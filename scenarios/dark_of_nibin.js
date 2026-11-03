@@ -118,77 +118,101 @@ if (typeof window !== 'undefined') {
         };
     }
 
+    const origEngagementChecks = window.engagementChecks;
+    if (origEngagementChecks && !window._nibinEngagementChecksPatched) {
+        window._nibinEngagementChecksPatched = true;
+        window.engagementChecks = function() {
+            const engine = window.LotrEngine;
+            const game = engine ? engine.game : null;
+            if (game && window.QUEST_STAGES) {
+                const currentStage = window.QUEST_STAGES[game.questStageIdx];
+                if (currentStage && currentStage.name === 'Surprise Attack') {
+                    game.stagingArea.forEach(c => {
+                        if (c.type === 'enemy' || c.type === 'enemy-immune') {
+                            if (c._origEngagement === undefined) {
+                                c._origEngagement = c.engagement !== undefined ? c.engagement : 0;
+                            }
+                            c.engagement = 0;
+                        }
+                    });
+                }
+            }
+            return origEngagementChecks.apply(this, arguments);
+        };
+    }
+
     // Global watcher to enforce Collapsed Mine quest progress clamping across saves and loads
+    if (!window._nibinCombatTimeoutPatched) {
+        window._nibinCombatTimeoutPatched = true;
+        const origSetTimeout = window.setTimeout;
+        window.setTimeout = function(fn, delay) {
+            if (typeof fn === 'function' && (fn.toString().includes('playerAttacks()') || fn.toString().includes('resolveEnemyAttacks()'))) {
+                const wrappedFn = function() {
+                    const engine = window.LotrEngine;
+                    const game = engine ? engine.game : window.game;
+                    if (game && (game._nibinChieftainPromptActive || (game._nibinBlockCombatTransitions && !game.currentEnemyAttacking) || (game.engagedEnemies && game.engagedEnemies.some(e => e._extraAttackPending > 0)))) {
+                        return; // BLOCKED! Wait for Nibin modals to resolve!
+                    }
+                    return fn.apply(this, arguments);
+                };
+                return origSetTimeout.call(this, wrappedFn, delay);
+            }
+            return origSetTimeout.apply(this, arguments);
+        };
+    }
+
     setInterval(() => {
         const engine = window.LotrEngine;
         const game = engine ? engine.game : null;
         if (!game) return;
 
-        const phaseDesc = Object.getOwnPropertyDescriptor(game, 'phase');
-        if (!phaseDesc || phaseDesc.configurable) {
-            if (!phaseDesc || !phaseDesc.get) {
-                let actualPhase = game.phase || 'setup';
-                Object.defineProperty(game, 'phase', {
-                    get: () => actualPhase,
-                    set: (val) => {
-                        if (val === 'combat-player-attack' && (game._nibinBlockCombatTransitions || game._nibinChieftainPromptActive || actualPhase === 'combat-player-attack')) {
-                            throw new Error("[Nibin] Blocked redundant or active combat transition to player attacks.");
-                        }
-                        actualPhase = val;
-                    },
-                    configurable: true,
-                    enumerable: true
+        // UI Silencer: Prevent base game's UI from being clickable while Goblin Chieftain prompt is on screen
+        if (game._nibinChieftainPromptActive || (game._nibinBlockCombatTransitions && !game.currentEnemyAttacking)) {
+            const actionBar = document.getElementById('action-bar');
+            if (actionBar) {
+                const btns = actionBar.querySelectorAll('button');
+                btns.forEach(b => {
+                    b.disabled = true;
+                    b.style.opacity = '0.35';
+                    b.style.cursor = 'not-allowed';
+                    b.style.pointerEvents = 'none';
                 });
+                const info = document.getElementById('action-info');
+                if (info && !info.textContent.includes('Resolving')) {
+                    if (game._nibinChieftainPromptActive) {
+                        info.textContent = 'Combat Phase — Resolving Goblin Chieftain effect...';
+                    } else {
+                        info.textContent = 'Combat Phase — Resolving enemy attack effect...';
+                    }
+                }
             }
-        }
+        } else if (game.phase === 'combat-player-attack' && game.pendingAction === null) {
+            // FIX: Override native playerAttacks() skip if Cracked Pillar is present
+            const hasCrackedPillar = game.stagingArea && game.stagingArea.some(c => c.id === 'nibin_cracked_pillar');
+            if (hasCrackedPillar) {
+                game.pendingAction = 'declare-attacker';
+                
+                setTimeout(() => {
+                    if (engine && engine.window && engine.window.setActionInfo) {
+                        engine.window.setActionInfo('Player Attacks — Click ready characters to declare as attackers, then click an enemy to attack.');
+                    }
+                    
+                    const flashText = document.createElement('div');
+                    flashText.style.cssText = "position:fixed; top:50%; left:50%; transform:translate(-50%, -50%) scale(0.5); z-index:90001; font-family:'Cinzel Decorative', serif; font-size:4rem; font-weight:900; color:var(--gold-bright); text-shadow:0 0 25px var(--gold), 0 4px 10px #000; opacity:0; transition:all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); pointer-events:none;";
+                    flashText.textContent = "Player's Attack Turn!";
+                    document.body.appendChild(flashText);
+                    setTimeout(() => {
+                        flashText.style.transform = 'translate(-50%, -50%) scale(1)';
+                        flashText.style.opacity = '1';
+                    }, 50);
+                    setTimeout(() => {
+                        flashText.style.transform = 'translate(-50%, -50%) scale(1.3)';
+                        flashText.style.opacity = '0';
+                        setTimeout(() => flashText.remove(), 300);
+                    }, 1500);
 
-        const actionDesc = Object.getOwnPropertyDescriptor(game, 'pendingAction');
-        if (!actionDesc || actionDesc.configurable) {
-            if (!actionDesc || !actionDesc.get) {
-                let actualAction = game.pendingAction;
-                Object.defineProperty(game, 'pendingAction', {
-                    get: () => actualAction,
-                    set: (val) => {
-                        if (val === 'declare-attacker' && game._nibinBlockCombatTransitions) {
-                            return;
-                        }
-                        
-                        // FIX: Override native playerAttacks() skip if Cracked Pillar is present
-                        if (val === null && game.phase === 'combat-player-attack' && actualAction !== 'declare-attacker') {
-                            const hasCrackedPillar = game.stagingArea && game.stagingArea.some(c => c.id === 'nibin_cracked_pillar');
-                            if (hasCrackedPillar) {
-                                actualAction = 'declare-attacker';
-                                
-                                setTimeout(() => {
-                                    if (engine && engine.window && engine.window.setActionInfo) {
-                                        engine.window.setActionInfo('Player Attacks — Click ready characters to declare as attackers, then click an enemy to attack.');
-                                    }
-                                    
-                                    const flashText = document.createElement('div');
-                                    flashText.style.cssText = "position:fixed; top:50%; left:50%; transform:translate(-50%, -50%) scale(0.5); z-index:90001; font-family:'Cinzel Decorative', serif; font-size:4rem; font-weight:900; color:var(--gold-bright); text-shadow:0 0 25px var(--gold), 0 4px 10px #000; opacity:0; transition:all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); pointer-events:none;";
-                                    flashText.textContent = "Player's Attack Turn!";
-                                    document.body.appendChild(flashText);
-                                    setTimeout(() => {
-                                        flashText.style.transform = 'translate(-50%, -50%) scale(1)';
-                                        flashText.style.opacity = '1';
-                                    }, 50);
-                                    setTimeout(() => {
-                                        flashText.style.transform = 'translate(-50%, -50%) scale(1.3)';
-                                        flashText.style.opacity = '0';
-                                        setTimeout(() => flashText.remove(), 300);
-                                    }, 1500);
-
-                                    if (engine && engine.render) engine.render();
-                                }, 10);
-                                return;
-                            }
-                        }
-                        
-                        actualAction = val;
-                    },
-                    configurable: true,
-                    enumerable: true
-                });
+                    if (engine && engine.render) engine.render();
+                }, 10);
             }
         }
 
@@ -231,8 +255,11 @@ if (typeof window !== 'undefined') {
                                     const allowance = 4 - (game._nibinProgressThisRound || 0);
                                     const applied = Math.min(diff, Math.max(0, allowance));
                                     game._nibinProgressThisRound = (game._nibinProgressThisRound || 0) + applied;
-                                    if (diff > applied && engine.toast) {
-                                        engine.toast("Collapsed Mine", "Progress limited to 4 per round!", "warning");
+                                    if (diff > applied) {
+                                        if (engine.toast) engine.toast("Collapsed Mine", "Progress limited to 4 per round!", "warning");
+                                        if (typeof window.triggerCollapsedMineCaveIn === 'function') {
+                                            window.triggerCollapsedMineCaveIn(diff - applied);
+                                        }
                                     }
                                     diff = applied;
                                 }
@@ -294,16 +321,369 @@ if (typeof window !== 'undefined') {
             }
         }
 
-        // Patch animateLunge to play warg attack audio right when combat damage is determined
+        window.triggerFantasySlamExplosion = function(targetEl) {
+            if (!targetEl) return;
+            const rect = targetEl.getBoundingClientRect();
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.bottom - 18;
+
+            const canvas = document.createElement('canvas');
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            canvas.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:10006;';
+            document.body.appendChild(canvas);
+            const ctx = canvas.getContext('2d');
+
+            const startTime = performance.now();
+            const duration = 1500;
+
+            // 1. Swirling Vortex Energy Streamers (6 fine golden helical arcs)
+            const streamers = [
+                { ang: 0, h: 0, r: 16, trail: [] },
+                { ang: Math.PI * 0.33, h: 0, r: 18, trail: [] },
+                { ang: Math.PI * 0.66, h: 0, r: 15, trail: [] },
+                { ang: Math.PI, h: 0, r: 17, trail: [] },
+                { ang: Math.PI * 1.33, h: 0, r: 19, trail: [] },
+                { ang: Math.PI * 1.66, h: 0, r: 16, trail: [] }
+            ];
+
+            // 2. Central Flame Vortex & Rising Sparks
+            const vortexFlames = [];
+            const risingSparks = [];
+
+            // 3. Lingering Ground Embers (Rendered with pure radial gradient falloff for 100% soft edges)
+            const groundEmbers = [];
+            for (let i = 0; i < 42; i++) {
+                const rad = Math.random() * Math.PI * 2;
+                const dist = Math.random() * 48;
+                groundEmbers.push({
+                    x: cx + Math.cos(rad) * dist,
+                    y: cy + Math.sin(rad) * dist * 0.35 + (Math.random() - 0.5) * 8,
+                    vx: (Math.random() - 0.5) * 0.7,
+                    vy: -0.35 - Math.random() * 0.75,
+                    size: 2.5 + Math.random() * 3.5,
+                    life: 1.0,
+                    decay: 0.006 + Math.random() * 0.0035,
+                    phase: Math.random() * Math.PI * 2,
+                    twinkleSpeed: 0.08 + Math.random() * 0.06
+                });
+            }
+
+            let animId = null;
+
+            const render = (now) => {
+                const elapsed = now - startTime;
+                const p = Math.min(1, elapsed / duration);
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                ctx.save();
+                ctx.globalCompositeOperation = 'screen';
+
+                // --- A. PERSPECTIVE GROUND SHOCKWAVE RINGS (Soft feathered concentric shockwaves) ---
+                if (elapsed < 550) {
+                    const rProgress = Math.min(1, elapsed / 500);
+                    const easeOut = 1 - Math.pow(1 - rProgress, 3);
+                    const ringAlpha = (1 - rProgress);
+
+                    // Layer 1: Outer Soft Ambient Ring
+                    ctx.save();
+                    ctx.globalAlpha = ringAlpha * 0.65;
+                    ctx.strokeStyle = '#f59e0b';
+                    ctx.lineWidth = 4.0;
+                    ctx.shadowColor = '#d97706';
+                    ctx.shadowBlur = 24;
+                    ctx.beginPath();
+                    ctx.ellipse(cx, cy, easeOut * 105, easeOut * 35, 0, 0, Math.PI * 2);
+                    ctx.stroke();
+
+                    // Layer 2: Mid Glowing Golden Ring
+                    ctx.globalAlpha = ringAlpha * 0.9;
+                    ctx.strokeStyle = '#fde047';
+                    ctx.lineWidth = 2.5;
+                    ctx.shadowColor = '#f59e0b';
+                    ctx.shadowBlur = 14;
+                    ctx.beginPath();
+                    ctx.ellipse(cx, cy, easeOut * 75, easeOut * 26, 0, 0, Math.PI * 2);
+                    ctx.stroke();
+
+                    // Layer 3: Inner Sharp-Core Ring
+                    ctx.globalAlpha = ringAlpha;
+                    ctx.strokeStyle = '#ffffff';
+                    ctx.lineWidth = 1.2;
+                    ctx.shadowBlur = 8;
+                    ctx.beginPath();
+                    ctx.ellipse(cx, cy, easeOut * 45, easeOut * 16, 0, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.restore();
+
+                    // Ground Impact Radiant Center
+                    const flashAlpha = Math.max(0, 1 - (elapsed / 260));
+                    if (flashAlpha > 0) {
+                        ctx.save();
+                        ctx.globalAlpha = flashAlpha;
+                        const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 65);
+                        grad.addColorStop(0, 'rgba(255, 255, 255, 0.95)');
+                        grad.addColorStop(0.25, 'rgba(254, 240, 138, 0.85)');
+                        grad.addColorStop(0.6, 'rgba(245, 158, 11, 0.45)');
+                        grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+                        ctx.fillStyle = grad;
+                        ctx.beginPath();
+                        ctx.ellipse(cx, cy, 65, 22, 0, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.restore();
+                    }
+                }
+
+                // --- B. VORTEX FLAME COLUMN & FAST RISING SPARKS ---
+                if (elapsed < 380) {
+                    for (let k = 0; k < 3; k++) {
+                        vortexFlames.push({
+                            x: cx + (Math.random() - 0.5) * 16,
+                            y: cy - Math.random() * 15,
+                            vx: (Math.random() - 0.5) * 1.4,
+                            vy: -5.5 - Math.random() * 4.5,
+                            size: 10 + Math.random() * 14,
+                            life: 1.0,
+                            decay: 0.05 + Math.random() * 0.03,
+                            color: Math.random() > 0.4 ? '#ffffff' : (Math.random() > 0.5 ? '#fef08a' : '#f59e0b')
+                        });
+                    }
+                    if (Math.random() < 0.8) {
+                        risingSparks.push({
+                            x: cx + (Math.random() - 0.5) * 20,
+                            y: cy - Math.random() * 10,
+                            vx: (Math.random() - 0.5) * 1.5,
+                            vy: -8 - Math.random() * 6,
+                            len: 8 + Math.random() * 10,
+                            life: 1.0,
+                            decay: 0.04 + Math.random() * 0.02
+                        });
+                    }
+                }
+
+                // Render Vertical Fast Sparks
+                for (let i = risingSparks.length - 1; i >= 0; i--) {
+                    const sp = risingSparks[i];
+                    sp.x += sp.vx;
+                    sp.y += sp.vy;
+                    sp.life -= sp.decay;
+                    if (sp.life <= 0) { risingSparks.splice(i, 1); continue; }
+                    ctx.save();
+                    ctx.globalAlpha = sp.life;
+                    ctx.strokeStyle = '#fef08a';
+                    ctx.lineWidth = 1.6;
+                    ctx.beginPath();
+                    ctx.moveTo(sp.x, sp.y);
+                    ctx.lineTo(sp.x - sp.vx * 0.8, sp.y + sp.len);
+                    ctx.stroke();
+                    ctx.restore();
+                }
+
+                // Render Vortex Core Flames
+                for (let i = vortexFlames.length - 1; i >= 0; i--) {
+                    const vf = vortexFlames[i];
+                    vf.x += vf.vx;
+                    vf.y += vf.vy;
+                    vf.life -= vf.decay;
+
+                    if (vf.life <= 0) {
+                        vortexFlames.splice(i, 1);
+                        continue;
+                    }
+
+                    ctx.save();
+                    ctx.globalAlpha = Math.max(0, vf.life * 0.85);
+                    const grad = ctx.createRadialGradient(vf.x, vf.y, 0, vf.x, vf.y, vf.size * vf.life);
+                    grad.addColorStop(0, vf.color);
+                    grad.addColorStop(0.45, '#f59e0b');
+                    grad.addColorStop(1, 'rgba(220, 38, 38, 0)');
+                    ctx.fillStyle = grad;
+                    ctx.beginPath();
+                    ctx.arc(vf.x, vf.y, vf.size * vf.life, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.restore();
+                }
+
+                // --- C. SPIRALING ENERGY STREAMERS (6 winding ribbons) ---
+                if (elapsed < 500) {
+                    streamers.forEach(s => {
+                        s.h += 4.2;
+                        s.ang += 0.25;
+                        const curR = s.r + (s.h * 0.11) * Math.sin(s.h * 0.035);
+                        const curX = cx + Math.cos(s.ang) * curR;
+                        const curY = cy - s.h + Math.sin(s.ang) * curR * 0.35;
+                        s.trail.push({ x: curX, y: curY, alpha: 1.0, size: Math.max(0.8, 3.4 - (s.h / 140) * 2.8) });
+
+                        for (let t = s.trail.length - 1; t >= 0; t--) {
+                            const tr = s.trail[t];
+                            tr.alpha -= 0.042;
+                            if (tr.alpha <= 0) {
+                                s.trail.splice(t, 1);
+                                continue;
+                            }
+                            ctx.save();
+                            ctx.globalAlpha = tr.alpha * 0.9;
+                            const strGrad = ctx.createRadialGradient(tr.x, tr.y, 0, tr.x, tr.y, tr.size * 1.8);
+                            strGrad.addColorStop(0, '#ffffff');
+                            strGrad.addColorStop(0.5, '#fef08a');
+                            strGrad.addColorStop(1, 'rgba(245, 158, 11, 0)');
+                            ctx.fillStyle = strGrad;
+                            ctx.beginPath();
+                            ctx.arc(tr.x, tr.y, tr.size * 1.8, 0, Math.PI * 2);
+                            ctx.fill();
+                            ctx.restore();
+                        }
+                    });
+                }
+
+                // --- D. LINGERING GROUND EMBERS (100% soft feathered edges with smooth radial falloff) ---
+                for (let i = groundEmbers.length - 1; i >= 0; i--) {
+                    const em = groundEmbers[i];
+                    em.life -= em.decay;
+                    if (em.life <= 0) {
+                        groundEmbers.splice(i, 1);
+                        continue;
+                    }
+
+                    em.phase += em.twinkleSpeed;
+                    em.x += em.vx + Math.sin(em.phase) * 0.22;
+                    em.y += em.vy;
+                    em.vy += 0.005; // Gentle floaty settling
+
+                    const twinkle = 0.72 + Math.sin(em.phase * 2) * 0.28;
+                    const alpha = Math.max(0, em.life * twinkle);
+                    const curRadius = em.size * (0.8 + 0.4 * em.life);
+
+                    ctx.save();
+                    ctx.globalAlpha = alpha;
+
+                    // Fully feathered soft gradient orb with zero harsh circular perimeter edges
+                    const orbGrad = ctx.createRadialGradient(em.x, em.y, 0, em.x, em.y, curRadius * 2.4);
+                    orbGrad.addColorStop(0, '#ffffff');
+                    orbGrad.addColorStop(0.2, 'rgba(254, 240, 138, 0.95)');
+                    orbGrad.addColorStop(0.55, 'rgba(245, 158, 11, 0.4)');
+                    orbGrad.addColorStop(1, 'rgba(245, 158, 11, 0)');
+
+                    ctx.fillStyle = orbGrad;
+                    ctx.beginPath();
+                    ctx.arc(em.x, em.y, curRadius * 2.4, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.restore();
+                }
+
+                ctx.restore();
+
+                if (p < 1 || groundEmbers.length > 0) {
+                    animId = requestAnimationFrame(render);
+                } else {
+                    canvas.remove();
+                }
+            };
+            animId = requestAnimationFrame(render);
+        };
+
+        window.triggerTrollSlamDown = function(attackerUid, targetUid) {
+            const attackerEl = document.querySelector(`[data-uid="${attackerUid}"]`);
+            const targetEl = document.querySelector(`[data-uid="${targetUid}"]`);
+            if (!attackerEl || !targetEl) return;
+
+            // Suppress the base game damage particle burst from firing on the receiving character
+            window._suppressDamageFxBurst = true;
+            setTimeout(() => { window._suppressDamageFxBurst = false; }, 900);
+
+            // Play Great Cave Troll attack audio
+            try {
+                const atkSnd = new Audio('./sound_effects/dark_of_mirkwood/great_cave_troll_attack.mp3');
+                const volSlider = document.getElementById('volume-slider');
+                atkSnd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                atkSnd.play().catch(() => {});
+            } catch(e) {}
+
+            const isExhausted = attackerEl.classList.contains('exhausted');
+            const rot = isExhausted ? 'rotate(90deg)' : '';
+            const origTransform = attackerEl.style.transform;
+            const origTransition = attackerEl.style.transition;
+
+            // 1. Troll card performs heavy in-place overhead windup
+            attackerEl.style.transition = 'transform 0.16s cubic-bezier(0.2, 0.8, 0.4, 1)';
+            attackerEl.style.transform = `translateY(-35px) scale(1.08) rotate(-3deg) ${rot}`;
+
+            // Troll strikes downward with massive force in its own area
+            setTimeout(() => {
+                attackerEl.style.transition = 'transform 0.12s cubic-bezier(0.6, 0, 0.9, 1)';
+                attackerEl.style.transform = `translateY(32px) scale(1.05) rotate(2deg) ${rot}`;
+            }, 140);
+
+            // Impact moment: Triggers the ground fantasy explosion on the player's card
+            setTimeout(() => {
+                window.triggerFantasySlamExplosion(targetEl);
+
+                if (window.LotrEngine && window.LotrEngine.window && window.LotrEngine.window.screenShake) {
+                    window.LotrEngine.window.screenShake(24, 380);
+                }
+
+                try {
+                    const snd = new Audio('./sound_effects/dark_of_mirkwood/troll_smash.mp3');
+                    snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                    snd.playbackRate = 1.15;
+                    snd.play().catch(() => {});
+                } catch(e) {}
+
+                // Player card compresses/recoils downward under the slam impact while preserving its rotation
+                const targetIsExhausted = targetEl.classList.contains('exhausted');
+                const targetBaseRot = targetIsExhausted ? 'rotate(90deg) ' : '';
+
+                targetEl.style.transition = 'transform 0.08s ease-out';
+                targetEl.style.transform = `${targetBaseRot}translateY(14px) scale(0.92, 0.88)`;
+                setTimeout(() => {
+                    targetEl.style.transition = 'transform 0.18s ease-out';
+                    targetEl.style.transform = targetIsExhausted ? 'rotate(90deg)' : '';
+                }, 140);
+
+                // Troll card returns to idle stance in its slot
+                setTimeout(() => {
+                    attackerEl.style.transition = 'transform 0.24s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                    attackerEl.style.transform = origTransform;
+                    setTimeout(() => {
+                        attackerEl.style.transition = origTransition;
+                    }, 240);
+                }, 100);
+            }, 250);
+        };
+
+        // Suppress base game particle burst during Great Cave Troll attack
+        const fxCanvas = document.getElementById('fx-canvas');
+        if (fxCanvas && !window._nibinFxPatched) {
+            window._nibinFxPatched = true;
+            const fxCtx = fxCanvas.getContext('2d');
+            const origArc = fxCtx.arc;
+            const origFill = fxCtx.fill;
+            fxCtx.arc = function() {
+                if (window._suppressDamageFxBurst) return;
+                return origArc.apply(this, arguments);
+            };
+            fxCtx.fill = function() {
+                if (window._suppressDamageFxBurst) return;
+                return origFill.apply(this, arguments);
+            };
+        }
+
+        // Patch animateLunge to play attack effects right when combat damage is determined
         if (window.animateLunge && !window._nibinAnimateLungePatched) {
             window._nibinAnimateLungePatched = true;
             const origAnimateLunge = window.animateLunge;
             window.animateLunge = function(attackerUid, targetUid) {
                 const attacker = window._cardRegistry ? window._cardRegistry[attackerUid] : null;
-                if (attacker && attacker.id === 'nibin_cavern_warg') {
-                    const snd = new Audio('./sound_effects/dark_of_mirkwood/cavern_warg_attack.mp3');
-                    snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
-                    snd.play().catch(() => {});
+                const isWarg = attacker && (attacker.id === 'nibin_cavern_warg' || attacker.id === 'cavern_warg' || attacker.id === 'nibin_wild_wargs' || attacker.id === 'wild_wargs' || (attacker.trait || '').includes('Warg'));
+                if (isWarg) {
+                    if (window.triggerWargChompOnTorch && targetUid) {
+                        window.triggerWargChompOnTorch(targetUid);
+                    }
+                }
+                const isTroll = attacker && (attacker.id === 'nibin_great_cave_troll' || attacker.id === 'great_cave_troll');
+                if (isTroll && window.triggerTrollSlamDown) {
+                    window.triggerTrollSlamDown(attackerUid, targetUid);
+                    return;
                 }
                 return origAnimateLunge.apply(this, arguments);
             };
@@ -672,14 +1052,13 @@ if (typeof window !== 'undefined') {
     let _watchfulResolving = false;
     window.handleWatchfulEyesActivation = function() {
         if (_watchfulResolving) return;
-        _watchfulResolving = true;
 
         const engine = window.LotrEngine;
         const game = engine ? engine.game : null;
-        if (!game) {
-            _watchfulResolving = false;
+        if (!game || (game.phase && (game.phase.startsWith('quest') || game.phase === 'setup')) || window._watchfulCardRevealing) {
             return;
         }
+        _watchfulResolving = true;
 
         const watchfulHero = game.heroes.find(h => 
             !h._prisoner && 
@@ -788,8 +1167,5092 @@ if (typeof window !== 'undefined') {
             });
         });
         observer.observe(toastContainer, { childList: true });
+        };
+        initWatchfulObserver();
+
+        // Epic Red & Black Bottom-Weighted Persistent Shadow & Ember Aura
+        (function initWatchfulEyesPersistentAura() {
+            if (!document.getElementById('watchful-eyes-aura-style')) {
+                const style = document.createElement('style');
+                style.id = 'watchful-eyes-aura-style';
+                style.textContent = `
+                    @keyframes weBottomGlowPulse {
+                        0%, 100% {
+                            box-shadow: 0 16px 28px -2px rgba(220, 38, 38, 0.8), 0 24px 44px 2px rgba(10, 0, 0, 0.98), inset 0 -18px 24px -4px rgba(185, 28, 28, 0.7);
+                            border-bottom-color: #ef4444;
+                        }
+                        50% {
+                            box-shadow: 0 22px 36px 0px rgba(239, 68, 68, 0.95), 0 32px 55px 4px rgba(20, 0, 4, 1), inset 0 -24px 32px -4px rgba(239, 68, 68, 0.9);
+                            border-bottom-color: #fca5a5;
+                        }
+                    }
+                    @keyframes weAbyssalMistSurge {
+                        0%, 100% { transform: scale(0.96) translateY(2px); opacity: 0.65; }
+                        50% { transform: scale(1.05) translateY(-3px); opacity: 0.95; }
+                    }
+                    @keyframes weGazeSweep1 {
+                        0% { transform: rotate(-25deg) scaleX(0.9); opacity: 0.55; }
+                        50% { transform: rotate(25deg) scaleX(1.15); opacity: 0.95; }
+                        100% { transform: rotate(-25deg) scaleX(0.9); opacity: 0.55; }
+                    }
+                    @keyframes weGazeSweep2 {
+                        0% { transform: rotate(22deg) scaleX(1.1); opacity: 0.9; }
+                        50% { transform: rotate(-22deg) scaleX(0.85); opacity: 0.45; }
+                        100% { transform: rotate(22deg) scaleX(1.1); opacity: 0.9; }
+                    }
+                    @keyframes weBillowPuff {
+                        0%, 100% { transform: scale(0.92) rotate(0deg); opacity: 0.6; }
+                        50% { transform: scale(1.12) rotate(8deg); opacity: 0.9; }
+                    }
+                    @keyframes weBottomSparkDrift {
+                        0% { transform: translate(0, 0) scale(0.4); opacity: 0; }
+                        20% { opacity: 1; }
+                        80% { opacity: 0.85; }
+                        100% { transform: translate(var(--dx, 8px), -54px) scale(0.1); opacity: 0; }
+                    }
+                    .we-persistent-aura {
+                        position: fixed;
+                        pointer-events: none;
+                        z-index: 45;
+                        border-radius: 8px;
+                        border: 1.5px solid transparent;
+                        border-bottom: 2.5px solid #ef4444;
+                        animation: weBottomGlowPulse 3.2s ease-in-out infinite;
+                        transition: opacity 0.35s ease-out;
+                        will-change: transform, left, top, width, height;
+                        overflow: visible;
+                        -webkit-mask-image: linear-gradient(to top, black 0%, black 28%, rgba(0,0,0,0.7) 42%, rgba(0,0,0,0.2) 50%, transparent 58%);
+                        mask-image: linear-gradient(to top, black 0%, black 28%, rgba(0,0,0,0.7) 42%, rgba(0,0,0,0.2) 50%, transparent 58%);
+                    }
+                    .we-spark {
+                        position: absolute;
+                        border-radius: 50%;
+                        background: radial-gradient(circle at 35% 35%, #ffffff 0%, #fecaca 30%, #ef4444 75%);
+                        box-shadow: 0 0 6px #ef4444, 0 0 12px #991b1b, 0 0 2px #fff;
+                        animation: weBottomSparkDrift 2.6s cubic-bezier(0.2, 0.8, 0.4, 1) infinite;
+                        will-change: transform, opacity;
+                    }
+                `;
+                document.head.appendChild(style);
+            }
+
+            const _watchfulAuras = new Map();
+
+            function createAuraElement() {
+                const el = document.createElement('div');
+                el.className = 'we-persistent-aura';
+                el.innerHTML = `
+                    <!-- Volumetric Abyssal Red & Black Mist Base -->
+                    <div style="position:absolute; left:-12px; right:-12px; bottom:-12px; height:68%; border-radius:0 0 14px 14px; background:radial-gradient(ellipse at 50% 100%, rgba(239,68,68,0.75) 0%, rgba(185,28,28,0.5) 28%, rgba(15,0,3,0.96) 62%, transparent 88%); filter:blur(6px); animation:weAbyssalMistSurge 3.4s ease-in-out infinite alternate; pointer-events:none;"></div>
+                    <div style="position:absolute; left:-6px; right:-6px; bottom:-8px; height:45%; background:radial-gradient(ellipse at 50% 100%, rgba(254,202,202,0.6) 0%, rgba(220,38,38,0.45) 30%, transparent 75%); filter:blur(4px); mix-blend-mode:screen; pointer-events:none;"></div>
+
+                    <!-- Watchful Gaze-Beams (No SVG): Sweeping Crimson Searchlight Beams -->
+                    <div style="position:absolute; inset:-10px; overflow:hidden; pointer-events:none;">
+                        <!-- Primary Sweeping Gaze Cone -->
+                        <div style="position:absolute; left:50%; bottom:-20px; width:220px; height:180px; margin-left:-110px; transform-origin:center bottom; background:conic-gradient(from 250deg at 50% 100%, transparent 0deg, rgba(220,38,38,0.6) 12deg, rgba(255,255,255,0.92) 20deg, rgba(239,68,68,0.7) 28deg, transparent 40deg); filter:blur(6px); animation:weGazeSweep1 4.5s ease-in-out infinite; mix-blend-mode:screen;"></div>
+                        <!-- Counter-Sweeping Amber/Crimson Surveillance Fan -->
+                        <div style="position:absolute; left:50%; bottom:-24px; width:250px; height:200px; margin-left:-125px; transform-origin:center bottom; background:conic-gradient(from 240deg at 50% 100%, transparent 0deg, rgba(153,27,27,0.5) 16deg, rgba(248,113,113,0.85) 32deg, rgba(220,38,38,0.55) 48deg, transparent 65deg); filter:blur(9px); animation:weGazeSweep2 5.8s ease-in-out infinite; mix-blend-mode:screen;"></div>
+                    </div>
+
+                    <!-- Billowing Black & Blood Smoke Puffs (No SVG) -->
+                    <div style="position:absolute; left:8%; bottom:-6px; width:65px; height:50px; border-radius:50% 45% 55% 40%; background:radial-gradient(circle, rgba(10,0,3,0.95) 0%, rgba(136,19,55,0.45) 55%, transparent 78%); filter:blur(7px); animation:weBillowPuff 4.2s ease-in-out infinite alternate; pointer-events:none;"></div>
+                    <div style="position:absolute; right:8%; bottom:-8px; width:70px; height:54px; border-radius:45% 55% 40% 50%; background:radial-gradient(circle, rgba(10,0,3,0.95) 0%, rgba(153,27,27,0.45) 55%, transparent 78%); filter:blur(8px); animation:weBillowPuff 3.6s 0.8s ease-in-out infinite alternate; pointer-events:none;"></div>
+                    <div style="position:absolute; left:32%; bottom:-12px; width:75px; height:58px; border-radius:50%; background:radial-gradient(circle, rgba(20,0,5,0.98) 0%, rgba(185,28,28,0.35) 60%, transparent 80%); filter:blur(9px); animation:weBillowPuff 4.8s 1.5s ease-in-out infinite alternate; pointer-events:none;"></div>
+
+                    <!-- Rising Magma Sparks & Hot Ash -->
+                    <div style="position:absolute; inset:0; pointer-events:none;">
+                        <div class="we-spark" style="left:16%; bottom:8px; width:4px; height:4px; --dx:-12px; animation-delay:0s; animation-duration:2.5s;"></div>
+                        <div class="we-spark" style="left:28%; bottom:14px; width:4.5px; height:4.5px; --dx:9px; animation-delay:0.4s; animation-duration:3.0s;"></div>
+                        <div class="we-spark" style="left:42%; bottom:6px; width:3.5px; height:3.5px; --dx:-7px; animation-delay:1.0s; animation-duration:2.4s;"></div>
+                        <div class="we-spark" style="left:56%; bottom:12px; width:5px; height:5px; --dx:11px; animation-delay:0.7s; animation-duration:2.8s;"></div>
+                        <div class="we-spark" style="left:70%; bottom:8px; width:4px; height:4px; --dx:-9px; animation-delay:1.5s; animation-duration:2.7s;"></div>
+                        <div class="we-spark" style="left:84%; bottom:10px; width:3.5px; height:3.5px; --dx:7px; animation-delay:1.2s; animation-duration:3.1s;"></div>
+                        <div class="we-spark" style="left:22%; bottom:22px; width:3px; height:3px; --dx:6px; animation-delay:0.9s; animation-duration:2.3s;"></div>
+                        <div class="we-spark" style="left:64%; bottom:20px; width:4px; height:4px; --dx:-8px; animation-delay:1.8s; animation-duration:2.9s;"></div>
+                        <div class="we-spark" style="left:36%; bottom:24px; width:3.5px; height:3.5px; --dx:-6px; animation-delay:2.1s; animation-duration:2.6s;"></div>
+                        <div class="we-spark" style="left:78%; bottom:18px; width:3.5px; height:3.5px; --dx:8px; animation-delay:0.3s; animation-duration:2.7s;"></div>
+                    </div>
+                `;
+                return el;
+            }
+
+            function syncWatchfulAuras() {
+                const game = window.game || (window.LotrEngine && window.LotrEngine.game);
+                const activeHeroUids = new Set();
+
+                // Exclusively targets the Hero card that has Watchful Eyes attached
+                if (game && game.heroes) {
+                    game.heroes.forEach(h => {
+                        if (!h._dead && h.attached && h.attached.some(a => a.id === 'nibin_watchful_eyes')) {
+                            activeHeroUids.add(h._uid);
+                        }
+                    });
+                }
+
+                _watchfulAuras.forEach((aura, uid) => {
+                    if (!activeHeroUids.has(uid)) {
+                        aura.style.opacity = '0';
+                        setTimeout(() => aura.remove(), 360);
+                        _watchfulAuras.delete(uid);
+                    }
+                });
+
+                activeHeroUids.forEach(uid => {
+                    let aura = _watchfulAuras.get(uid);
+                    if (!aura) {
+                        aura = createAuraElement();
+                        document.body.appendChild(aura);
+                        _watchfulAuras.set(uid, aura);
+                    }
+
+                    // Query the hero card in the player area
+                    const cardEl = document.querySelector(`#player-content .card[data-uid="${uid}"]`) ||
+                                   document.querySelector(`.card[data-uid="${uid}"]`);
+                    if (cardEl && cardEl.style.display !== 'none' && cardEl.style.visibility !== 'hidden' && cardEl.style.opacity !== '0') {
+                        const r = cardEl.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) {
+                            aura.style.left = `${r.left - 6}px`;
+                            aura.style.top = `${r.top - 6}px`;
+                            aura.style.width = `${r.width + 12}px`;
+                            aura.style.height = `${r.height + 12}px`;
+                            if (aura.style.opacity === '0' || aura.style.opacity === '') aura.style.opacity = '1';
+                        } else {
+                            aura.style.opacity = '0';
+                        }
+                    } else {
+                        aura.style.opacity = '0';
+                    }
+                });
+
+                requestAnimationFrame(syncWatchfulAuras);
+            }
+            requestAnimationFrame(syncWatchfulAuras);
+        })();
+
+        let _lastNibinObsidianArrowsRevealAudioTime = 0;
+    if (!window.playObsidianArrowsAudio) {
+        window.playObsidianArrowsAudio = function() {
+            const now = Date.now();
+            if (now - _lastNibinObsidianArrowsRevealAudioTime < 1500) return;
+            _lastNibinObsidianArrowsRevealAudioTime = now;
+            try {
+                const snd = new Audio('./sound_effects/dark_of_mirkwood/obsidian_arrows.mp3');
+                const volSlider = document.getElementById('volume-slider');
+                snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                snd.play().catch(() => {});
+            } catch(e) {}
+        };
+    }
+
+    let _lastNibinEyesInTheDarkAudioTime = 0;
+    if (!window.playEyesInTheDarkAudio) {
+        window.playEyesInTheDarkAudio = function() {
+            const now = Date.now();
+            if (now - _lastNibinEyesInTheDarkAudioTime < 1500) return;
+            _lastNibinEyesInTheDarkAudioTime = now;
+            try {
+                const snd = new Audio('./sound_effects/dark_of_mirkwood/eyes_in_the_dark.mp3');
+                const volSlider = document.getElementById('volume-slider');
+                snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                snd.play().catch(() => {
+                    const fallbackSnd = new Audio('./sound_effects/eyes_in_the_dark.mp3');
+                    fallbackSnd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                    fallbackSnd.play().catch(() => {});
+                });
+            } catch(e) {}
+        };
+    }
+
+    let _lastNibinGoblinsUponYouAudioTime = 0;
+    if (!window.playGoblinsAreUponYouAudio) {
+        window.playGoblinsAreUponYouAudio = function() {
+            const now = Date.now();
+            if (now - _lastNibinGoblinsUponYouAudioTime < 1500) return;
+            _lastNibinGoblinsUponYouAudioTime = now;
+            try {
+                const snd = new Audio('./sound_effects/dark_of_mirkwood/goblins_are_upon_you.mp3');
+                const volSlider = document.getElementById('volume-slider');
+                snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                snd.play().catch(() => {
+                    const fallbackSnd = new Audio('./sound_effects/goblins_are_upon_you.mp3');
+                    fallbackSnd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                    fallbackSnd.play().catch(() => {});
+                });
+            } catch(e) {}
+        };
+    }
+
+    let _lastNibinGoblinsPickedAudioTime = 0;
+    if (!window.playGoblinsAreUponYouPickedAudio) {
+        window.playGoblinsAreUponYouPickedAudio = function() {
+            const now = Date.now();
+            if (now - _lastNibinGoblinsPickedAudioTime < 800) return;
+            _lastNibinGoblinsPickedAudioTime = now;
+            try {
+                const snd = new Audio('./sound_effects/dark_of_mirkwood/goblins_are_upon_you_picked.mp3');
+                const volSlider = document.getElementById('volume-slider');
+                snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                snd.play().catch(() => {
+                    const fallbackSnd = new Audio('./sound_effects/goblins_are_upon_you_picked.mp3');
+                    fallbackSnd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                    fallbackSnd.play().catch(() => {});
+                });
+            } catch(e) {}
+        };
+    }
+
+    let _lastNibinForestSpiderPowerUpAudioTime = 0;
+    if (!window.playForestSpiderPowerUpAudio) {
+        window.playForestSpiderPowerUpAudio = function() {
+            const now = Date.now();
+            if (now - _lastNibinForestSpiderPowerUpAudioTime < 800) return;
+            _lastNibinForestSpiderPowerUpAudioTime = now;
+            try {
+                const volSlider = document.getElementById('volume-slider');
+                const vol = volSlider ? parseFloat(volSlider.value) : 0.25;
+                const s1 = new Audio('./sound_effects/dark_of_mirkwood/forest_spider_powerup.mp3');
+                s1.volume = vol;
+                s1.play().catch(() => {
+                    try {
+                        const s2 = new Audio('./sound_effects/forest_spider_powerup.mp3');
+                        s2.volume = vol;
+                        s2.play().catch(() => {});
+                    } catch(e) {}
+                });
+            } catch(e) {}
+        };
+    }
+
+    let _lastWatchfulEyesAudioTime = 0;
+    if (!window.playWatchfulEyesAudio) {
+        window.playWatchfulEyesAudio = function() {
+            const now = Date.now();
+            if (now - _lastWatchfulEyesAudioTime < 1500) return;
+            _lastWatchfulEyesAudioTime = now;
+            try {
+                const snd = new Audio('./sound_effects/dark_of_mirkwood/watchful_eyes.mp3');
+                const volSlider = document.getElementById('volume-slider');
+                snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                snd.play().catch(() => {});
+            } catch(e) {}
+        };
+    }
+
+    let _lastLostInTheDarkAudioTime = 0;
+    if (!window.playLostInTheDarkAudio) {
+        window.playLostInTheDarkAudio = function() {
+            const now = Date.now();
+            if (now - _lastLostInTheDarkAudioTime < 1500) return;
+            _lastLostInTheDarkAudioTime = now;
+            try {
+                const snd = new Audio('./sound_effects/dark_of_mirkwood/lost_in_the_dark.mp3');
+                const volSlider = document.getElementById('volume-slider');
+                snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                snd.play().catch(() => {});
+            } catch(e) {}
+        };
+    }
+
+    if (!window.triggerEyesInTheDarkSpiderBite) {
+        window.triggerEyesInTheDarkSpiderBite = function(targetEl, onComplete) {
+            const r = targetEl.getBoundingClientRect();
+            const bite = document.createElement('div');
+            bite.style.cssText = `
+                position: fixed; left: ${r.left + r.width/2 - 110}px; top: ${r.top + r.height/2 - 110}px;
+                width: 220px; height: 235px; z-index: 100005; pointer-events: none;
+                perspective: 1000px;
+            `;
+
+            const yingYangFangPath = "M 78,8 C 38,8 4,38 2,82 C 0,128 20,174 68,198 C 54,186 46,166 46,138 C 46,104 74,74 96,44 C 104,32 100,10 78,8 Z";
+            const yingYangHighlight = "M 72,16 C 38,44 18,98 66,194";
+            const drippingIndices = [0, 1, 2, 3, 4, 5].sort(() => Math.random() - 0.5).slice(0, 2 + Math.floor(Math.random() * 3));
+
+            const buildYingYangFang = (idClass, styleStr, fangIdx) => {
+                const hasDrip = drippingIndices.includes(fangIdx);
+                const dripDelay = (Math.random() * 0.45).toFixed(2);
+                const dripDuration = (0.75 + Math.random() * 0.35).toFixed(2);
+                const dripJitter = (68 + (Math.random() * 4 - 2)).toFixed(1);
+                const dripHTML = hasDrip ? `
+                    <div class="creepy-venom-drip" style="left:${dripJitter}%; animation-delay:${dripDelay}s; animation-duration:${dripDuration}s;"></div>
+                    <div class="creepy-venom-bead" style="left:${dripJitter}%; animation-delay:${dripDelay}s; animation-duration:${dripDuration}s;"></div>
+                ` : '';
+
+                return `
+                    <div class="creepy-fang-container ${idClass}" style="${styleStr}">
+                        <svg viewBox="0 0 102 208" style="width:100%; height:100%; overflow:visible; filter: drop-shadow(0 4px 8px rgba(0,0,0,0.95));">
+                            <defs>
+                                <linearGradient id="yyFangBody_${idClass}" x1="0%" y1="0%" x2="55%" y2="100%">
+                                    <stop offset="0%" stop-color="#000000"/>
+                                    <stop offset="20%" stop-color="#18181b"/>
+                                    <stop offset="40%" stop-color="#71717a"/>
+                                    <stop offset="65%" stop-color="#f4f4f5"/>
+                                    <stop offset="85%" stop-color="#991b1b"/>
+                                    <stop offset="100%" stop-color="#ef4444"/>
+                                </linearGradient>
+                                <radialGradient id="yyFangGloss_${idClass}" cx="60%" cy="26%" r="42%">
+                                    <stop offset="0%" stop-color="#ffffff" stop-opacity="0.95"/>
+                                    <stop offset="50%" stop-color="#e2e8f0" stop-opacity="0.6"/>
+                                    <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+                                </radialGradient>
+                            </defs>
+                            <path d="${yingYangFangPath}" fill="url(#yyFangBody_${idClass})" stroke="#18181b" stroke-width="2.5" stroke-linejoin="round"/>
+                            <path d="${yingYangHighlight}" fill="none" stroke="rgba(255,255,255,0.7)" stroke-width="2.8" stroke-linecap="round"/>
+                            <ellipse cx="60" cy="40" rx="24" ry="18" fill="url(#yyFangGloss_${idClass})" transform="rotate(-18 60 40)"/>
+                            <circle cx="68" cy="198" r="1.6" fill="#ffffff" filter="drop-shadow(0 0 3px #ffffff)"/>
+                        </svg>
+                        ${dripHTML}
+                    </div>
+                `;
+            };
+
+            bite.innerHTML = `
+                <style>
+                    @keyframes creepyEyeGleam {
+                        0%, 100% { filter: drop-shadow(0 0 4px #ff0000) drop-shadow(0 0 10px #ef4444); transform: scale(1) rotate(var(--erot, 0deg)); }
+                        50% { filter: drop-shadow(0 0 8px #ff2222) drop-shadow(0 0 16px #ff0000); transform: scale(1.15) rotate(var(--erot, 0deg)); }
+                    }
+                    @keyframes venomThreadStretch {
+                        0% { height: 4px; opacity: 0.3; transform: scaleY(0.2); }
+                        35% { height: 26px; opacity: 0.95; transform: scaleY(1); }
+                        70% { height: 38px; opacity: 0.85; transform: translateY(6px) scaleY(1.2); }
+                        100% { height: 46px; opacity: 0; transform: translateY(20px) scaleY(1.4); }
+                    }
+                    @keyframes venomDropFall {
+                        0% { transform: translateY(0) scale(0.35); opacity: 0; }
+                        25% { transform: translateY(4px) scale(1); opacity: 0.95; }
+                        65% { transform: translateY(26px) scale(0.9); opacity: 0.9; }
+                        100% { transform: translateY(48px) scale(0.45); opacity: 0; }
+                    }
+                    .creepy-spider-eye {
+                        position: absolute; border-radius: 50%;
+                        background: radial-gradient(circle at 35% 30%, #ffffff 0%, #ff6b6b 22%, #ef4444 55%, #7f1d1d 85%, #1f0505 100%);
+                        box-shadow: inset 0 0 2px #000, 0 0 6px rgba(239, 68, 68, 0.9); border: 0.8px solid #2a0808;
+                        animation: creepyEyeGleam 1.1s ease-in-out infinite alternate;
+                    }
+                    .creepy-fang-container {
+                        position: absolute; transform-origin: 75% 10%;
+                        transition: transform 0.16s cubic-bezier(0.2, 0.85, 0.3, 1.25);
+                    }
+                    .creepy-venom-drip {
+                        position: absolute; bottom: -28px; width: 1px; transform: translateX(-50%);
+                        background: linear-gradient(to bottom, #ef4444 0%, #a3e635 45%, #84cc16 75%, transparent 100%);
+                        animation: venomThreadStretch 0.85s ease-in infinite; pointer-events: none;
+                    }
+                    .creepy-venom-bead {
+                        position: absolute; bottom: -32px; width: 3.5px; height: 4.5px; margin-left: -1.75px;
+                        border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+                        background: radial-gradient(circle at 35% 35%, #fef08a 0%, #a3e635 45%, #65a30d 100%);
+                        box-shadow: 0 0 6px #84cc16, 0 0 10px rgba(163, 230, 53, 0.7);
+                        animation: venomDropFall 0.85s cubic-bezier(0.4, 0, 0.8, 1) infinite; pointer-events: none;
+                    }
+                </style>
+                <div class="spider-3d-cluster" style="width:100%; height:100%; position:relative; transform-style:preserve-3d; transform: translateZ(-130px) rotateX(-12deg) scale(0.65); opacity:0; transition: transform 0.32s cubic-bezier(0.18, 0.89, 0.32, 1.28), opacity 0.25s ease-in;">
+                    <div style="position:absolute; left:65px; top:16px; width:90px; height:36px; border-radius:50%; background:radial-gradient(ellipse at 50% 40%, rgba(240, 249, 255, 0.9) 0%, rgba(56, 189, 248, 0.5) 45%, rgba(14, 165, 233, 0.15) 75%, transparent 100%); filter:blur(4px); pointer-events:none;"></div>
+                    <div class="creepy-spider-eye" style="left:76px; top:46px; width:7px; height:8px; --erot:-22deg; animation-delay:0.12s;"></div>
+                    <div class="creepy-spider-eye" style="left:92px; top:40px; width:8px; height:9px; --erot:-10deg; animation-delay:0.28s;"></div>
+                    <div class="creepy-spider-eye" style="right:92px; top:40px; width:8px; height:9px; --erot:10deg; animation-delay:0.24s;"></div>
+                    <div class="creepy-spider-eye" style="right:76px; top:46px; width:7px; height:8px; --erot:22deg; animation-delay:0.16s;"></div>
+                    <div class="creepy-spider-eye" style="left:82px; top:61px; width:9px; height:10px; --erot:-30deg; animation-delay:0.35s;"></div>
+                    <div class="creepy-spider-eye" style="left:98px; top:56px; width:13px; height:14px; --erot:-8deg; box-shadow:inset 0 0 2px #000, 0 0 10px #ff0000, 0 0 20px #ef4444; animation-delay:0s;"></div>
+                    <div class="creepy-spider-eye" style="right:98px; top:56px; width:13px; height:14px; --erot:8deg; box-shadow:inset 0 0 2px #000, 0 0 10px #ff0000, 0 0 20px #ef4444; animation-delay:0.04s;"></div>
+                    <div class="creepy-spider-eye" style="right:82px; top:61px; width:9px; height:10px; --erot:30deg; animation-delay:0.32s;"></div>
+                    ${buildYingYangFang('fang-1', 'left:58px; top:88px; width:27px; height:53px; transform: rotateZ(-16deg);', 0)}
+                    ${buildYingYangFang('fang-2', 'left:75px; top:91px; width:29px; height:58px; transform: rotateZ(-10deg);', 1)}
+                    ${buildYingYangFang('fang-3', 'left:93px; top:94px; width:31px; height:63px; transform: rotateZ(-4deg);', 2)}
+                    ${buildYingYangFang('fang-4', 'right:93px; top:94px; width:31px; height:63px; transform: scaleX(-1) rotateZ(-4deg);', 3)}
+                    ${buildYingYangFang('fang-5', 'right:75px; top:91px; width:29px; height:58px; transform: scaleX(-1) rotateZ(-10deg);', 4)}
+                    ${buildYingYangFang('fang-6', 'right:58px; top:88px; width:27px; height:53px; transform: scaleX(-1) rotateZ(-16deg);', 5)}
+                </div>
+            `;
+            document.body.appendChild(bite);
+
+            try {
+                const snd = new Audio('./sound_effects/dark_of_mirkwood/great_spider_attack.mp3');
+                snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                snd.play().catch(()=>{});
+            } catch(e){}
+
+            const cluster = bite.querySelector('.spider-3d-cluster');
+            const f1 = bite.querySelector('.fang-1');
+            const f2 = bite.querySelector('.fang-2');
+            const f3 = bite.querySelector('.fang-3');
+            const f4 = bite.querySelector('.fang-4');
+            const f5 = bite.querySelector('.fang-5');
+            const f6 = bite.querySelector('.fang-6');
+
+            requestAnimationFrame(() => {
+                cluster.style.opacity = '1';
+                cluster.style.transform = 'translateZ(80px) rotateX(0deg) scale(1.15)';
+            });
+
+            setTimeout(() => {
+                f1.style.transform = 'translate(4px, 8px) rotateZ(-32deg)';
+                f2.style.transform = 'translate(4px, 9px) rotateZ(-22deg)';
+                f3.style.transform = 'translate(5px, 10px) rotateZ(-14deg)';
+                f4.style.transform = 'translate(-5px, 10px) scaleX(-1) rotateZ(-14deg)';
+                f5.style.transform = 'translate(-4px, 9px) scaleX(-1) rotateZ(-22deg)';
+                f6.style.transform = 'translate(-4px, 8px) scaleX(-1) rotateZ(-32deg)';
+                cluster.style.transform = 'translateZ(105px) rotateX(4deg) translateY(6px) scale(1.18)';
+
+                if (window.LotrEngine && window.LotrEngine.screenShake) window.LotrEngine.screenShake(14, 320);
+                if (window.LotrEngine && window.LotrEngine.spawnBurstAtElement) window.LotrEngine.spawnBurstAtElement(targetEl, '#dc2626', 30);
+
+                try {
+                    const crunch = new Audio('./sound_effects/spider_attack.mp3');
+                    crunch.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                    crunch.play().catch(()=>{});
+                } catch(e){}
+
+                setTimeout(() => {
+                    cluster.style.opacity = '0';
+                    cluster.style.transform = 'translateZ(-50px) translateY(-15px) scale(0.85)';
+                    setTimeout(() => {
+                        bite.remove();
+                        if (onComplete) onComplete();
+                    }, 240);
+                }, 340);
+            }, 300);
+        };
+    }
+
+    if (!window.launchEyesInTheDarkGlobs) {
+        window.launchEyesInTheDarkGlobs = function(amount, pIdx, onAllComplete) {
+            const ghost = document.getElementById('encounter-limbo-ghost') || document.querySelector('[data-id="nibin_eyes_in_the_dark"]') || document.querySelector('[data-id="oath_eyes_in_the_dark"]') || document.querySelector('[data-id="eyes_in_the_dark"]');
+            const threatEl = document.getElementById('hud-threat');
+            
+            const startRect = ghost ? ghost.getBoundingClientRect() : {left: window.innerWidth/2, top: window.innerHeight/2, width: 144, height: 202};
+            const targetRect = threatEl ? threatEl.getBoundingClientRect() : {left: window.innerWidth/2, top: 20, width: 40, height: 40};
+
+            const startX = startRect.left + startRect.width / 2;
+            const startY = startRect.top + startRect.height / 2;
+            const endX = targetRect.left + targetRect.width / 2;
+            const endY = targetRect.top + targetRect.height / 2;
+            
+            let globsLanded = 0;
+            const engine = window.LotrEngine;
+            const game = engine ? engine.game : window.game;
+            
+            for (let i = 0; i < amount; i++) {
+                setTimeout(() => {
+                    const glob = document.createElement('div');
+                    glob.style.cssText = `
+                        position: fixed; left: ${startX}px; top: ${startY}px;
+                        width: 0px; height: 0px;
+                        z-index: 100000; pointer-events: none;
+                        perspective: 800px; transform-style: preserve-3d;
+                    `;
+                    
+                    glob.innerHTML = `
+                        <div class="glob-projectile" style="position:absolute; top:-25px; left:-25px; width:50px; height:50px; transform-style:preserve-3d;">
+                            <svg class="glob-tail" viewBox="0 0 160 50" style="position:absolute; top:0; left:-135px; width:160px; height:50px; filter:drop-shadow(0 0 5px #ffffff) drop-shadow(0 0 8px rgba(186,230,253,0.8)); overflow:visible;">
+                                <path d="M160 25 Q110 4 0 16" fill="none" stroke="rgba(255,255,255,0.9)" stroke-width="2.6" stroke-linecap="round"/>
+                                <path d="M160 25 Q95 46 12 36" fill="none" stroke="rgba(226,232,240,0.75)" stroke-width="2.2" stroke-linecap="round"/>
+                                <path d="M160 25 Q75 25 0 25" fill="none" stroke="#ffffff" stroke-width="4.2" stroke-linecap="round"/>
+                                <path d="M125 18 L125 32 M85 12 L85 38 M45 15 L45 35" fill="none" stroke="rgba(255,255,255,0.6)" stroke-width="1.8"/>
+                                <circle cx="20" cy="25" r="2.5" fill="#ffffff"/>
+                                <circle cx="65" cy="25" r="3.2" fill="#ffffff"/>
+                                <circle cx="110" cy="25" r="3.6" fill="#ffffff"/>
+                            </svg>
+                            <div class="glob-core" style="position:absolute; inset:0; border-radius:50%; background: radial-gradient(circle at 30% 30%, #ffffff 0%, #cbd5e1 40%, #64748b 80%, #0f172a 100%); box-shadow: 0 5px 15px rgba(0,0,0,0.6), 0 0 10px #ffffff, inset -5px -5px 10px rgba(0,0,0,0.5); transform: translateZ(10px); transform-style:preserve-3d;">
+                                <div style="position:absolute; inset:-2px; border-radius:50%; border: 3px solid rgba(255,255,255,0.85); transform: rotateX(45deg) rotateY(45deg); pointer-events:none;"></div>
+                                <div style="position:absolute; inset:-2px; border-radius:50%; border: 2px solid rgba(226,232,240,0.95); transform: rotateX(-45deg) rotateY(-30deg); pointer-events:none;"></div>
+                            </div>
+                        </div>
+                    `;
+                    document.body.appendChild(glob);
+
+                    try {
+                        const snd = new Audio('./sound_effects/dark_of_mirkwood/spider_den_glob.mp3');
+                        snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25) * 0.7;
+                        snd.play().catch(()=>{});
+                    } catch(e) {}
+
+                    const launchTime = performance.now();
+                    const flightDuration = 450 + Math.random() * 150;
+                    const arcDir = (i % 2 === 0 ? 1 : -1) * (40 + Math.random() * 50);
+                    const p0 = { x: startX, y: startY };
+                    const p1 = { x: (startX + endX) / 2 + arcDir, y: (startY + endY) / 2 - 120 };
+                    const p2 = { x: endX, y: endY };
+
+                    const animateGlob = (now) => {
+                        const elapsed = now - launchTime;
+                        const progress = Math.min(1, elapsed / flightDuration);
+                        const t = progress;
+                        const invT = 1 - t;
+                        const curX = invT * invT * p0.x + 2 * invT * t * p1.x + t * t * p2.x;
+                        const curY = invT * invT * p0.y + 2 * invT * t * p1.y + t * t * p2.y;
+
+                        const vx = 2 * invT * (p1.x - p0.x) + 2 * t * (p2.x - p1.x);
+                        const vy = 2 * invT * (p1.y - p0.y) + 2 * t * (p2.y - p1.y);
+                        const angleDeg = Math.atan2(vy, vx) * (180 / Math.PI);
+
+                        glob.style.left = `${curX}px`;
+                        glob.style.top = `${curY}px`;
+                        
+                        const proj = glob.querySelector('.glob-projectile');
+                        const core = glob.querySelector('.glob-core');
+                        if (proj) {
+                            proj.style.transform = `scale(${0.8 + Math.sin(progress * Math.PI) * 0.4}) rotateZ(${angleDeg}deg)`;
+                        }
+                        if (core) {
+                            core.style.transform = `rotateX(${progress * 720}deg) rotateY(${progress * 360}deg)`;
+                        }
+                        
+                        if (progress < 1) {
+                            requestAnimationFrame(animateGlob);
+                        } else {
+                            glob.remove();
+                            
+                            const splatter = document.createElement('div');
+                            splatter.style.cssText = `
+                                position: fixed; left: ${endX}px; top: ${endY}px;
+                                width: 0px; height: 0px; z-index: 99999;
+                                pointer-events: none; perspective: 1000px;
+                            `;
+
+                            const clipPolygons = [
+                                'polygon(12% 0%, 28% 18%, 52% 4%, 68% 22%, 92% 8%, 84% 38%, 100% 52%, 82% 74%, 96% 94%, 64% 86%, 48% 100%, 32% 84%, 4% 92%, 18% 66%, 0% 48%, 22% 28%)',
+                                'polygon(18% 2%, 35% 22%, 58% 8%, 76% 26%, 98% 12%, 88% 44%, 96% 62%, 78% 80%, 92% 98%, 58% 88%, 42% 96%, 26% 80%, 2% 86%, 14% 58%, 0% 36%, 18% 18%)',
+                                'polygon(6% 8%, 24% 24%, 46% 0%, 72% 16%, 90% 2%, 86% 32%, 100% 46%, 76% 70%, 98% 86%, 66% 80%, 54% 100%, 38% 88%, 0% 96%, 16% 70%, 2% 54%, 26% 36%)'
+                            ];
+                            
+                            let webHTML = '';
+                            for(let w = 0; w < 3; w++) {
+                                const rotZ = Math.random() * 360;
+                                const rotX = (Math.random() - 0.5) * 65;
+                                const rotY = (Math.random() - 0.5) * 65;
+                                const poly = clipPolygons[w % clipPolygons.length];
+
+                                webHTML += `
+                                    <div style="position:absolute; top:-75px; left:-75px; width:150px; height:150px; 
+                                        background: repeating-radial-gradient(circle at center, transparent 0, transparent 9px, rgba(255,255,255,0.85) 10px, rgba(226,232,240,0.95) 11.5px), 
+                                                    repeating-conic-gradient(from 0deg, rgba(255,255,255,0.95) 0deg, rgba(255,255,255,0.95) 2.2deg, transparent 3.5deg, transparent 28deg);
+                                        clip-path: ${poly};
+                                        opacity:0;
+                                        transform-style: preserve-3d;
+                                        transform: translateZ(${w*12}px) rotateZ(${rotZ}deg) rotateX(${rotX}deg) rotateY(${rotY}deg) scale(0.1);
+                                        transition: transform 0.38s cubic-bezier(0.18, 0.89, 0.32, 1.28), opacity 0.2s ease-out;
+                                        filter: drop-shadow(0 6px 14px rgba(0,0,0,0.95));"
+                                        class="web-splat-layer">
+                                    </div>
+                                `;
+                            }
+                            splatter.innerHTML = webHTML;
+                            document.body.appendChild(splatter);
+                            
+                            requestAnimationFrame(() => {
+                                splatter.querySelectorAll('.web-splat-layer').forEach((layer, lIdx) => {
+                                    layer.style.opacity = '1';
+                                    const origTransform = layer.style.transform.replace('scale(0.1)', `scale(${1.05 + lIdx * 0.28})`);
+                                    layer.style.transform = origTransform;
+                                });
+                            });
+                            
+                            setTimeout(() => {
+                                splatter.querySelectorAll('.web-splat-layer').forEach(layer => {
+                                    layer.style.transition = 'opacity 0.45s ease-in, transform 0.45s ease-in';
+                                    layer.style.opacity = '0';
+                                    layer.style.transform += ' scale(1.22)';
+                                });
+                                setTimeout(() => splatter.remove(), 480);
+                            }, 750);
+
+                            try {
+                                const incSnd = new Audio('./sound_effects/threat_increase.mp3');
+                                incSnd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                                incSnd.play().catch(()=>{});
+                            } catch(e) {}
+                            
+                            if (game) {
+                                game.threats[pIdx] += 1;
+                                if (game.numPlayers === 1) game.threat += 1;
+                                if (engine && engine.render) engine.render();
+                            }
+                            
+                            if (threatEl) {
+                                threatEl.style.transform = 'scale(1.4)';
+                                setTimeout(() => threatEl.style.transform = 'scale(1)', 100);
+                            }
+                            if (engine && engine.spawnBurstAtElement) engine.spawnBurstAtElement(threatEl, '#ffffff', 20);
+                            if (engine && engine.screenShake) engine.screenShake(6, 200);
+                            
+                            const diffEl = document.getElementById('hud-threat-diff');
+                            if (diffEl) {
+                                diffEl.textContent = `+${globsLanded + 1}`;
+                                diffEl.classList.remove('threat-diff-active');
+                                void diffEl.offsetWidth;
+                                diffEl.classList.add('threat-diff-active');
+                                setTimeout(() => { diffEl.classList.remove('threat-diff-active'); diffEl.textContent = ''; }, 3500);
+                            }
+                            
+                            globsLanded++;
+                            if (globsLanded === amount) {
+                                setTimeout(() => {
+                                    if (game && game.threats[pIdx] >= 50 && engine && engine.eliminatePlayer) engine.eliminatePlayer(pIdx);
+                                    if (onAllComplete) onAllComplete();
+                                }, 400);
+                            }
+                        }
+                    };
+                    requestAnimationFrame(animateGlob);
+                }, i * 300);
+            }
+        };
+    }
+
+    if (!window.launch3DObsidianArrows) {
+        window.launch3DObsidianArrows = function({ sourceEl, targetUid, count = 1, soundPath = '', onComplete = null }) {
+            if (soundPath) {
+                try {
+                    const snd = new Audio(soundPath);
+                    const volSlider = document.getElementById('volume-slider');
+                    snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                    snd.play().catch(() => {});
+                } catch(e) {}
+            }
+
+            const targetEl = document.querySelector(`[data-uid="${targetUid}"]`);
+            const sRect = sourceEl ? sourceEl.getBoundingClientRect() : { left: window.innerWidth / 2 - 72, top: window.innerHeight / 2 - 101, width: 144, height: 202 };
+            const tRect = targetEl ? targetEl.getBoundingClientRect() : { left: window.innerWidth / 2 - 72, top: window.innerHeight / 2 - 101, width: 144, height: 202 };
+
+            const arrowSvgMarkup = `
+                <svg viewBox="0 0 130 26" width="130" height="26" style="overflow:visible; filter: drop-shadow(0 2px 5px rgba(0,0,0,0.95));">
+                    <defs>
+                        <linearGradient id="obsidianGlass_nibin" x1="0%" y1="0%" x2="100%" y2="50%">
+                            <stop offset="0%" stop-color="#050508"/>
+                            <stop offset="35%" stop-color="#1e1b4b"/>
+                            <stop offset="70%" stop-color="#0f172a"/>
+                            <stop offset="92%" stop-color="#e2e8f0"/>
+                            <stop offset="100%" stop-color="#ffffff"/>
+                        </linearGradient>
+                        <linearGradient id="obsidianFacetUnder_nibin" x1="0%" y1="50%" x2="100%" y2="100%">
+                            <stop offset="0%" stop-color="#020204"/>
+                            <stop offset="50%" stop-color="#09090b"/>
+                            <stop offset="100%" stop-color="#1e1b4b"/>
+                        </linearGradient>
+                        <linearGradient id="arrowShaft_nibin" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" stop-color="#451a03"/>
+                            <stop offset="40%" stop-color="#271206"/>
+                            <stop offset="100%" stop-color="#0f0502"/>
+                        </linearGradient>
+                        <linearGradient id="ravenFeather_nibin" x1="0%" y1="0%" x2="100%" y2="0%">
+                            <stop offset="0%" stop-color="#0f172a"/>
+                            <stop offset="50%" stop-color="#1e1b4b"/>
+                            <stop offset="100%" stop-color="#334155"/>
+                        </linearGradient>
+                    </defs>
+                    <line x1="6" y1="13" x2="106" y2="13" stroke="url(#arrowShaft_nibin)" stroke-width="3.6" stroke-linecap="round"/>
+                    <line x1="8" y1="12.2" x2="104" y2="12.2" stroke="#78350f" stroke-width="0.8" opacity="0.6"/>
+                    <path d="M 10,12.5 L 18,5 L 34,5 L 36,12.5 Z" fill="url(#ravenFeather_nibin)"/>
+                    <path d="M 10,13.5 L 18,21 L 34,21 L 36,13.5 Z" fill="url(#ravenFeather_nibin)"/>
+                    <line x1="16" y1="6" x2="14" y2="12" stroke="#020617" stroke-width="0.8"/>
+                    <line x1="22" y1="6" x2="20" y2="12" stroke="#020617" stroke-width="0.8"/>
+                    <line x1="28" y1="6" x2="26" y2="12" stroke="#020617" stroke-width="0.8"/>
+                    <line x1="16" y1="20" x2="14" y2="14" stroke="#020617" stroke-width="0.8"/>
+                    <line x1="22" y1="20" x2="20" y2="14" stroke="#020617" stroke-width="0.8"/>
+                    <line x1="28" y1="20" x2="26" y2="14" stroke="#020617" stroke-width="0.8"/>
+                    <rect x="8" y="11" width="3" height="4" fill="#991b1b" rx="0.5"/>
+                    <rect x="35" y="11" width="3.5" height="4" fill="#991b1b" rx="0.5"/>
+                    <rect x="101" y="11" width="7" height="4.2" fill="#78350f" rx="0.8"/>
+                    <line x1="103" y1="11" x2="104" y2="15.2" stroke="#451a03" stroke-width="1"/>
+                    <line x1="106" y1="11" x2="107" y2="15.2" stroke="#451a03" stroke-width="1"/>
+                    <polygon points="106,13 111,6 128,13" fill="url(#obsidianGlass_nibin)"/>
+                    <polygon points="106,13 111,20 128,13" fill="url(#obsidianFacetUnder_nibin)"/>
+                    <polygon points="104,13 108,7 112,11 108,13" fill="#09090b"/>
+                    <polygon points="104,13 108,19 112,15 108,13" fill="#020204"/>
+                    <line x1="107" y1="13" x2="128" y2="13" stroke="#ffffff" stroke-width="1.1" stroke-linecap="round"/>
+                    <path d="M 111,6 L 128,13 L 111,20" fill="none" stroke="rgba(255,255,255,0.6)" stroke-width="0.8"/>
+                </svg>
+            `;
+
+            let completed = 0;
+            for (let i = 0; i < count; i++) {
+                setTimeout(() => {
+                    const startX = sRect.left + sRect.width / 2 + (count > 1 ? (Math.random() - 0.5) * 45 : 0);
+                    const startY = sRect.top + sRect.height / 2 + (count > 1 ? (Math.random() - 0.5) * 45 : 0);
+                    const endX = tRect.left + tRect.width / 2 + (count > 1 ? (Math.random() - 0.5) * (tRect.width * 0.45) : (Math.random() - 0.5) * 14);
+                    const endY = tRect.top + tRect.height / 2 + (count > 1 ? (Math.random() - 0.5) * (tRect.height * 0.45) : (Math.random() - 0.5) * 14);
+
+                    const lateralArc = (i % 2 === 0 ? -1 : 1) * (20 + Math.random() * 25);
+                    const arcHeight = 55 + Math.random() * 35;
+                    const midX = (startX + endX) / 2 + lateralArc;
+                    const midY = Math.min(startY, endY) - arcHeight;
+
+                    const p0 = { x: startX, y: startY };
+                    const p1 = { x: midX, y: midY };
+                    const p2 = { x: endX, y: endY };
+
+                    const arrowWrap = document.createElement('div');
+                    arrowWrap.style.cssText = `
+                        position: fixed;
+                        left: ${startX}px;
+                        top: ${startY}px;
+                        width: 130px;
+                        height: 26px;
+                        margin-left: -128px;
+                        margin-top: -13px;
+                        transform-origin: 128px 13px;
+                        z-index: 100005;
+                        pointer-events: none;
+                        perspective: 800px;
+                        opacity: 0;
+                    `;
+
+                    const arrow3D = document.createElement('div');
+                    arrow3D.style.cssText = `
+                        width: 100%;
+                        height: 100%;
+                        transform-style: preserve-3d;
+                    `;
+                    arrow3D.innerHTML = arrowSvgMarkup;
+                    arrowWrap.appendChild(arrow3D);
+                    document.body.appendChild(arrowWrap);
+
+                    const flightDuration = 390 + Math.random() * 70;
+                    const startTime = performance.now();
+                    const spinDirection = i % 2 === 0 ? 1 : -1;
+                    const totalRotations = (3 + Math.random()) * 360 * spinDirection;
+
+                    const animateArrow = (now) => {
+                        const elapsed = now - startTime;
+                        const progress = Math.min(1, elapsed / flightDuration);
+                        const t = progress;
+                        const invT = 1 - t;
+
+                        const curX = invT * invT * p0.x + 2 * invT * t * p1.x + t * t * p2.x;
+                        const curY = invT * invT * p0.y + 2 * invT * t * p1.y + t * t * p2.y;
+
+                        const vx = 2 * invT * (p1.x - p0.x) + 2 * t * (p2.x - p1.x);
+                        const vy = 2 * invT * (p1.y - p0.y) + 2 * t * (p2.y - p1.y);
+                        const flightAngle = Math.atan2(vy, vx) * (180 / Math.PI);
+
+                        arrowWrap.style.left = `${curX}px`;
+                        arrowWrap.style.top = `${curY}px`;
+                        arrowWrap.style.transform = `rotate(${flightAngle}deg) scale(${0.85 + progress * 0.15})`;
+                        arrowWrap.style.opacity = Math.min(1, progress * 4);
+                        arrow3D.style.transform = `rotateX(${t * totalRotations}deg)`;
+
+                        if (progress < 1) {
+                            requestAnimationFrame(animateArrow);
+                        } else {
+                            if (window.shakeCard) window.shakeCard(targetUid);
+                            if (window.LotrEngine && window.LotrEngine.spawnBurstAtElement) {
+                                window.LotrEngine.spawnBurstAtElement(targetEl, '#c0392b', 10);
+                                window.LotrEngine.spawnBurstAtElement(targetEl, '#0f172a', 8);
+                            }
+
+                            arrowWrap.style.transition = 'opacity 0.28s ease-out';
+                            setTimeout(() => {
+                                arrowWrap.style.opacity = '0';
+                                setTimeout(() => arrowWrap.remove(), 280);
+                            }, 260);
+
+                            completed++;
+                            if (completed === count && onComplete) {
+                                onComplete();
+                            }
+                        }
+                    };
+
+                    requestAnimationFrame(animateArrow);
+                }, i * 55);
+            }
+        };
+    }
+
+    function playCrumblingRuinAudio(card) {
+        if (card && card._crumblingRuinFlippedAudio) return;
+        if (card) card._crumblingRuinFlippedAudio = true;
+        if (window._crumblingRuinAudioCooldown) return;
+        window._crumblingRuinAudioCooldown = true;
+        setTimeout(() => { window._crumblingRuinAudioCooldown = false; }, 3000);
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/crumbling_ruin.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch (e) {}
+    }
+    window.playCrumblingRuinAudio = playCrumblingRuinAudio;
+
+    const origAnimateEncounterGhostToFinal = window.animateEncounterGhostToFinal;
+    if (origAnimateEncounterGhostToFinal && !window._nibinGhostToFinalPatched) {
+        window._nibinGhostToFinalPatched = true;
+        window.animateEncounterGhostToFinal = function(card, onComplete) {
+            if (typeof window._triggerDungeonTravelEarly === 'function') {
+                window._triggerDungeonTravelEarly();
+            }
+            return origAnimateEncounterGhostToFinal.apply(this, arguments);
+        };
+    }
+
+    function playBranchingPathsAudio(card) {
+        if (card && card._branchingPathsFlippedAudio) return;
+        if (card) card._branchingPathsFlippedAudio = true;
+        if (window._branchingPathsAudioCooldown) return;
+        window._branchingPathsAudioCooldown = true;
+        setTimeout(() => { window._branchingPathsAudioCooldown = false; }, 3000);
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/branching_paths.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch (e) {}
+    }
+    window.playBranchingPathsAudio = playBranchingPathsAudio;
+
+    function playLightlessPassageAudio(card) {
+        if (card && card._lightlessPassageFlippedAudio) return;
+        if (card) card._lightlessPassageFlippedAudio = true;
+        if (window._lightlessPassageAudioCooldown) return;
+        window._lightlessPassageAudioCooldown = true;
+        setTimeout(() => { window._lightlessPassageAudioCooldown = false; }, 3000);
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/lightless_passage.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch (e) {}
+    }
+    window.playLightlessPassageAudio = playLightlessPassageAudio;
+
+    function playGoblinTunnelsAudio(card) {
+        if (card && card._goblinTunnelsFlippedAudio) return;
+        if (card) card._goblinTunnelsFlippedAudio = true;
+        if (window._goblinTunnelsAudioCooldown) return;
+        window._goblinTunnelsAudioCooldown = true;
+        setTimeout(() => { window._goblinTunnelsAudioCooldown = false; }, 3000);
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/goblin_tunnels.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch (e) {}
+    }
+    window.playGoblinTunnelsAudio = playGoblinTunnelsAudio;
+
+    // =========================================================================
+    // GOBLIN TUNNELS: "SUBTERRANEAN DRAFT & DUST" & "THE GOBLIN CLAW SNATCH"
+    // Visual effects for Goblin Tunnels location (100% Canvas 2D - strictly NO SVG)
+    // =========================================================================
+
+    function playGoblinClawSnatchAudio() {
+        try {
+            const volSlider = document.getElementById('volume-slider');
+            const vol = volSlider ? parseFloat(volSlider.value) : 0.35;
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/goblin_chieftain_progress.mp3');
+            snd.volume = vol;
+            snd.play().catch(() => {
+                const fallbackSnd = new Audio('./sound_effects/dark_of_mirkwood/goblin_chieftain.mp3');
+                fallbackSnd.volume = vol;
+                fallbackSnd.play().catch(() => {});
+            });
+        } catch (e) {}
+    }
+    window.playGoblinClawSnatchAudio = playGoblinClawSnatchAudio;
+
+    // Map tracking active draft & dust canvas overlays for Goblin Tunnels cards in staging
+    const _activeGoblinTunnelsDrafts = new Map();
+
+    function initGoblinTunnelsMotes(count) {
+        const motes = [];
+        for (let i = 0; i < count; i++) {
+            motes.push({
+                relX: 0.06 + Math.random() * 0.88,
+                relY: 0.15 + Math.random() * 0.85,
+                vy: 0.0022 + Math.random() * 0.0042,
+                swayAmp: 0.0012 + Math.random() * 0.0024,
+                swaySpeed: 0.0015 + Math.random() * 0.0025,
+                swayPhase: Math.random() * Math.PI * 2,
+                size: 0.8 + Math.random() * 2.4,
+                isRock: Math.random() < 0.3,
+                rot: Math.random() * Math.PI * 2,
+                rotSpeed: (Math.random() - 0.5) * 0.025,
+                paletteIdx: Math.floor(Math.random() * 4),
+                baseAlpha: 0.38 + Math.random() * 0.45
+            });
+        }
+        return motes;
+    }
+
+    function initGoblinTunnelsWisps(count) {
+        const wisps = [];
+        for (let i = 0; i < count; i++) {
+            wisps.push({
+                relX: 0.15 + Math.random() * 0.7,
+                relY: 0.25 + Math.random() * 0.75,
+                vy: 0.0014 + Math.random() * 0.0022,
+                radius: 18 + Math.random() * 24,
+                swaySpeed: 0.001 + Math.random() * 0.0016,
+                swayPhase: Math.random() * Math.PI * 2,
+                alpha: 0.07 + Math.random() * 0.08
+            });
+        }
+        return wisps;
+    }
+
+    // 60FPS Sync Loop for "Subterranean Draft & Dust"
+    (function syncGoblinTunnelsDraftLoop() {
+        const engine = window.LotrEngine;
+        const game = engine ? engine.game : window.game;
+
+        if (game && game.stagingArea && !game.gameOver) {
+            // Find all Goblin Tunnels locations in staging area
+            const activeTunnels = game.stagingArea.filter(c => c && (c.id === 'nibin_goblin_tunnels' || c.id === 'goblin_tunnels' || c.name === 'Goblin Tunnels'));
+            const activeUids = new Set(activeTunnels.map(c => c._uid));
+
+            // Clean up canvases for cards that left the staging area
+            _activeGoblinTunnelsDrafts.forEach((data, uid) => {
+                if (!activeUids.has(uid)) {
+                    data.canvas.style.opacity = '0';
+                    setTimeout(() => {
+                        data.canvas.remove();
+                        _activeGoblinTunnelsDrafts.delete(uid);
+                    }, 400);
+                }
+            });
+
+            // Update or create draft canvas for each active Goblin Tunnels in staging
+            activeTunnels.forEach(card => {
+                let data = _activeGoblinTunnelsDrafts.get(card._uid);
+                if (!data) {
+                    const canvas = document.createElement('canvas');
+                    canvas.className = 'goblin-tunnels-draft-canvas';
+                    canvas.style.cssText = `
+                        position: fixed;
+                        pointer-events: none;
+                        z-index: 10025;
+                        opacity: 0;
+                        transition: opacity 0.4s ease-out;
+                    `;
+                    document.body.appendChild(canvas);
+                    const ctx = canvas.getContext('2d');
+                    data = {
+                        canvas,
+                        ctx,
+                        motes: initGoblinTunnelsMotes(32),
+                        wisps: initGoblinTunnelsWisps(6),
+                        startTime: performance.now()
+                    };
+                    _activeGoblinTunnelsDrafts.set(card._uid, data);
+                    requestAnimationFrame(() => { canvas.style.opacity = '1'; });
+                }
+
+                // Query the Goblin Tunnels card element inside staging
+                const cardEl = document.querySelector(`#staging-content .card[data-uid="${card._uid}"]`) ||
+                               document.querySelector(`#staging-content .card[data-id="${card.id}"]`) ||
+                               document.querySelector(`.card[data-uid="${card._uid}"]`);
+
+                if (!cardEl || cardEl.style.display === 'none' || cardEl.style.visibility === 'hidden' || cardEl.style.opacity === '0') {
+                    data.canvas.style.opacity = '0';
+                    return;
+                }
+
+                const r = cardEl.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) {
+                    data.canvas.style.opacity = '0';
+                    return;
+                }
+                data.canvas.style.opacity = '1';
+
+                // Generous margins: padTop=90px so rock-dust motes and cold air waft UPWARDS OUT OF THE CARD FRAME!
+                const padX = 32;
+                const padTop = 90;
+                const padBottom = 20;
+                const targetW = Math.round(r.width + padX * 2);
+                const targetH = Math.round(r.height + padTop + padBottom);
+                const dpr = window.devicePixelRatio || 1;
+
+                if (data.canvas.width !== targetW * dpr || data.canvas.height !== targetH * dpr) {
+                    data.canvas.width = targetW * dpr;
+                    data.canvas.height = targetH * dpr;
+                }
+
+                data.canvas.style.left = `${Math.round(r.left - padX)}px`;
+                data.canvas.style.top = `${Math.round(r.top - padTop)}px`;
+                data.canvas.style.width = `${targetW}px`;
+                data.canvas.style.height = `${targetH}px`;
+
+                const ctx = data.ctx;
+                ctx.save();
+                ctx.clearRect(0, 0, data.canvas.width, data.canvas.height);
+                ctx.scale(dpr, dpr);
+
+                const cLeft = padX;
+                const cTop = padTop;
+                const cWidth = r.width;
+                const cHeight = r.height;
+                const cBottom = padTop + r.height;
+
+                const now = performance.now();
+                const t = (now - data.startTime) * 0.001;
+                // Subtle rhythmic pulsing shadow along the bottom of the card (~3.2s breathing cycle)
+                const pulse = 0.5 + 0.5 * Math.sin(t * 1.95);
+
+                // 1. "A subtle rhythmic pulsing shadow along the bottom of the card" (soft edges & narrower width)
+                // Centered cavernous pit abyss with ultra-soft isotropic radial falloff (softer top edges)
+                // Moved up so the bottom of the shadow lines up with the bottom of the card
+                const pitCx = cLeft + cWidth * 0.5;
+                const pitRx = cWidth * 0.35 + 5 * pulse;
+                const pitRy = 28 + 6 * pulse;
+                const pitCy = cBottom - pitRy;
+
+                // Isotropically scaled soft radial gradient so the top edge fades out seamlessly to 0 alpha
+                // and the bottom reaches cBottom cleanly without protruding below the card
+                ctx.save();
+                ctx.translate(pitCx, pitCy);
+                ctx.scale(pitRx, pitRy);
+
+                const softPitGrad = ctx.createRadialGradient(0, 0.18, 0, 0, 0, 1.0);
+                softPitGrad.addColorStop(0, `rgba(3, 1, 5, ${0.72 + 0.08 * pulse})`);
+                softPitGrad.addColorStop(0.20, `rgba(6, 3, 9, ${0.52 + 0.07 * pulse})`);
+                softPitGrad.addColorStop(0.45, `rgba(12, 6, 17, ${0.26 + 0.05 * pulse})`);
+                softPitGrad.addColorStop(0.70, `rgba(16, 8, 22, ${0.08 + 0.03 * pulse})`);
+                softPitGrad.addColorStop(0.88, `rgba(14, 7, 20, 0.02)`);
+                softPitGrad.addColorStop(1.0, 'rgba(10, 5, 14, 0)');
+
+                ctx.fillStyle = softPitGrad;
+                ctx.beginPath();
+                ctx.arc(0, 0, 1.0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+
+                // Subtle soft subterranean wisps restricted to the narrow central pit zone
+                for (let i = 0; i < 3; i++) {
+                    const tx = pitCx + (i - 1) * (pitRx * 0.40);
+                    const sway = Math.sin(t * 1.8 + i * 1.6) * 3.5;
+                    const th = (13 + 6 * pulse) + Math.sin(t * 1.3 + i) * 3;
+                    ctx.save();
+                    ctx.shadowColor = 'rgba(12, 5, 18, 0.6)';
+                    ctx.shadowBlur = 10;
+                    ctx.strokeStyle = `rgba(16, 8, 22, ${0.22 + 0.10 * pulse})`;
+                    ctx.lineWidth = 2.4;
+                    ctx.lineCap = 'round';
+                    ctx.beginPath();
+                    ctx.moveTo(tx - 2, cBottom);
+                    ctx.quadraticCurveTo(tx + sway, cBottom - th * 0.55, tx + sway * 0.5, cBottom - th);
+                    ctx.stroke();
+                    ctx.restore();
+                }
+
+                // 2. Cold air rushing vapor wisps wafting from the deep pit
+                data.wisps.forEach(w => {
+                    w.relY -= w.vy;
+                    w.relX += Math.sin(t * 1.3 + w.swayPhase) * w.swaySpeed;
+                    if (w.relY < -0.22) {
+                        w.relY = 0.94 + Math.random() * 0.1;
+                        w.relX = 0.12 + Math.random() * 0.76;
+                    }
+                    const wx = cLeft + w.relX * cWidth;
+                    const wy = cTop + w.relY * cHeight;
+                    let wAlpha = w.alpha;
+                    if (w.relY > 0.8) wAlpha *= (1.0 - w.relY) / 0.2;
+                    else if (w.relY < 0.1) wAlpha *= Math.max(0, (w.relY + 0.22) / 0.32);
+                    if (wAlpha > 0.005) {
+                        const wg = ctx.createRadialGradient(wx, wy, 0, wx, wy, w.radius);
+                        wg.addColorStop(0, `rgba(205, 218, 230, ${wAlpha * 0.22})`);
+                        wg.addColorStop(0.5, `rgba(165, 180, 198, ${wAlpha * 0.11})`);
+                        wg.addColorStop(1, 'rgba(130, 145, 165, 0)');
+                        ctx.fillStyle = wg;
+                        ctx.beginPath();
+                        ctx.arc(wx, wy, w.radius, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                });
+
+                // 3. Faint subterranean rock-dust motes wafting upwards OUT OF THE CARD FRAME
+                data.motes.forEach(m => {
+                    m.relY -= m.vy;
+                    m.relX += Math.sin(t * 1.7 + m.swayPhase) * m.swayAmp;
+                    m.rot += m.rotSpeed;
+                    // When it wafts past the top of the card frame (-0.35) into open staging air
+                    if (m.relY < -0.35) {
+                        m.relY = 0.96 + Math.random() * 0.12;
+                        m.relX = 0.06 + Math.random() * 0.88;
+                        m.vy = 0.0022 + Math.random() * 0.0038;
+                    }
+                    const mx = cLeft + m.relX * cWidth;
+                    const my = cTop + m.relY * cHeight;
+
+                    let alpha = m.baseAlpha;
+                    if (m.relY > 0.85) {
+                        // Fade in as it emerges from the pit
+                        alpha *= Math.max(0, (1.0 - m.relY) / 0.15);
+                    } else if (m.relY < 0) {
+                        // Wafting upwards out of the top card frame
+                        alpha *= Math.max(0, 1 - (-m.relY) / 0.35);
+                    }
+                    if (alpha <= 0.01) return;
+
+                    let color;
+                    if (m.paletteIdx === 0) color = `rgba(226, 218, 208, ${alpha})`;
+                    else if (m.paletteIdx === 1) color = `rgba(185, 172, 156, ${alpha})`;
+                    else if (m.paletteIdx === 2) color = `rgba(162, 175, 190, ${alpha})`;
+                    else color = `rgba(112, 104, 98, ${alpha})`;
+
+                    if (m.isRock) {
+                        // Jagged tumbling subterranean rock crumb
+                        ctx.save();
+                        ctx.translate(mx, my);
+                        ctx.rotate(m.rot);
+                        ctx.fillStyle = color;
+                        const s = m.size;
+                        ctx.beginPath();
+                        ctx.moveTo(-s * 0.5, -s * 0.4);
+                        ctx.lineTo(s * 0.6, -s * 0.25);
+                        ctx.lineTo(s * 0.4, s * 0.5);
+                        ctx.lineTo(-s * 0.4, s * 0.35);
+                        ctx.closePath();
+                        ctx.fill();
+                        ctx.restore();
+                    } else {
+                        // Fine glowing rock-dust mote
+                        ctx.beginPath();
+                        ctx.arc(mx, my, m.size * 0.6, 0, Math.PI * 2);
+                        ctx.fillStyle = color;
+                        ctx.fill();
+                        if (m.size > 1.6) {
+                            ctx.beginPath();
+                            ctx.arc(mx, my, m.size * 1.4, 0, Math.PI * 2);
+                            ctx.fillStyle = `rgba(235, 225, 215, ${alpha * 0.22})`;
+                            ctx.fill();
+                        }
+                    }
+                });
+
+                ctx.restore();
+            });
+        } else {
+            // Clean up all draft canvases when game ends or no staging
+            _activeGoblinTunnelsDrafts.forEach((data) => {
+                data.canvas.remove();
+            });
+            _activeGoblinTunnelsDrafts.clear();
+        }
+
+        requestAnimationFrame(syncGoblinTunnelsDraftLoop);
+    })();
+
+    // =========================================================================
+    // DUST AND THE GOBLIN CLAW SNATCH
+    // A dark shadowy Goblin claw swiping out from the Goblin Tunnels card across
+    // the board directly to the Quest Card's progress token, snatching it and
+    // yanking it back down into the tunnels as it dissolves. (100% Canvas 2D)
+    // =========================================================================
+
+    window._goblinClawSnatchQueue = [];
+    window._isGoblinClawSnatching = false;
+
+    // Procedural Goblin Hand & Talons Drawer with Soft Edges and Soft Inner (No SVG!)
+    function drawGoblinClawHand(ctx, hx, hy, angle, curl, alpha, holdsToken) {
+        ctx.save();
+        ctx.translate(hx, hy);
+        ctx.rotate(angle);
+        ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+
+        // Soft shadowy glow
+        ctx.shadowColor = 'rgba(12, 5, 20, 0.85)';
+        ctx.shadowBlur = 20;
+
+        // 1. Soft Wrist Cords
+        ctx.strokeStyle = 'rgba(14, 6, 22, 0.38)';
+        ctx.lineWidth = 22;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(-18, 0);
+        ctx.lineTo(0, 0);
+        ctx.stroke();
+
+        ctx.strokeStyle = 'rgba(28, 12, 42, 0.65)';
+        ctx.lineWidth = 14;
+        ctx.beginPath();
+        ctx.moveTo(-16, 0);
+        ctx.lineTo(0, 0);
+        ctx.stroke();
+
+        // 2. Soft-edged Palm with Radial Gradient (soft inner & soft feathered edges)
+        const palmGrad = ctx.createRadialGradient(2, 0, 0, 2, 0, 19);
+        palmGrad.addColorStop(0, 'rgba(34, 15, 50, 0.75)');
+        palmGrad.addColorStop(0.40, 'rgba(22, 9, 32, 0.60)');
+        palmGrad.addColorStop(0.75, 'rgba(12, 5, 18, 0.35)');
+        palmGrad.addColorStop(1.0, 'rgba(8, 3, 14, 0)');
+        ctx.fillStyle = palmGrad;
+        ctx.beginPath();
+        ctx.ellipse(2, 0, 19, 15, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 3. Stolen Progress Token (drawn trapped inside the clenched fist during yank back)
+        if (holdsToken) {
+            ctx.save();
+            ctx.shadowColor = 'rgba(235, 60, 40, 0.85)';
+            ctx.shadowBlur = 14;
+
+            // Diamond Progress Token Base
+            const ts = 16;
+            ctx.fillStyle = '#1a1008';
+            ctx.strokeStyle = '#d35400';
+            ctx.lineWidth = 2.2;
+            ctx.beginPath();
+            ctx.moveTo(3, -ts);
+            ctx.lineTo(3 + ts, 0);
+            ctx.lineTo(3, ts);
+            ctx.lineTo(3 - ts, 0);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+
+            // Inner gold ring & progress travel emblem
+            ctx.fillStyle = '#f39c12';
+            ctx.font = 'bold 12px "Cinzel", serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('1', 3, 1);
+
+            // Shadow constriction bands crackling around token
+            ctx.strokeStyle = 'rgba(24, 10, 34, 0.85)';
+            ctx.lineWidth = 2.2;
+            ctx.beginPath();
+            ctx.arc(3, 0, 11, 0, Math.PI * 1.6);
+            ctx.stroke();
+
+            // Crimson fracture spark arcs
+            ctx.strokeStyle = 'rgba(255, 60, 60, 0.8)';
+            ctx.lineWidth = 1.0;
+            ctx.beginPath();
+            ctx.moveTo(3 - 7, -5);
+            ctx.lineTo(3 + 2, 0);
+            ctx.lineTo(3 + 7, 6);
+            ctx.stroke();
+
+            ctx.restore();
+        }
+
+        // 4. Four Spindly Articulated Goblin Fingers with Soft Edges and Soft Inner
+        const fingers = [
+            { baseAngle: -0.85, l1: 15, l2: 13, clawLen: 12, width: 5.2, isThumb: true },
+            { baseAngle: -0.30, l1: 19, l2: 16, clawLen: 15, width: 4.6 },
+            { baseAngle: 0.12,  l1: 22, l2: 18, clawLen: 17, width: 4.8 },
+            { baseAngle: 0.58,  l1: 17, l2: 14, clawLen: 14, width: 4.0 }
+        ];
+
+        fingers.forEach(f => {
+            const kx = Math.cos(f.baseAngle) * 10;
+            const ky = Math.sin(f.baseAngle) * 8;
+
+            const bend1 = f.isThumb ? (0.35 + curl * 0.95) : (-0.22 + curl * 1.15);
+            const bend2 = f.isThumb ? (0.45 + curl * 1.05) : (0.24 + curl * 1.25);
+            const a1 = f.baseAngle + bend1 * (f.baseAngle < 0 ? -1 : 1);
+            const j1x = kx + Math.cos(a1) * f.l1;
+            const j1y = ky + Math.sin(a1) * f.l1;
+
+            const a2 = a1 + bend2 * (f.baseAngle < 0 ? -1 : 1);
+            const j2x = j1x + Math.cos(a2) * f.l2;
+            const j2y = j1y + Math.sin(a2) * f.l2;
+
+            const clawAngle = a2 + (0.55 + curl * 0.85) * (f.baseAngle < 0 ? -1 : 1);
+            const tipX = j2x + Math.cos(clawAngle) * f.clawLen;
+            const tipY = j2y + Math.sin(clawAngle) * f.clawLen;
+
+            // Outer soft halo pass (soft edges)
+            ctx.shadowColor = 'rgba(10, 4, 16, 0.9)';
+            ctx.shadowBlur = 12;
+            ctx.strokeStyle = 'rgba(14, 6, 22, 0.35)';
+            ctx.lineWidth = f.width * 1.7;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(kx, ky);
+            ctx.lineTo(j1x, j1y);
+            ctx.lineTo(j2x, j2y);
+            ctx.stroke();
+
+            // Inner soft core pass (soft inner)
+            ctx.shadowBlur = 6;
+            ctx.strokeStyle = 'rgba(28, 12, 40, 0.68)';
+            ctx.lineWidth = f.width;
+            ctx.beginPath();
+            ctx.moveTo(kx, ky);
+            ctx.lineTo(j1x, j1y);
+            ctx.lineTo(j2x, j2y);
+            ctx.stroke();
+
+            // Soft knobby joints
+            ctx.fillStyle = 'rgba(34, 15, 48, 0.75)';
+            ctx.beginPath();
+            ctx.arc(j1x, j1y, f.width * 0.7, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.beginPath();
+            ctx.arc(j2x, j2y, f.width * 0.6, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Soft Razor Hooked Talon
+            ctx.strokeStyle = 'rgba(14, 6, 20, 0.45)';
+            ctx.lineWidth = f.width * 1.5;
+            ctx.beginPath();
+            ctx.moveTo(j2x, j2y);
+            ctx.quadraticCurveTo(
+                j2x + Math.cos(clawAngle - 0.22) * (f.clawLen * 0.65),
+                j2y + Math.sin(clawAngle - 0.22) * (f.clawLen * 0.65),
+                tipX, tipY
+            );
+            ctx.stroke();
+
+            ctx.strokeStyle = 'rgba(24, 10, 36, 0.75)';
+            ctx.lineWidth = f.width * 0.85;
+            ctx.beginPath();
+            ctx.moveTo(j2x, j2y);
+            ctx.quadraticCurveTo(
+                j2x + Math.cos(clawAngle - 0.22) * (f.clawLen * 0.65),
+                j2y + Math.sin(clawAngle - 0.22) * (f.clawLen * 0.65),
+                tipX, tipY
+            );
+            ctx.stroke();
+
+            // Soft gleaming ivory/bone talon tip highlight
+            ctx.strokeStyle = 'rgba(235, 226, 208, 0.75)';
+            ctx.lineWidth = 1.4;
+            ctx.beginPath();
+            ctx.moveTo(tipX - Math.cos(clawAngle) * 3.5, tipY - Math.sin(clawAngle) * 3.5);
+            ctx.lineTo(tipX, tipY);
+            ctx.stroke();
+        });
+
+        ctx.restore();
+    }
+
+    // Unified Shadow Card Effect Handler for Goblin Tunnels
+    window.resolveGoblinTunnelsShadow = function(shadow, enemy, defChars, game, engine, next) {
+        if (!enemy) {
+            if (typeof next === 'function') next();
+            return;
+        }
+        const isGoblin = Boolean(
+            (enemy.trait || '').toLowerCase().includes('goblin') ||
+            (enemy.name || '').toLowerCase().includes('goblin') ||
+            (enemy.id || '').toLowerCase().includes('goblin')
+        );
+        const buff = isGoblin ? 3 : 1;
+        enemy._goblinTunnelsShadowApplied = true;
+        enemy.attackBonus = (enemy.attackBonus || 0) + buff;
+
+        // Play the Forest Spider power-up sound effect (forest_spider_powerup.mp3)
+        if (typeof window.playForestSpiderPowerUpAudio === 'function') {
+            window.playForestSpiderPowerUpAudio();
+        } else {
+            try {
+                const volSlider = document.getElementById('volume-slider');
+                const vol = volSlider ? parseFloat(volSlider.value) : 0.25;
+                const snd = new Audio('./sound_effects/dark_of_mirkwood/forest_spider_powerup.mp3');
+                snd.volume = vol;
+                snd.play().catch(() => {
+                    const snd2 = new Audio('./sound_effects/forest_spider_powerup.mp3');
+                    snd2.volume = vol;
+                    snd2.play().catch(() => {});
+                });
+            } catch(e) {}
+        }
+
+        // Trigger the Forest Spider attack buff visual animation effect
+        if (typeof window.triggerForestSpiderPowerUp === 'function') {
+            window.triggerForestSpiderPowerUp(enemy._uid, 'red');
+        }
+
+        // Toast notification
+        const msg = isGoblin ? 
+            'Goblin Tunnels: Attacking Goblin enemy gets +3 ⚔' : 
+            'Goblin Tunnels: Attacking enemy gets +1 ⚔';
+        if (engine && engine.toast) {
+            engine.toast('Shadow Effect', msg, 'danger', 2800);
+        }
+
+        // Floating text above enemy element
+        const floatFn = window.floatText || (engine && engine.window && engine.window.floatText);
+        const enemyEl = document.querySelector(`[data-uid="${enemy._uid}"]`);
+        if (enemyEl && floatFn) {
+            const rect = enemyEl.getBoundingClientRect();
+            floatFn(rect.left + rect.width / 2, rect.top - 12, `+${buff} ⚔`, '#ff3333');
+        }
+
+        if (engine && engine.render) engine.render();
+        setTimeout(() => {
+            if (typeof next === 'function') next();
+        }, 450);
     };
-    initWatchfulObserver();
+
+    // Ensure animateShadowReveal auto-injects shadow effect for Goblin Tunnels
+    if (typeof window !== 'undefined') {
+        const patchShadowReveal = () => {
+            if (window.animateShadowReveal && !window.animateShadowReveal._goblinTunnelsHooked) {
+                const origReveal = window.animateShadowReveal;
+                window.animateShadowReveal = function(enemy, cb, idx = 0) {
+                    const shadowCard = enemy ? (enemy.shadowCard || (enemy.shadowCards && enemy.shadowCards[idx])) : null;
+                    if (shadowCard && (shadowCard.id === 'nibin_goblin_tunnels' || shadowCard.id === 'goblin_tunnels' || shadowCard.name === 'Goblin Tunnels')) {
+                        if (!shadowCard.shadow) {
+                            shadowCard.shadow = 'Shadow: Attacking enemy gets +1 attack (+3 attack instead if attacking enemy is a Goblin.)';
+                        }
+                        if (!shadowCard.onShadow) {
+                            shadowCard.onShadow = window.resolveGoblinTunnelsShadow;
+                        }
+                    }
+                    return origReveal.apply(this, arguments);
+                };
+                window.animateShadowReveal._goblinTunnelsHooked = true;
+            }
+        };
+        patchShadowReveal();
+        setInterval(patchShadowReveal, 1000);
+    }
+
+    // Unified helper ensuring revealed Goblins trigger exactly 1 snatch per Goblin Tunnels in staging
+    window.checkGoblinTunnelsReveal = function(card, stagingArr) {
+        if (!card) return;
+        const isGoblin = (card.trait || '').toLowerCase().includes('goblin') ||
+                         (card.id || '').toLowerCase().includes('goblin') ||
+                         (card.name || '').toLowerCase().includes('goblin');
+        if (!isGoblin || card._returnedToStaging) return;
+
+        card._tunnelsSnatchProcessedFor = card._tunnelsSnatchProcessedFor || new Set();
+
+        const game = (window.LotrEngine && window.LotrEngine.game) || window.game;
+        const arr = stagingArr || (game && game.stagingArea) || [];
+        const tunnels = arr.filter(c => c && (c.id === 'nibin_goblin_tunnels' || c.id === 'goblin_tunnels' || c.name === 'Goblin Tunnels'));
+
+        tunnels.forEach((tCard, idx) => {
+            const tunnelId = tCard._uid || tCard.id;
+            if (card._tunnelsSnatchProcessedFor.has(tunnelId)) {
+                return; // Already processed this tunnel card for this revealed goblin!
+            }
+            card._tunnelsSnatchProcessedFor.add(tunnelId);
+
+            setTimeout(() => {
+                if (typeof window.triggerGoblinClawSnatch === 'function') {
+                    window.triggerGoblinClawSnatch(tCard, card);
+                }
+            }, idx * 750);
+        });
+    };
+
+    // Main trigger for "Dust and The Goblin Claw Snatch"
+    window.triggerGoblinClawSnatch = function(tunnelCard, goblinCard, onComplete) {
+        const engine = window.LotrEngine;
+        const game = engine ? engine.game : window.game;
+        if (!game) {
+            if (typeof onComplete === 'function') onComplete();
+            return;
+        }
+
+        // Deduplication guard: guarantee a single progress snatch per Goblin Tunnels per revealed goblin
+        const snatchKey = `${tunnelCard ? (tunnelCard._uid || tunnelCard.id) : 'tunnel'}_${goblinCard ? (goblinCard._uid || goblinCard.id) : 'goblin'}`;
+        if (window._recentGoblinSnatchKeys && window._recentGoblinSnatchKeys.has(snatchKey)) {
+            if (typeof onComplete === 'function') onComplete();
+            return;
+        }
+        window._recentGoblinSnatchKeys = window._recentGoblinSnatchKeys || new Set();
+        window._recentGoblinSnatchKeys.add(snatchKey);
+        setTimeout(() => {
+            if (window._recentGoblinSnatchKeys) window._recentGoblinSnatchKeys.delete(snatchKey);
+        }, 3500);
+
+        // If a snatch is already running, queue it so animations play sequentially and cleanly
+        if (window._isGoblinClawSnatching) {
+            const alreadyQueued = window._goblinClawSnatchQueue.some(q => 
+                (q.tunnelCard && tunnelCard && (q.tunnelCard._uid || q.tunnelCard.id) === (tunnelCard._uid || tunnelCard.id)) &&
+                (q.goblinCard && goblinCard && (q.goblinCard._uid || q.goblinCard.id) === (goblinCard._uid || goblinCard.id))
+            );
+            if (!alreadyQueued) {
+                window._goblinClawSnatchQueue.push({ tunnelCard, goblinCard, onComplete });
+            }
+            return;
+        }
+        window._isGoblinClawSnatching = true;
+
+        // Verify quest progress exists to remove
+        if (game.questProgress <= 0) {
+            if (engine && engine.toast) {
+                engine.toast("Goblin Tunnels", "A Goblin was revealed, but the quest has no progress to remove!", "info");
+            }
+            window._isGoblinClawSnatching = false;
+            if (typeof onComplete === 'function') onComplete();
+            if (window._goblinClawSnatchQueue.length > 0) {
+                const next = window._goblinClawSnatchQueue.shift();
+                window.triggerGoblinClawSnatch(next.tunnelCard, next.goblinCard, next.onComplete);
+            }
+            return;
+        }
+
+        // Play chilling goblin snatch audio
+        playGoblinClawSnatchAudio();
+
+        // 1. Locate Goblin Tunnels card element in DOM
+        let tunnelEl = null;
+        if (tunnelCard && tunnelCard._uid) {
+            tunnelEl = document.querySelector(`#staging-content .card[data-uid="${tunnelCard._uid}"]`);
+        }
+        if (!tunnelEl) {
+            tunnelEl = document.querySelector('#staging-content .card[data-id="nibin_goblin_tunnels"], #staging-content .card[data-id="goblin_tunnels"]') ||
+                       document.querySelector('.card[data-id="nibin_goblin_tunnels"]');
+        }
+
+        // 2. Locate Quest Card and Progress Token element
+        const questCardEl = document.querySelector('#quest-content .quest-card') ||
+                            document.querySelector('#quest-content .card') ||
+                            document.getElementById('quest-zone');
+        const tokenEl = questCardEl ? questCardEl.querySelector('.token.progress') : null;
+
+        // Origin at bottom center of Goblin Tunnels card (where pit darkness pools)
+        let originX, originY;
+        if (tunnelEl) {
+            const tr = tunnelEl.getBoundingClientRect();
+            originX = tr.left + tr.width / 2;
+            originY = tr.bottom - 6;
+        } else {
+            originX = window.innerWidth * 0.65;
+            originY = 240;
+        }
+
+        // Target at center of Quest progress token
+        let targetX, targetY;
+        if (tokenEl) {
+            const qr = tokenEl.getBoundingClientRect();
+            targetX = qr.left + qr.width / 2;
+            targetY = qr.top + qr.height / 2;
+        } else if (questCardEl) {
+            const qr = questCardEl.getBoundingClientRect();
+            targetX = qr.right - 26;
+            targetY = qr.top + 26;
+        } else {
+            targetX = window.innerWidth * 0.3;
+            targetY = 160;
+        }
+
+        // Bezier Arc trajectory control points
+        const dist = Math.hypot(targetX - originX, targetY - originY);
+        const arcHeight = Math.min(220, Math.max(110, dist * 0.3));
+        const midX = (originX + targetX) / 2;
+        const midY = Math.min(originY, targetY) - arcHeight;
+
+        function getArcPoint(u) {
+            const inv = 1 - u;
+            const x = inv * inv * originX + 2 * inv * u * midX + u * u * targetX;
+            const y = inv * inv * originY + 2 * inv * u * midY + u * u * targetY;
+            const tx = 2 * inv * (midX - originX) + 2 * u * (targetX - midX);
+            const ty = 2 * inv * (midY - originY) + 2 * u * (targetY - midY);
+            const angle = Math.atan2(ty, tx);
+            return { x, y, angle };
+        }
+
+        // Fullscreen FX Canvas
+        const canvas = document.createElement('canvas');
+        canvas.className = 'goblin-claw-snatch-canvas';
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = window.innerWidth * dpr;
+        canvas.height = window.innerHeight * dpr;
+        canvas.style.cssText = `
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            pointer-events: none;
+            z-index: 100060;
+        `;
+        document.body.appendChild(canvas);
+        const ctx = canvas.getContext('2d');
+
+        // Particle system for the snatch
+        const particles = [];
+        function spawnDustBurst(cx, cy, count, isImpact) {
+            for (let i = 0; i < count; i++) {
+                const spd = (isImpact ? 2.5 : 1.2) + Math.random() * (isImpact ? 6.5 : 3.0);
+                const angle = Math.random() * Math.PI * 2;
+                particles.push({
+                    x: cx,
+                    y: cy,
+                    vx: Math.cos(angle) * spd,
+                    vy: Math.sin(angle) * spd - (isImpact ? 1.5 : 0.8),
+                    size: 1.2 + Math.random() * 3.5,
+                    life: 1.0,
+                    decay: 0.018 + Math.random() * 0.025,
+                    isRock: Math.random() < 0.35,
+                    rot: Math.random() * Math.PI * 2,
+                    rotSpeed: (Math.random() - 0.5) * 0.08,
+                    color: isImpact
+                        ? (Math.random() < 0.35 ? '#ff3b30' : (Math.random() < 0.6 ? '#f39c12' : '#d2c5b4'))
+                        : (Math.random() < 0.4 ? '#c8beaf' : (Math.random() < 0.7 ? '#8e8275' : '#2d2432'))
+                });
+            }
+        }
+
+        // Initial subterranean dust eruption from Goblin Tunnels pit
+        spawnDustBurst(originX, originY, 24, false);
+
+        const startTime = performance.now();
+        const duration = 1200; // Sequence time: 1.2s
+        let progressDeducted = false;
+
+        function renderFrame() {
+            const now = performance.now();
+            const elapsed = now - startTime;
+            if (elapsed > duration) {
+                // Sequence Complete
+                canvas.remove();
+                window._isGoblinClawSnatching = false;
+                if (typeof onComplete === 'function') onComplete();
+                // Check if another snatch was queued
+                if (window._goblinClawSnatchQueue.length > 0) {
+                    const next = window._goblinClawSnatchQueue.shift();
+                    window.triggerGoblinClawSnatch(next.tunnelCard, next.goblinCard, next.onComplete);
+                }
+                return;
+            }
+
+            ctx.save();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.scale(dpr, dpr);
+
+            let wristX, wristY, handAngle, fingerCurl, armAlpha, holdsToken;
+
+            if (elapsed <= 460) {
+                // =============================================================
+                // PHASE 1: SWIPE OUT FROM TUNNELS (0ms - 460ms)
+                // =============================================================
+                const p = elapsed / 460;
+                // Aggressive, swift predatory strike curve
+                const u = 1 - Math.pow(1 - p, 3.2);
+                const pt = getArcPoint(u);
+                wristX = pt.x;
+                wristY = pt.y;
+                handAngle = pt.angle;
+                fingerCurl = 0.12; // Splayed wide open
+                armAlpha = Math.min(1, p * 2.8);
+                holdsToken = false;
+
+                // Stream trailing rock dust motes behind the speeding arm
+                if (Math.random() < 0.82) {
+                    particles.push({
+                        x: wristX + (Math.random() - 0.5) * 20,
+                        y: wristY + (Math.random() - 0.5) * 20,
+                        vx: (Math.random() - 0.5) * 1.7,
+                        vy: -0.8 - Math.random() * 1.7,
+                        size: 1.0 + Math.random() * 2.4,
+                        life: 1.0,
+                        decay: 0.038,
+                        isRock: Math.random() < 0.3,
+                        rot: Math.random() * Math.PI * 2,
+                        rotSpeed: (Math.random() - 0.5) * 0.06,
+                        color: Math.random() < 0.5 ? '#d2c5b4' : '#1e1424'
+                    });
+                }
+
+                // Draw shadowy arm stretching from origin to wrist
+                drawShadowArm(ctx, originX, originY, wristX, wristY, u, armAlpha);
+                drawGoblinClawHand(ctx, wristX, wristY, handAngle, fingerCurl, armAlpha, holdsToken);
+
+            } else if (elapsed <= 620) {
+                // =============================================================
+                // PHASE 2: INSTANT SNATCH & TOKEN SEIZURE (460ms - 620ms)
+                // =============================================================
+                const sp = (elapsed - 460) / 160;
+                wristX = targetX;
+                wristY = targetY;
+                const pt = getArcPoint(1.0);
+                handAngle = pt.angle;
+                // Snap claws violently shut around the token
+                fingerCurl = 0.12 + (1.15 - 0.12) * Math.min(1, sp * 2.1);
+                armAlpha = 1.0;
+                holdsToken = sp > 0.3;
+
+                if (!progressDeducted) {
+                    progressDeducted = true;
+                    // Deduct Quest Progress
+                    if (game.questProgress > 0) {
+                        game.questProgress = Math.max(0, game.questProgress - 1);
+                        if (engine && engine.render) engine.render();
+                        if (window.renderQuest) window.renderQuest();
+                    }
+
+                    // Toast notification
+                    if (engine && engine.toast) {
+                        engine.toast("Goblin Tunnels", "A Goblin was revealed! A shadowy claw snatched 1 quest progress!", "warning");
+                    }
+
+                    // Explosive dust & spark burst at progress token
+                    spawnDustBurst(targetX, targetY, 40, true);
+
+                    // Float Text: "-1 Progress!"
+                    const floatFn = window.floatText || (engine && engine.window && engine.window.floatText);
+                    if (floatFn) {
+                        floatFn(targetX, targetY - 26, '-1 Progress!', '#c0392b');
+                    } else {
+                        const floatEl = document.createElement('div');
+                        floatEl.className = 'float-text';
+                        floatEl.style.cssText = `
+                            position: fixed;
+                            left: ${targetX}px;
+                            top: ${targetY - 26}px;
+                            color: #ff3333;
+                            font-family: 'Cinzel', serif;
+                            font-size: 1.45rem;
+                            font-weight: 900;
+                            text-shadow: 0 0 10px #000, 0 0 16px #ff0000;
+                            pointer-events: none;
+                            z-index: 100075;
+                            transition: all 1.2s cubic-bezier(0.2, 0.8, 0.2, 1);
+                            transform: translate(-50%, 0);
+                        `;
+                        floatEl.textContent = '-1 Progress!';
+                        document.body.appendChild(floatEl);
+                        requestAnimationFrame(() => {
+                            floatEl.style.transform = 'translate(-50%, -38px)';
+                            floatEl.style.opacity = '0';
+                        });
+                        setTimeout(() => floatEl.remove(), 1300);
+                    }
+
+                    // Quest Card violent rumble/shake
+                    if (questCardEl) {
+                        questCardEl.style.transition = 'transform 0.06s ease';
+                        questCardEl.style.transform = 'translate(4px, -3px) rotate(1.4deg)';
+                        setTimeout(() => {
+                            questCardEl.style.transform = 'translate(-4px, 3px) rotate(-1.2deg)';
+                            setTimeout(() => {
+                                questCardEl.style.transform = 'translate(2px, -1px) rotate(0.6deg)';
+                                setTimeout(() => {
+                                    questCardEl.style.transform = '';
+                                    questCardEl.style.transition = '';
+                                }, 80);
+                            }, 65);
+                        }, 65);
+                    }
+                }
+
+                drawShadowArm(ctx, originX, originY, wristX, wristY, 1.0, armAlpha);
+                drawGoblinClawHand(ctx, wristX, wristY, handAngle, fingerCurl, armAlpha, holdsToken);
+
+            } else {
+                // =============================================================
+                // PHASE 3: VIOLENT YANK & DISSOLUTION (620ms - 1200ms)
+                // =============================================================
+                const yp = (elapsed - 620) / 580;
+                // Accelerating violent pull
+                const pullEase = Math.pow(yp, 2.2);
+                const retU = Math.max(0, 1 - pullEase);
+                const pt = getArcPoint(retU);
+                wristX = pt.x;
+                wristY = pt.y;
+                handAngle = pt.angle + Math.PI; // Inverted towards tunnel retreat
+                fingerCurl = 1.15; // Clenched tightly around token
+                holdsToken = true;
+
+                // Dissolution into dark dust and shadowy vapor as it reaches the tunnels
+                let dissolveAlpha = 1.0;
+                if (yp > 0.40) {
+                    dissolveAlpha = Math.max(0, 1 - (yp - 0.40) / 0.60);
+                    // Cavern pit erupts with dust motes and swirling smoke
+                    if (Math.random() < 0.65) {
+                        particles.push({
+                            x: originX + (Math.random() - 0.5) * 35,
+                            y: originY + (Math.random() - 0.5) * 15,
+                            vx: (Math.random() - 0.5) * 2.8,
+                            vy: -1.2 - Math.random() * 2.8,
+                            size: 1.5 + Math.random() * 3.5,
+                            life: 1.0,
+                            decay: 0.035,
+                            isRock: Math.random() < 0.4,
+                            rot: Math.random() * Math.PI * 2,
+                            rotSpeed: (Math.random() - 0.5) * 0.1,
+                            color: Math.random() < 0.4 ? '#d2c5b4' : '#14081c'
+                        });
+                    }
+                }
+
+                drawShadowArm(ctx, originX, originY, wristX, wristY, retU, dissolveAlpha);
+                drawGoblinClawHand(ctx, wristX, wristY, handAngle, fingerCurl, dissolveAlpha, holdsToken);
+            }
+
+            // Update & Draw All Particles (Subterranean rock-dust motes and sparks)
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.x += p.vx;
+                p.y += p.vy;
+                p.rot += p.rotSpeed;
+                p.life -= p.decay;
+                if (p.life <= 0) {
+                    particles.splice(i, 1);
+                    continue;
+                }
+
+                ctx.save();
+                ctx.globalAlpha = p.life;
+                if (p.isRock) {
+                    ctx.translate(p.x, p.y);
+                    ctx.rotate(p.rot);
+                    ctx.fillStyle = p.color;
+                    const s = p.size;
+                    ctx.beginPath();
+                    ctx.moveTo(-s * 0.5, -s * 0.4);
+                    ctx.lineTo(s * 0.6, -s * 0.3);
+                    ctx.lineTo(s * 0.4, s * 0.5);
+                    ctx.lineTo(-s * 0.4, s * 0.3);
+                    ctx.closePath();
+                    ctx.fill();
+                } else {
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                    ctx.fillStyle = p.color;
+                    ctx.fill();
+                }
+                ctx.restore();
+            }
+
+            ctx.restore();
+            requestAnimationFrame(renderFrame);
+        }
+
+        // Procedural Shadow Arm Drawer with Soft Edges and Soft Inner (No SVG!)
+        function drawShadowArm(ctx, ox, oy, wx, wy, u, alpha) {
+            ctx.save();
+            ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+
+            const steps = Math.max(14, Math.round(u * 26));
+            const pts = [];
+            for (let i = 0; i <= steps; i++) {
+                const stepU = (i / steps) * u;
+                pts.push(getArcPoint(stepU));
+            }
+
+            // 1. Broad outer soft shadow aura (soft diffused edge)
+            ctx.shadowColor = 'rgba(12, 5, 20, 0.85)';
+            ctx.shadowBlur = 24;
+            ctx.strokeStyle = 'rgba(12, 5, 20, 0.22)';
+            ctx.lineWidth = 30;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.beginPath();
+            pts.forEach((pt, i) => { if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y); });
+            ctx.stroke();
+
+            // 2. Mid soft smoky layer
+            ctx.shadowBlur = 14;
+            ctx.shadowColor = 'rgba(16, 7, 26, 0.75)';
+            ctx.strokeStyle = 'rgba(18, 8, 28, 0.48)';
+            ctx.lineWidth = 20;
+            ctx.beginPath();
+            pts.forEach((pt, i) => { if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y); });
+            ctx.stroke();
+
+            // 3. Soft translucent inner core (soft inner: not opaque harsh black, but deep misty shadowy cavern tone)
+            ctx.shadowBlur = 8;
+            ctx.shadowColor = 'rgba(28, 12, 42, 0.65)';
+            ctx.strokeStyle = 'rgba(30, 14, 46, 0.62)';
+            ctx.lineWidth = 12;
+            ctx.beginPath();
+            pts.forEach((pt, i) => { if (i === 0) ctx.moveTo(pt.x, pt.y); else ctx.lineTo(pt.x, pt.y); });
+            ctx.stroke();
+
+            // 4. Subtle center ethereal shadow wisp
+            ctx.shadowBlur = 4;
+            ctx.strokeStyle = 'rgba(52, 24, 76, 0.38)';
+            ctx.lineWidth = 5;
+            ctx.beginPath();
+            pts.forEach((pt, i) => {
+                const jitter = Math.sin(i * 1.1) * 1.5;
+                if (i === 0) ctx.moveTo(pt.x + jitter, pt.y);
+                else ctx.lineTo(pt.x + jitter, pt.y);
+            });
+            ctx.stroke();
+
+            // 5. Soft wispy filaments peeling off the arm
+            ctx.strokeStyle = 'rgba(22, 10, 32, 0.45)';
+            ctx.lineWidth = 2.5;
+            for (let i = 2; i < pts.length - 1; i += 3) {
+                const pt = pts[i];
+                const wispAngle = pt.angle + Math.PI / 2 + (i % 2 === 0 ? 0.35 : -0.35);
+                ctx.beginPath();
+                ctx.moveTo(pt.x, pt.y);
+                ctx.quadraticCurveTo(
+                    pt.x + Math.cos(wispAngle) * 14,
+                    pt.y + Math.sin(wispAngle) * 14,
+                    pt.x + Math.cos(wispAngle) * 24 + (Math.sin(i) * 4),
+                    pt.y + Math.sin(wispAngle) * 24 - 8
+                );
+                ctx.stroke();
+            }
+
+            ctx.restore();
+        }
+
+        requestAnimationFrame(renderFrame);
+    };
+
+    // Global background watcher ensuring Goblin Tunnels interception hook is always active
+    setInterval(() => {
+        const engine = window.LotrEngine;
+        const game = engine ? engine.game : window.game;
+        if (!game) return;
+
+        // Ensure all Goblin Tunnels cards have shadow and onShadow
+        const allCards = [
+            ...(game.stagingArea || []),
+            ...(game.encounterDeck || []),
+            ...(game.discardPile || [])
+        ];
+        allCards.forEach(c => {
+            if (c && (c.id === 'nibin_goblin_tunnels' || c.id === 'goblin_tunnels' || c.name === 'Goblin Tunnels')) {
+                if (!c.shadow) c.shadow = 'Shadow: Attacking enemy gets +1 attack (+3 attack instead if attacking enemy is a Goblin.)';
+                if (!c.onShadow && window.resolveGoblinTunnelsShadow) c.onShadow = window.resolveGoblinTunnelsShadow;
+            }
+        });
+
+        if (!game.stagingArea) return;
+        if (!game.stagingArea._goblinTunnelsSnatchHooked) {
+            const arr = game.stagingArea;
+            Object.defineProperty(arr, '_goblinTunnelsSnatchHooked', { value: true, writable: true });
+            const origPush = arr.push;
+            arr.push = function(...items) {
+                const newItems = items.filter(c => !this.some(existing => existing && c && existing._uid === c._uid));
+                newItems.forEach(card => {
+                    if (typeof window.checkGoblinTunnelsReveal === 'function') {
+                        window.checkGoblinTunnelsReveal(card, arr);
+                    }
+                });
+                if (newItems.length > 0) return origPush.apply(this, newItems);
+                return this.length;
+            };
+        }
+    }, 250);
+
+    const _activeLightlessShields = new Map();
+
+    // Reusable offscreen canvas sprite to eliminate gradient creation during 60fps animation
+    let _lpWispCache = null;
+    function getLpWispCache() {
+        if (_lpWispCache) return _lpWispCache;
+        _lpWispCache = document.createElement('canvas');
+        _lpWispCache.width = 48;
+        _lpWispCache.height = 48;
+        const sctx = _lpWispCache.getContext('2d');
+        const g = sctx.createRadialGradient(24, 24, 0, 24, 24, 24);
+        g.addColorStop(0, 'rgba(254, 202, 202, 0.75)');
+        g.addColorStop(0.35, 'rgba(239, 68, 68, 0.4)');
+        g.addColorStop(0.7, 'rgba(185, 28, 28, 0.12)');
+        g.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        sctx.fillStyle = g;
+        sctx.beginPath();
+        sctx.arc(24, 24, 24, 0, Math.PI * 2);
+        sctx.fill();
+        return _lpWispCache;
+    }
+
+    window.activateLightlessShield = function(enemy) {
+        if (!enemy || !enemy._uid) return;
+        if (typeof playLightlessPassageAudio === 'function') {
+            playLightlessPassageAudio();
+        }
+        if (_activeLightlessShields.has(enemy._uid)) return;
+
+        const canvas = document.createElement('canvas');
+        canvas.className = 'lightless-passage-canvas-shield';
+        canvas.style.cssText = `
+            position: fixed;
+            pointer-events: none;
+            z-index: 10020;
+            opacity: 0;
+            transition: opacity 0.4s ease-out;
+        `;
+        document.body.appendChild(canvas);
+
+        const ctx = canvas.getContext('2d');
+
+        // Detailed floating red/ruby triangle motes matching card boundaries
+        const motes = [];
+        for (let i = 0; i < 14; i++) {
+            motes.push({
+                relAngle: -Math.PI * 0.45 + Math.random() * (Math.PI * 0.9),
+                yProgress: Math.random(),
+                speed: 0.003 + Math.random() * 0.0035,
+                size: 5 + Math.random() * 7,
+                rot: (Math.random() - 0.5) * 0.5,
+                rotSpeed: (Math.random() - 0.5) * 0.02,
+                inverted: Math.random() > 0.45,
+                alpha: 0.45 + Math.random() * 0.55
+            });
+        }
+
+        // Ascending red energy/smoke wisps
+        const wisps = [];
+        for (let i = 0; i < 8; i++) {
+            wisps.push({
+                relAngle: -Math.PI * 0.38 + Math.random() * (Math.PI * 0.76),
+                yProgress: Math.random(),
+                speed: 0.0035 + Math.random() * 0.004,
+                size: 16 + Math.random() * 18,
+                swayPhase: Math.random() * Math.PI * 2,
+                swaySpeed: 0.03 + Math.random() * 0.02,
+                alpha: 0.25 + Math.random() * 0.25
+            });
+        }
+
+        _activeLightlessShields.set(enemy._uid, {
+            canvas, ctx, motes, wisps, startTime: performance.now()
+        });
+
+        requestAnimationFrame(() => {
+            canvas.style.opacity = '1';
+        });
+    };
+
+    (function syncLightlessShieldLoop() {
+        const game = window.game || (window.LotrEngine && window.LotrEngine.game);
+        const now = performance.now();
+        const wispImg = getLpWispCache();
+
+        _activeLightlessShields.forEach((shieldData, enemyUid) => {
+            const { canvas, ctx, motes, wisps, startTime } = shieldData;
+            const enemy = (game && game.engagedEnemies) ? game.engagedEnemies.find(e => e._uid === enemyUid) : null;
+            const isCombatPhase = game && game.phase && game.phase.startsWith('combat') && game.phase !== 'refresh';
+
+            if (!enemy || !enemy._lightlessPassageActive || !isCombatPhase || (game && game.gameOver)) {
+                canvas.style.opacity = '0';
+                setTimeout(() => {
+                    canvas.remove();
+                    _activeLightlessShields.delete(enemyUid);
+                }, 400);
+                return;
+            }
+
+            const enemyEl = document.querySelector(`.zone-content [data-uid="${enemyUid}"]`) || document.querySelector(`[data-uid="${enemyUid}"]`);
+            if (!enemyEl || enemyEl.style.display === 'none' || enemyEl.style.visibility === 'hidden' || enemyEl.style.opacity === '0') {
+                canvas.style.opacity = '0';
+                return;
+            }
+
+            const r = enemyEl.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) {
+                canvas.style.opacity = '0';
+                return;
+            }
+
+            // Generous headroom and padding so the bottom ground ring and glow never clip
+            const padW = 22;
+            const padTop = 50;
+            const padBottom = 34;
+            const targetW = Math.round(r.width + padW * 2);
+            const targetH = Math.round(r.height + padTop + padBottom);
+
+            const dpr = window.devicePixelRatio || 1;
+            if (canvas.width !== targetW * dpr || canvas.height !== targetH * dpr) {
+                canvas.width = targetW * dpr;
+                canvas.height = targetH * dpr;
+            }
+
+            canvas.style.left = `${Math.round(r.left - padW)}px`;
+            canvas.style.top = `${Math.round(r.top - padTop)}px`;
+            canvas.style.width = `${targetW}px`;
+            canvas.style.height = `${targetH}px`;
+            if (canvas.style.opacity === '0') canvas.style.opacity = '1';
+
+            ctx.save();
+            ctx.scale(dpr, dpr);
+            ctx.clearRect(0, 0, targetW, targetH);
+
+            const cx = targetW / 2;
+            const cardW = r.width;
+            // Shield cylinder radius tightly matching card width
+            const rx = cardW * 0.5;
+            const ry = rx * 0.26;
+            // Shifted up so the bottom curve of the ground ellipse sits right at the card's bottom edge without clipping
+            const baseY = padTop + r.height - Math.round(ry * 0.7);
+            const cylH = r.height + 12;
+            const topY = baseY - cylH;
+            const elapsed = (now - startTime) * 0.001;
+
+            ctx.globalCompositeOperation = 'screen';
+
+            // 1. BASE GROUND ENERGY RIPPLE & GLOWING CONCENTRIC CIRCULAR RINGS (SOFT FEATHERED BLEND)
+            ctx.save();
+            // Feathered soft ambient ground pool blending base into the card
+            ctx.beginPath();
+            ctx.ellipse(cx, baseY, rx * 1.08, ry * 1.08, 0, 0, Math.PI * 2);
+            const groundGrad = ctx.createRadialGradient(cx, baseY, 0, cx, baseY, rx * 1.08);
+            groundGrad.addColorStop(0, 'rgba(254, 202, 202, 0.42)');
+            groundGrad.addColorStop(0.28, 'rgba(239, 68, 68, 0.38)');
+            groundGrad.addColorStop(0.58, 'rgba(185, 28, 28, 0.2)');
+            groundGrad.addColorStop(0.85, 'rgba(127, 29, 29, 0.06)');
+            groundGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = groundGrad;
+            ctx.fill();
+
+            // Inner caustic water ripple pulse with soft feathered fill
+            const causticPulse = Math.sin(elapsed * 2.8) * 0.06;
+            ctx.beginPath();
+            ctx.ellipse(cx, baseY, rx * (0.68 + causticPulse), ry * (0.68 + causticPulse), 0, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(254, 202, 202, 0.2)';
+            ctx.fill();
+
+            // Outer red ring with soft feathered glow
+            ctx.beginPath();
+            ctx.ellipse(cx, baseY, rx, ry, 0, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(239, 68, 68, 0.85)';
+            ctx.lineWidth = 1.8;
+            ctx.shadowColor = '#dc2626';
+            ctx.shadowBlur = 12;
+            ctx.stroke();
+
+            // Inner white-hot hairline ring
+            ctx.beginPath();
+            ctx.ellipse(cx, baseY, rx * 0.94, ry * 0.94, 0, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(254, 202, 202, 0.75)';
+            ctx.lineWidth = 0.9;
+            ctx.shadowColor = '#ef4444';
+            ctx.shadowBlur = 6;
+            ctx.stroke();
+
+            // Secondary concentric inner ring
+            ctx.beginPath();
+            ctx.ellipse(cx, baseY, rx * 0.82, ry * 0.82, 0, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(239, 68, 68, 0.45)';
+            ctx.lineWidth = 0.8;
+            ctx.stroke();
+            ctx.restore();
+
+            // 2. VERTICAL RED ENERGY COLUMN (CURVED BASE TO BLEND SEAMLESSLY WITH GROUND POOL)
+            ctx.save();
+            const colGrad = ctx.createLinearGradient(0, baseY + ry, 0, topY);
+            colGrad.addColorStop(0, 'rgba(239, 68, 68, 0.45)');
+            colGrad.addColorStop(0.12, 'rgba(220, 38, 38, 0.32)');
+            colGrad.addColorStop(0.42, 'rgba(185, 28, 28, 0.18)');
+            colGrad.addColorStop(0.78, 'rgba(127, 29, 29, 0.06)');
+            colGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+
+            // Curved base matching the exact bottom ground ellipse for a seamless joint
+            ctx.beginPath();
+            ctx.moveTo(cx - rx, topY);
+            ctx.lineTo(cx - rx, baseY);
+            ctx.ellipse(cx, baseY, rx, ry, 0, Math.PI, 0, true);
+            ctx.lineTo(cx + rx, topY);
+            ctx.closePath();
+            ctx.fillStyle = colGrad;
+            ctx.fill();
+
+            // Soft radial wash rooting the cylinder seamlessly into the ground pool
+            const rootWash = ctx.createRadialGradient(cx, baseY, 0, cx, baseY, rx * 0.9);
+            rootWash.addColorStop(0, 'rgba(239, 68, 68, 0.42)');
+            rootWash.addColorStop(0.45, 'rgba(185, 28, 28, 0.18)');
+            rootWash.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = rootWash;
+            ctx.beginPath();
+            ctx.ellipse(cx, baseY, rx, ry * 1.5, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Ascending smoke wisps drawn using fast blitted offscreen sprite
+            wisps.forEach(w => {
+                w.yProgress += w.speed;
+                if (w.yProgress > 1) w.yProgress = 0;
+
+                const py = (baseY - 4) - (w.yProgress * cylH) + Math.cos(w.relAngle) * (ry * 0.45);
+                const px = cx + Math.sin(w.relAngle) * (rx * 0.78) + Math.sin(elapsed * 2.2 + w.swayPhase) * 4;
+                const pAlpha = w.alpha * Math.sin(w.yProgress * Math.PI);
+
+                ctx.globalAlpha = pAlpha;
+                ctx.drawImage(wispImg, px - w.size, py - w.size, w.size * 2, w.size * 2);
+            });
+            ctx.globalAlpha = 1.0;
+
+            // Feathered vertical boundary filaments hugging card sides
+            const sideAlpha = 0.65 + Math.sin(elapsed * 3.2) * 0.25;
+            ctx.lineWidth = 1.6;
+            ctx.shadowColor = '#dc2626';
+            ctx.shadowBlur = 8;
+
+            const sideGrad = ctx.createLinearGradient(0, baseY, 0, topY);
+            sideGrad.addColorStop(0, `rgba(252, 165, 165, ${sideAlpha})`);
+            sideGrad.addColorStop(0.75, `rgba(239, 68, 68, ${sideAlpha * 0.6})`);
+            sideGrad.addColorStop(1, 'rgba(239, 68, 68, 0)');
+            ctx.strokeStyle = sideGrad;
+
+            ctx.beginPath();
+            ctx.moveTo(cx - rx, baseY);
+            ctx.lineTo(cx - rx, topY);
+            ctx.moveTo(cx + rx, baseY);
+            ctx.lineTo(cx + rx, topY);
+            ctx.stroke();
+            ctx.restore();
+
+            // 3. 3D CYLINDRICAL TRIANGLE & DIAMOND LATTICE (CURVED WITH DEPTH & BATCHED DRAW CALLS)
+            ctx.save();
+            const cols = 8;
+            const rows = 4;
+            const gridH = cylH * 0.48;
+            const rowH = gridH / rows;
+
+            // Generate 3D grid points projected onto the curved front cylinder
+            const gridPoints = [];
+            for (let r = 0; r <= rows; r++) {
+                const baseRowY = (baseY - 6) - (r * rowH);
+                const rowPts = [];
+                for (let c = 0; c <= cols; c++) {
+                    const angle = -Math.PI * 0.48 + (c / cols) * (Math.PI * 0.96);
+                    const x = cx + rx * Math.sin(angle);
+                    // Elliptical downward curve gives physical 3D wrapping depth around the card
+                    const curveY = Math.cos(angle) * (ry * 0.55);
+                    const y = baseRowY + curveY;
+                    rowPts.push({ x, y });
+                }
+                gridPoints.push(rowPts);
+            }
+
+            // Batched rendering: all grid lines are connected into a single stroke call to run smoothly at 60fps
+            ctx.beginPath();
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    const p1 = gridPoints[r][c];
+                    const p2 = gridPoints[r][c + 1];
+                    const p3 = gridPoints[r + 1][c + 1];
+                    const p4 = gridPoints[r + 1][c];
+
+                    // Lower triangle
+                    ctx.moveTo(p1.x, p1.y);
+                    ctx.lineTo(p2.x, p2.y);
+                    ctx.lineTo(p4.x, p4.y);
+                    ctx.lineTo(p1.x, p1.y);
+
+                    // Upper triangle
+                    ctx.moveTo(p2.x, p2.y);
+                    ctx.lineTo(p3.x, p3.y);
+                    ctx.lineTo(p4.x, p4.y);
+                }
+            }
+            const shimmer = 0.55 + Math.sin(elapsed * 4) * 0.25;
+            ctx.strokeStyle = `rgba(239, 68, 68, ${0.75 * shimmer})`;
+            ctx.lineWidth = 1.2;
+            ctx.shadowColor = '#dc2626';
+            ctx.shadowBlur = 6;
+            ctx.stroke();
+
+            // Batched inner highlight prisms
+            ctx.beginPath();
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    const p1 = gridPoints[r][c];
+                    const p2 = gridPoints[r][c + 1];
+                    const p4 = gridPoints[r + 1][c];
+                    ctx.moveTo(p1.x + (p2.x - p1.x) * 0.28, p1.y - 1.2);
+                    ctx.lineTo(p2.x - (p2.x - p1.x) * 0.28, p2.y - 1.2);
+                    ctx.lineTo(p4.x + (p2.x - p4.x) * 0.16, p4.y + 2.2);
+                    ctx.closePath();
+                }
+            }
+            ctx.fillStyle = `rgba(254, 202, 202, ${0.25 * shimmer})`;
+            ctx.fill();
+
+            // Central diamond highlight dots
+            ctx.beginPath();
+            for (let r = 0; r < rows - 1; r++) {
+                for (let c = 0; c < cols; c++) {
+                    const p4 = gridPoints[r + 1][c];
+                    ctx.moveTo(p4.x + 1.6, p4.y);
+                    ctx.arc(p4.x, p4.y, 1.6, 0, Math.PI * 2);
+                }
+            }
+            ctx.fillStyle = `rgba(254, 226, 226, ${0.85 * shimmer})`;
+            ctx.fill();
+            ctx.restore();
+
+            // 4. FLOATING RED & WHITE TRIANGULAR PRISM MOTES
+            ctx.save();
+            ctx.shadowColor = '#ef4444';
+            ctx.shadowBlur = 6;
+            motes.forEach(m => {
+                m.yProgress += m.speed;
+                if (m.yProgress > 1) m.yProgress = 0;
+
+                const py = (baseY - 4) - (m.yProgress * (cylH * 1.05)) + Math.cos(m.relAngle) * (ry * 0.5);
+                const px = cx + Math.sin(m.relAngle) * (rx * 0.88);
+                const pAlpha = m.alpha * Math.sin(m.yProgress * Math.PI);
+
+                if (pAlpha <= 0.02) return;
+
+                m.rot += m.rotSpeed;
+                const s = m.size;
+
+                ctx.save();
+                ctx.translate(px, py);
+                ctx.rotate(m.rot);
+
+                ctx.beginPath();
+                if (m.inverted) {
+                    ctx.moveTo(0, s * 0.6);
+                    ctx.lineTo(-s * 0.52, -s * 0.4);
+                    ctx.lineTo(s * 0.52, -s * 0.4);
+                } else {
+                    ctx.moveTo(0, -s * 0.6);
+                    ctx.lineTo(-s * 0.52, s * 0.4);
+                    ctx.lineTo(s * 0.52, s * 0.4);
+                }
+                ctx.closePath();
+
+                ctx.fillStyle = `rgba(254, 202, 202, ${pAlpha * 0.85})`;
+                ctx.fill();
+                ctx.strokeStyle = `rgba(255, 255, 255, ${pAlpha * 0.9})`;
+                ctx.lineWidth = 1.0;
+                ctx.stroke();
+
+                ctx.restore();
+            });
+            ctx.restore();
+
+            ctx.restore();
+        });
+
+        requestAnimationFrame(syncLightlessShieldLoop);
+    })();
+
+    window.playBranchingPathsModalEffect = function(onModalReady) {
+        const canvas = document.createElement('canvas');
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = window.innerWidth * dpr;
+        canvas.height = window.innerHeight * dpr;
+        canvas.style.cssText = `position:fixed; inset:0; width:100vw; height:100vh; pointer-events:none; z-index:100050;`;
+        document.body.appendChild(canvas);
+        const ctx = canvas.getContext('2d');
+        ctx.scale(dpr, dpr);
+
+        const cx = window.innerWidth / 2;
+        const cy = window.innerHeight / 2;
+
+        const particles = [];
+        const colors = ['#c084fc', '#e879f9', '#a855f7', '#d8b4fe', '#fdf4ff', '#f5d76e'];
+
+        if (!document.getElementById('bp-modal-style')) {
+            const st = document.createElement('style');
+            st.id = 'bp-modal-style';
+            st.textContent = `
+                @keyframes bpModalBurnReveal {
+                    0% { transform: scale(0.2) translateY(100px); opacity: 0; filter: brightness(3) contrast(2) blur(10px); }
+                    30% { transform: scale(1.1) translateY(-10px); opacity: 1; filter: brightness(1.5) contrast(1.2) blur(0px); box-shadow: 0 0 100px #c084fc, inset 0 0 50px #e879f9; }
+                    100% { transform: scale(max(0.8, var(--res-scale, 1))) translateY(0); opacity: 1; filter: none; box-shadow: 0 0 40px rgba(212,175,55,0.4),0 12px 40px rgba(0,0,0,0.9); }
+                }
+            `;
+            document.head.appendChild(st);
+        }
+
+        for(let i=0; i<36; i++) {
+            const ang = Math.random() * Math.PI * 2;
+            const spd = 2 + Math.random() * 14;
+            particles.push({
+                x: cx + (Math.random() - 0.5) * 35,
+                y: cy + (Math.random() - 0.5) * 35,
+                vx: Math.cos(ang) * spd,
+                vy: Math.sin(ang) * spd,
+                size: 22 + Math.random() * 42,
+                color: colors[Math.floor(Math.random() * colors.length)],
+                life: 1.0,
+                decay: 0.02 + Math.random() * 0.022,
+                spin: (Math.random() - 0.5) * 0.18,
+                angle: Math.random() * Math.PI * 2
+            });
+        }
+        for(let i=0; i<35; i++) {
+            const ang = Math.random() * Math.PI * 2;
+            const spd = 8 + Math.random() * 20;
+            particles.push({
+                type: 'spark',
+                x: cx, y: cy,
+                vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd,
+                size: 2 + Math.random() * 3.5,
+                color: '#ffffff',
+                life: 1.0, decay: 0.024 + Math.random() * 0.03
+            });
+        }
+
+        let startTime = performance.now();
+        let modalShown = false;
+
+        const loop = (now) => {
+            const elapsed = now - startTime;
+            ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+            ctx.globalCompositeOperation = 'screen';
+            for(let i = particles.length - 1; i >= 0; i--) {
+                const pt = particles[i];
+                pt.x += pt.vx;
+                pt.y += pt.vy;
+                pt.vx *= 0.92;
+                pt.vy *= 0.92;
+                pt.life -= pt.decay;
+
+                if(pt.life <= 0) {
+                    particles.splice(i, 1);
+                    continue;
+                }
+
+                ctx.globalAlpha = Math.max(0, pt.life);
+                if (pt.type === 'spark') {
+                    ctx.fillStyle = pt.color;
+                    ctx.shadowColor = '#c084fc';
+                    ctx.shadowBlur = 8;
+                    ctx.beginPath();
+                    ctx.arc(pt.x, pt.y, pt.size * pt.life, 0, Math.PI * 2);
+                    ctx.fill();
+                } else {
+                    pt.angle += pt.spin;
+                    ctx.save();
+                    ctx.translate(pt.x, pt.y);
+                    ctx.rotate(pt.angle);
+                    const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, pt.size * pt.life);
+                    grad.addColorStop(0, pt.color);
+                    grad.addColorStop(0.4, pt.color);
+                    grad.addColorStop(1, 'rgba(0,0,0,0)');
+                    ctx.fillStyle = grad;
+                    ctx.fillRect(-pt.size, -pt.size, pt.size*2, pt.size*2);
+                    ctx.restore();
+                }
+            }
+            
+            ctx.shadowBlur = 0;
+            ctx.globalCompositeOperation = 'source-over';
+
+            if (elapsed > 150 && !modalShown) {
+                modalShown = true;
+                try {
+                    const snd = new Audio('./sound_effects/dark_of_mirkwood/branching_paths_explored.mp3');
+                    const volSlider = document.getElementById('volume-slider');
+                    snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                    snd.play().catch(() => {
+                        const fallback = new Audio('./sound_effects/dark_of_mirkwood/branching_paths_explored.mp3');
+                        fallback.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                        fallback.play().catch(() => {});
+                    });
+                } catch (e) {}
+                if (onModalReady) onModalReady();
+                setTimeout(() => {
+                    const mContent = document.getElementById('modal-content');
+                    if (mContent) {
+                        mContent.style.animation = 'bpModalBurnReveal 0.9s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards';
+                        setTimeout(() => { if (mContent) mContent.style.animation = ''; }, 1000);
+                    }
+                }, 10);
+            }
+
+            if (particles.length > 0) {
+                requestAnimationFrame(loop);
+            } else {
+                canvas.remove();
+            }
+        };
+        requestAnimationFrame(loop);
+    };
+
+    window.triggerBranchingPathsEpicThreatTokens = function(specificUids = null) {
+        const game = window.game || (window.LotrEngine && window.LotrEngine.game);
+        if (!game) return;
+        const engine = window.LotrEngine;
+
+        let darkLocs = (game.stagingArea || []).filter(c => c && c.type === 'location' && (c.trait || '').includes('Dark'));
+        if (specificUids) {
+            darkLocs = darkLocs.filter(c => specificUids.includes(c._uid));
+        }
+        if (darkLocs.length === 0) return;
+
+        // Force a render so the +1 Threat tokens are added to the HTML
+        if (engine && engine.render) engine.render();
+
+        // Wait for the DOM to physically paint the tokens before animating them
+        requestAnimationFrame(() => {
+            // Play the Goblin Troop buff / power-up sound effect
+            if (typeof window.playForestSpiderPowerUpAudio === 'function') {
+                window.playForestSpiderPowerUpAudio();
+            } else {
+                try {
+                    const volSlider = document.getElementById('volume-slider');
+                    const vol = volSlider ? parseFloat(volSlider.value) : 0.25;
+                    const snd = new Audio('./sound_effects/dark_of_mirkwood/forest_spider_powerup.mp3');
+                    snd.volume = vol;
+                    snd.play().catch(() => {});
+                } catch(e) {}
+            }
+
+            darkLocs.forEach((loc) => {
+                const el = document.querySelector(`#staging-content [data-uid="${loc._uid}"]`) || document.querySelector(`[data-uid="${loc._uid}"]`);
+                if (!el) return;
+
+                // Fire the global Goblin Troop animation if available
+                if (typeof window.triggerForestSpiderPowerUp === 'function') {
+                    window.triggerForestSpiderPowerUp(loc._uid, '#ffb74d');
+                }
+
+                // Dedicated Fallback Animation perfectly matching the cubic-bezier bounce
+                const tokens = el.querySelectorAll('.buff-token');
+                tokens.forEach(token => {
+                    const img = token.querySelector('img');
+                    if (img && img.alt === 'threat') {
+                        token.style.transition = 'none';
+                        token.style.transform = 'translateY(-50px) scale(1.6)';
+                        token.style.opacity = '0';
+                        
+                        void token.offsetWidth; // Force CSS reflow
+                        
+                        requestAnimationFrame(() => {
+                            token.style.transition = 'all 0.6s cubic-bezier(0.34, 1.56, 0.64, 1)';
+                            token.style.transform = 'translateY(0) scale(1)';
+                            token.style.opacity = '1';
+                        });
+                    }
+                });
+
+                if (engine && engine.window && engine.window.spawnBurstAtElement) {
+                    engine.window.spawnBurstAtElement(el, '#ffb74d', 35);
+                }
+            });
+        });
+    };
+
+    function playCollapsedMineAudio(card) {
+        if (card && card._collapsedMineFlippedAudio) return;
+        if (card) card._collapsedMineFlippedAudio = true;
+        if (window._collapsedMineAudioCooldown) return;
+        window._collapsedMineAudioCooldown = true;
+        setTimeout(() => { window._collapsedMineAudioCooldown = false; }, 3000);
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/collapsed_mine.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch (e) {}
+    }
+    window.playCollapsedMineAudio = playCollapsedMineAudio;
+
+    function triggerCollapsedMineCaveIn(blockedCount) {
+        const questCard = document.querySelector('#quest-content .quest-card') || document.querySelector('.card.quest-card') || document.getElementById('quest-zone');
+        if (!questCard) return;
+        const qRect = questCard.getBoundingClientRect();
+        if (qRect.width === 0 || qRect.height === 0) return;
+
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/collapsed_mine.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch(e) {}
+
+        const engine = window.LotrEngine;
+        if (engine && engine.window && engine.window.screenShake) {
+            engine.window.screenShake(16, 420);
+        }
+
+        if (!document.getElementById('cm-cavein-styles')) {
+            const st = document.createElement('style');
+            st.id = 'cm-cavein-styles';
+            st.textContent = `
+                @keyframes cmBoulderDrop {
+                    0% { transform: translateY(-240px) scale(0.65) rotate(calc(var(--b-rot) * 0.35)); opacity: 0; }
+                    25% { opacity: 1; }
+                    68% { transform: translateY(0px) scale(1.05) rotate(var(--b-rot)); }
+                    80% { transform: translateY(-16px) scale(0.97) rotate(calc(var(--b-rot) * 0.95)); }
+                    90% { transform: translateY(0px) scale(1.02) rotate(var(--b-rot)); }
+                    96% { transform: translateY(-4px) scale(0.99) rotate(var(--b-rot)); }
+                    100% { transform: translateY(0px) scale(1) rotate(var(--b-rot)); opacity: 1; }
+                }
+                @keyframes cmPebbleTumble {
+                    0% { transform: translateY(-180px) rotate(0deg); opacity: 0; }
+                    30% { opacity: 1; }
+                    100% { transform: translateY(0px) rotate(var(--p-rot)); opacity: 1; }
+                }
+                @keyframes cmTimberCrash {
+                    0% { transform: translateY(-260px) rotate(calc(var(--t-rot) * 2.2)) scale(0.65); opacity: 0; }
+                    35% { opacity: 1; }
+                    70% { transform: translateY(0px) rotate(var(--t-rot)) scale(1.06); }
+                    84% { transform: translateY(-12px) rotate(calc(var(--t-rot) * 0.96)) scale(0.98); }
+                    100% { transform: translateY(0px) rotate(var(--t-rot)) scale(1); opacity: 1; }
+                }
+                @keyframes cmDustPuff {
+                    0% { transform: translate(-50%, -50%) scale(0.28); opacity: 0; }
+                    25% { opacity: 0.92; }
+                    100% { transform: translate(calc(-50% + var(--dx)), calc(-50% + var(--dy))) scale(var(--ds, 2.1)); opacity: 0; filter: blur(9px); }
+                }
+                @keyframes cmGemFlyStrike {
+                    0% { transform: translate(var(--gx), var(--gy)) scale(0.5); opacity: 0; }
+                    25% { opacity: 1; transform: translate(calc(var(--gx) * 0.6), calc(var(--gy) * 0.6)) scale(1.1); }
+                    70% { transform: translate(0, 0) scale(1.2); opacity: 1; }
+                    75% { transform: translate(0, 0) scale(1.4); filter: brightness(2.5) drop-shadow(0 0 16px #ffffff); opacity: 1; }
+                    100% { transform: translate(var(--def-x), var(--def-y)) scale(0.2); opacity: 0; }
+                }
+                @keyframes cmShardShatter {
+                    0% { transform: translate(0, 0) scale(1) rotate(0deg); opacity: 1; }
+                    100% { transform: translate(var(--sx), var(--sy)) scale(0.2) rotate(var(--sr)); opacity: 0; }
+                }
+            `;
+            document.head.appendChild(st);
+        }
+
+        const wrap = document.createElement('div');
+        wrap.className = 'cm-cavein-container';
+        wrap.style.cssText = `
+            position: fixed;
+            left: ${qRect.left}px;
+            top: ${qRect.top}px;
+            width: ${qRect.width}px;
+            height: ${qRect.height}px;
+            pointer-events: none;
+            z-index: 10025;
+            overflow: visible;
+        `;
+        document.body.appendChild(wrap);
+
+        // 1. Heavy Splintered Timber Mine Beams (Mapped with card wood texture & 3D bevels)
+        const timbers = [
+            { left: 14, bottom: 22, w: 128, h: 16, rot: -17, del: 80, bgX: 30, bgY: 60 },
+            { left: 44, bottom: 27, w: 144, h: 18, rot: 14, del: 160, bgX: 65, bgY: 55 },
+            { left: 26, bottom: 14, w: 118, h: 15, rot: -5, del: 240, bgX: 45, bgY: 70 }
+        ];
+
+        timbers.forEach(tb => {
+            const tEl = document.createElement('div');
+            tEl.style.cssText = `
+                position: absolute;
+                left: ${tb.left}%;
+                bottom: ${tb.bottom}%;
+                width: ${tb.w}px;
+                height: ${tb.h}px;
+                clip-path: polygon(0% 18%, 3% 0%, 97% 0%, 100% 22%, 98% 52%, 100% 82%, 96% 100%, 3% 100%, 0% 68%);
+                background:
+                    linear-gradient(180deg, rgba(255,225,160,0.5) 0%, rgba(160,95,40,0.2) 32%, rgba(20,10,4,0.85) 100%),
+                    url('cards/dark_of_mirkwood/caves_of_nibin/collapsed_mine.jpg') ${tb.bgX}% ${tb.bgY}% / 220% auto no-repeat,
+                    linear-gradient(90deg, #1f1008 0%, #3e2212 50%, #1a0c06 100%);
+                border-top: 1.5px solid rgba(255, 210, 140, 0.75);
+                border-bottom: 2.5px solid #080301;
+                box-shadow: inset 0 1px 2px rgba(255,230,170,0.5), inset 0 -3px 5px rgba(0,0,0,0.9);
+                filter: drop-shadow(0 10px 18px rgba(0,0,0,0.95)) drop-shadow(0 3px 5px rgba(0,0,0,0.85));
+                --t-rot: ${tb.rot}deg;
+                animation: cmTimberCrash 0.82s cubic-bezier(0.4, 0, 0.2, 1) ${tb.del}ms forwards;
+                opacity: 0;
+            `;
+            wrap.appendChild(tEl);
+        });
+
+        // 2. Realistic 3D Textured Quarry Boulders (Texture-mapped with depth extrusion & relief facets)
+        const boulders = [
+            { left: 3, bottom: 3, w: 76, h: 62, clip: '0% 36%, 10% 18%, 26% 6%, 48% 0%, 74% 4%, 90% 16%, 98% 34%, 90% 54%, 100% 70%, 84% 86%, 92% 98%, 64% 100%, 38% 92%, 18% 100%, 4% 86%, 0% 62%', rot: -14, del: 90, bgX: 18, bgY: 72 },
+            { left: 21, bottom: 5, w: 90, h: 74, clip: '4% 30%, 16% 12%, 36% 0%, 62% 6%, 84% 2%, 98% 20%, 90% 46%, 100% 66%, 86% 88%, 66% 100%, 40% 94%, 20% 100%, 6% 84%, 0% 56%', rot: 13, del: 150, bgX: 42, bgY: 68 },
+            { left: 45, bottom: 1, w: 96, h: 78, clip: '2% 40%, 12% 16%, 30% 0%, 56% 6%, 78% 0%, 94% 16%, 100% 40%, 88% 64%, 98% 86%, 72% 100%, 48% 92%, 24% 100%, 8% 84%, 0% 64%', rot: -7, del: 210, bgX: 68, bgY: 74 },
+            { left: 69, bottom: 4, w: 80, h: 66, clip: '0% 32%, 14% 10%, 40% 0%, 66% 10%, 88% 2%, 100% 26%, 90% 50%, 100% 74%, 82% 100%, 52% 90%, 30% 98%, 10% 88%, 0% 60%', rot: 15, del: 270, bgX: 84, bgY: 70 },
+            { left: 33, bottom: 25, w: 70, h: 58, clip: '4% 38%, 20% 14%, 44% 0%, 72% 6%, 92% 0%, 100% 32%, 88% 56%, 98% 84%, 70% 100%, 46% 90%, 24% 98%, 6% 80%, 0% 54%', rot: 7, del: 310, bgX: 34, bgY: 52 },
+            { left: 55, bottom: 23, w: 64, h: 54, clip: '0% 34%, 16% 12%, 42% 0%, 68% 4%, 88% 0%, 100% 28%, 86% 52%, 98% 76%, 74% 100%, 48% 92%, 26% 98%, 8% 82%, 0% 52%', rot: -16, del: 350, bgX: 58, bgY: 56 },
+            { left: 13, bottom: 32, w: 56, h: 48, clip: '2% 36%, 18% 10%, 46% 0%, 74% 8%, 94% 2%, 100% 34%, 86% 62%, 96% 86%, 66% 100%, 38% 90%, 20% 98%, 4% 78%, 0% 50%', rot: -18, del: 380, bgX: 22, bgY: 48 },
+            { left: 77, bottom: 28, w: 54, h: 46, clip: '0% 32%, 14% 8%, 40% 0%, 68% 6%, 88% 0%, 100% 30%, 88% 54%, 98% 78%, 72% 100%, 44% 90%, 22% 96%, 6% 78%, 0% 48%', rot: 12, del: 410, bgX: 78, bgY: 46 }
+        ];
+
+        boulders.forEach(b => {
+            const rockContainer = document.createElement('div');
+            rockContainer.style.cssText = `
+                position: absolute;
+                left: ${b.left}%;
+                bottom: ${b.bottom}%;
+                width: ${b.w}px;
+                height: ${b.h}px;
+                pointer-events: none;
+                --b-rot: ${b.rot}deg;
+                animation: cmBoulderDrop 0.88s cubic-bezier(0.38, 0, 0.22, 1) ${b.del}ms forwards;
+                opacity: 0;
+            `;
+
+            // Layer A: 3D Extruded Depth Underlay (Creates true volumetric slab thickness beneath the fracture)
+            const underlay = document.createElement('div');
+            underlay.style.cssText = `
+                position: absolute;
+                inset: 0;
+                transform: translate(3px, 5px);
+                clip-path: polygon(${b.clip});
+                background: #0d0906;
+                box-shadow: 0 16px 26px rgba(0, 0, 0, 0.98);
+            `;
+            rockContainer.appendChild(underlay);
+
+            // Layer B: Textured Stone Face (Samples real card rock art with directional torchlight & deep occlusion)
+            const rockFace = document.createElement('div');
+            rockFace.style.cssText = `
+                position: absolute;
+                inset: 0;
+                clip-path: polygon(${b.clip});
+                background-image:
+                    linear-gradient(140deg, rgba(255, 240, 205, 0.55) 0%, rgba(185, 140, 95, 0.22) 28%, transparent 58%),
+                    linear-gradient(318deg, rgba(8, 5, 2, 0.95) 0%, rgba(25, 16, 9, 0.65) 45%, transparent 75%),
+                    url('cards/dark_of_mirkwood/caves_of_nibin/collapsed_mine.jpg'),
+                    url('cards/dark_of_mirkwood/caves_of_nibin/crumbling_stairs.jpg'),
+                    linear-gradient(135deg, #5e4c3a 0%, #2b2118 100%);
+                background-size: cover, cover, 250% auto, 250% auto, cover;
+                background-position: center, center, ${b.bgX}% ${b.bgY}%, ${b.bgX}% ${b.bgY}%, center;
+                background-repeat: no-repeat;
+                border-top: 1.8px solid rgba(255, 235, 195, 0.85);
+                border-left: 1.5px solid rgba(220, 190, 150, 0.6);
+                border-bottom: 2px solid #0d0804;
+                box-shadow: inset 2px 2px 4px rgba(255,245,215,0.45), inset -3px -4px 7px rgba(0,0,0,0.92);
+                filter: drop-shadow(0 4px 6px rgba(0, 0, 0, 0.95));
+            `;
+
+            // Layer C: High-Relief Jagged Surface Crag Ridge (Creates authentic fractured rocky topography across face)
+            const cragRidge = document.createElement('div');
+            cragRidge.style.cssText = `
+                position: absolute;
+                left: 14%;
+                top: 14%;
+                width: 62%;
+                height: 52%;
+                clip-path: polygon(0% 45%, 28% 0%, 78% 12%, 100% 55%, 72% 100%, 18% 88%);
+                background-image:
+                    linear-gradient(145deg, rgba(255, 248, 225, 0.62) 0%, rgba(165, 120, 80, 0.2) 35%, rgba(10, 5, 2, 0.88) 100%),
+                    url('cards/dark_of_mirkwood/caves_of_nibin/collapsed_mine.jpg');
+                background-size: cover, 300% auto;
+                background-position: center, ${b.bgX + 10}% ${b.bgY + 10}%;
+                border-top: 1.5px solid rgba(255, 245, 215, 0.85);
+                box-shadow: inset 1px 1px 2px rgba(255,240,205,0.65), 3px 4px 7px rgba(0,0,0,0.95);
+            `;
+            rockFace.appendChild(cragRidge);
+
+            rockContainer.appendChild(rockFace);
+            wrap.appendChild(rockContainer);
+        });
+
+        // 3. Falling Jagged Pebbles & Stone Gravel (Textured rock fragments)
+        const pebbles = [
+            { left: 10, bottom: 8, w: 14, h: 11, clip: '16% 0%, 84% 14%, 100% 68%, 74% 100%, 14% 92%, 0% 42%', rot: 120, del: 120, bgX: 20 },
+            { left: 28, bottom: 12, w: 12, h: 10, clip: '24% 0%, 90% 22%, 82% 100%, 26% 94%, 0% 50%', rot: -140, del: 180, bgX: 45 },
+            { left: 42, bottom: 7, w: 16, h: 12, clip: '14% 0%, 86% 12%, 100% 58%, 76% 100%, 18% 88%, 0% 36%', rot: 90, del: 220, bgX: 60 },
+            { left: 66, bottom: 10, w: 13, h: 10, clip: '20% 0%, 88% 18%, 100% 74%, 68% 100%, 10% 86%, 0% 44%', rot: -110, del: 280, bgX: 75 },
+            { left: 84, bottom: 8, w: 15, h: 11, clip: '18% 0%, 80% 10%, 100% 64%, 72% 100%, 16% 92%, 0% 38%', rot: 130, del: 320, bgX: 85 }
+        ];
+
+        pebbles.forEach(p => {
+            const pEl = document.createElement('div');
+            pEl.style.cssText = `
+                position: absolute;
+                left: ${p.left}%;
+                bottom: ${p.bottom}%;
+                width: ${p.w}px;
+                height: ${p.h}px;
+                clip-path: polygon(${p.clip});
+                background-image:
+                    linear-gradient(135deg, rgba(255,235,200,0.5) 0%, rgba(15,8,4,0.85) 100%),
+                    url('cards/dark_of_mirkwood/caves_of_nibin/collapsed_mine.jpg');
+                background-size: cover, 400% auto;
+                background-position: center, ${p.bgX}% 80%;
+                border-top: 1px solid rgba(255, 230, 180, 0.75);
+                box-shadow: 0 4px 8px rgba(0,0,0,0.92);
+                --p-rot: ${p.rot}deg;
+                animation: cmPebbleTumble 0.75s ease-in ${p.del}ms forwards;
+                opacity: 0;
+            `;
+            wrap.appendChild(pEl);
+        });
+
+        // 4. Billowing Dust Puffs at Base
+        const dustPuffs = [
+            { x: 18, y: 88, dx: -24, dy: -20, s: 68, ds: 2.3, del: 380 },
+            { x: 38, y: 85, dx: -14, dy: -32, s: 78, ds: 2.6, del: 420 },
+            { x: 60, y: 85, dx: 16, dy: -30, s: 80, ds: 2.5, del: 460 },
+            { x: 82, y: 88, dx: 28, dy: -18, s: 70, ds: 2.2, del: 500 },
+            { x: 50, y: 72, dx: 0, dy: -36, s: 88, ds: 2.7, del: 520 }
+        ];
+
+        dustPuffs.forEach(dp => {
+            const dEl = document.createElement('div');
+            dEl.style.cssText = `
+                position: absolute;
+                left: ${dp.x}%;
+                top: ${dp.y}%;
+                width: ${dp.s}px;
+                height: ${dp.s}px;
+                border-radius: 50%;
+                background: radial-gradient(circle, rgba(225, 190, 150, 0.88) 0%, rgba(150, 115, 80, 0.48) 45%, rgba(68, 48, 28, 0.14) 70%, transparent 100%);
+                filter: blur(4.5px);
+                --dx: ${dp.dx}px;
+                --dy: ${dp.dy}px;
+                --ds: ${dp.ds};
+                animation: cmDustPuff 0.95s ease-out ${dp.del}ms forwards;
+                opacity: 0;
+            `;
+            wrap.appendChild(dEl);
+        });
+
+        // 5. Deflecting & Shattering Travel Progress Tokens
+        const numGems = Math.max(1, Math.min(4, blockedCount || 1));
+        const gemStartX = [ -80, 80, -60, 60 ];
+        const gemStartY = [ -90, -80, -110, -100 ];
+
+        for (let i = 0; i < numGems; i++) {
+            const gemDelay = 580 + i * 120;
+            const impactX = qRect.width * (0.35 + i * 0.12);
+            const impactY = qRect.height * 0.68;
+
+            const gemEl = document.createElement('div');
+            gemEl.style.cssText = `
+                position: absolute;
+                left: ${impactX}px;
+                top: ${impactY}px;
+                width: 44px;
+                height: 44px;
+                margin-left: -22px;
+                margin-top: -22px;
+                background: url('tokens/travel.png') no-repeat center center;
+                background-size: contain;
+                filter: drop-shadow(0 0 10px #f5d76e) drop-shadow(0 4px 8px rgba(0,0,0,0.9));
+                --gx: ${gemStartX[i % gemStartX.length]}px;
+                --gy: ${gemStartY[i % gemStartY.length]}px;
+                --def-x: ${(i % 2 === 0 ? -1 : 1) * (45 + Math.random() * 40)}px;
+                --def-y: ${-40 - Math.random() * 35}px;
+                animation: cmGemFlyStrike 0.52s cubic-bezier(0.2, 0.8, 0.35, 1) ${gemDelay}ms forwards;
+                opacity: 0;
+            `;
+            wrap.appendChild(gemEl);
+
+            setTimeout(() => {
+                try {
+                    const clink = new Audio('./sound_effects/enemy_move.mp3');
+                    const vol = document.getElementById('volume-slider');
+                    clink.volume = vol ? parseFloat(vol.value) : 0.25;
+                    clink.playbackRate = 1.6 + Math.random() * 0.3;
+                    clink.play().catch(() => {});
+                } catch(e) {}
+
+                for (let k = 0; k < 14; k++) {
+                    const ang = Math.random() * Math.PI * 2;
+                    const dist = 28 + Math.random() * 42;
+                    const shard = document.createElement('div');
+                    shard.style.cssText = `
+                        position: absolute;
+                        left: ${impactX}px;
+                        top: ${impactY}px;
+                        width: ${3 + Math.random() * 5}px;
+                        height: ${3 + Math.random() * 5}px;
+                        background: ${Math.random() > 0.4 ? '#ffffff' : '#f5d76e'};
+                        box-shadow: 0 0 6px #f5d76e, 0 0 10px #ea580c;
+                        border-radius: 40% 60% 45% 55%;
+                        --sx: ${Math.cos(ang) * dist}px;
+                        --sy: ${Math.sin(ang) * dist - 15}px;
+                        --sr: ${(Math.random() - 0.5) * 540}deg;
+                        animation: cmShardShatter 0.48s ease-out forwards;
+                    `;
+                    wrap.appendChild(shard);
+                    setTimeout(() => shard.remove(), 480);
+                }
+            }, gemDelay + 360);
+        }
+
+        setTimeout(() => {
+            wrap.style.transition = 'opacity 0.85s ease-out';
+            wrap.style.opacity = '0';
+            setTimeout(() => wrap.remove(), 860);
+        }, 2800);
+    }
+    window.triggerCollapsedMineCaveIn = triggerCollapsedMineCaveIn;
+
+    function triggerCollapsedMineThreatBoulders(diff, enemy, pIdx) {
+        if (!diff || diff <= 0) return;
+
+        const engine = window.LotrEngine;
+        const game = engine ? engine.game : window.game;
+        const targetPIdx = (typeof pIdx === 'number' && !isNaN(pIdx)) ? pIdx : ((game && game.activeTabPlayerIdx !== undefined) ? game.activeTabPlayerIdx : 0);
+
+        const hudThreat = document.getElementById('hud-threat');
+        const targetRect = hudThreat ? hudThreat.getBoundingClientRect() : { left: window.innerWidth / 2, top: 40, width: 40, height: 40 };
+        const targetX = targetRect.left + targetRect.width / 2;
+        const targetY = targetRect.top + targetRect.height / 2;
+
+        const enemyEl = enemy ? document.querySelector(`[data-uid="${enemy._uid}"]`) : null;
+        const sRect = enemyEl ? enemyEl.getBoundingClientRect() : { left: window.innerWidth / 2 - 70, top: window.innerHeight / 2, width: 140, height: 200 };
+        const startX = sRect.left + sRect.width / 2;
+        const startY = sRect.top + sRect.height / 2;
+
+        const count = diff;
+        const flightDuration = 760;
+        const boulderInterval = 820; // Paced gap between each boulder's emergence and launch
+
+        window._gandalfThreatAnimating = true;
+
+        try {
+            const startSnd = new Audio('./sound_effects/dark_of_mirkwood/collapsed_mine.mp3');
+            const vol = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+            startSnd.volume = Math.min(1.0, vol * 1.3);
+            startSnd.play().catch(() => {});
+        } catch(e) {}
+
+        if (!document.getElementById('cm-stream-suction-styles')) {
+            const st = document.createElement('style');
+            st.id = 'cm-stream-suction-styles';
+            st.textContent = `
+                @keyframes cmPieceSuckIn {
+                    0% {
+                        transform: translate(var(--shard-x), var(--shard-y)) scale(0.3) rotate(var(--shard-r));
+                        opacity: 0;
+                        filter: brightness(2.2) drop-shadow(0 0 10px #f59e0b);
+                    }
+                    25% {
+                        opacity: 1;
+                        filter: brightness(1.5);
+                    }
+                    80% {
+                        transform: translate(calc(var(--shard-x) * 0.12), calc(var(--shard-y) * 0.12)) scale(1.0);
+                        opacity: 1;
+                    }
+                    95% {
+                        transform: translate(0, 0) scale(1.08) rotate(0deg);
+                        opacity: 1;
+                        filter: brightness(1.8) drop-shadow(0 0 12px #ff4500);
+                    }
+                    100% {
+                        transform: translate(0, 0) scale(1) rotate(0deg);
+                        opacity: 0;
+                    }
+                }
+            `;
+            document.head.appendChild(st);
+        }
+
+        const boulderTemplates = [
+            { w: 42, h: 36, clip: '0% 36%, 10% 18%, 26% 6%, 48% 0%, 74% 4%, 90% 16%, 98% 34%, 90% 54%, 100% 70%, 84% 86%, 92% 98%, 64% 100%, 38% 92%, 18% 100%, 4% 86%, 0% 62%', bgX: 18, bgY: 72 },
+            { w: 48, h: 40, clip: '4% 30%, 16% 12%, 36% 0%, 62% 6%, 84% 2%, 98% 20%, 90% 46%, 100% 66%, 86% 88%, 66% 100%, 40% 94%, 20% 100%, 6% 84%, 0% 56%', bgX: 42, bgY: 68 },
+            { w: 52, h: 42, clip: '2% 40%, 12% 16%, 30% 0%, 56% 6%, 78% 0%, 94% 16%, 100% 40%, 88% 64%, 98% 86%, 72% 100%, 48% 92%, 24% 100%, 8% 84%, 0% 64%', bgX: 68, bgY: 74 },
+            { w: 44, h: 38, clip: '0% 32%, 14% 10%, 40% 0%, 66% 10%, 88% 2%, 100% 26%, 90% 50%, 100% 74%, 82% 100%, 52% 90%, 30% 98%, 10% 88%, 0% 60%', bgX: 84, bgY: 70 },
+            { w: 46, h: 38, clip: '4% 38%, 20% 14%, 44% 0%, 72% 6%, 92% 0%, 100% 32%, 88% 56%, 98% 84%, 70% 100%, 46% 90%, 24% 98%, 6% 80%, 0% 54%', bgX: 34, bgY: 52 }
+        ];
+
+        // 8 Staggered pieces of varied dimensions (10px up to 26px) that appear and suck in one after another
+        const streamPieces = [
+            { sx: -125, sy: -85, sr: -80, clip: '20% 0%, 85% 15%, 100% 65%, 75% 100%, 15% 85%, 0% 45%', w: 14, h: 12, del: 0,   suckTime: 330, grow: 0.35 },
+            { sx: 120,  sy: -95, sr: 70,  clip: '15% 20%, 75% 0%, 100% 55%, 85% 95%, 20% 100%, 0% 60%', w: 22, h: 18, del: 60,  suckTime: 340, grow: 0.48 },
+            { sx: -110, sy: 75,  sr: 90,  clip: '30% 0%, 88% 25%, 78% 100%, 25% 95%, 0% 65%',            w: 11, h: 10, del: 120, suckTime: 320, grow: 0.58 },
+            { sx: 115,  sy: 85,  sr: -85, clip: '10% 15%, 80% 0%, 100% 70%, 65% 100%, 0% 85%',           w: 26, h: 22, del: 180, suckTime: 360, grow: 0.72 },
+            { sx: 0,    sy: -135,sr: 25,  clip: '25% 5%, 80% 0%, 100% 60%, 70% 100%, 10% 90%, 0% 40%',  w: 16, h: 14, del: 240, suckTime: 330, grow: 0.82 },
+            { sx: -135, sy: -15, sr: -95, clip: '22% 0%, 84% 18%, 100% 70%, 72% 100%, 12% 88%, 0% 52%',  w: 19, h: 17, del: 300, suckTime: 340, grow: 0.90 },
+            { sx: 135,  sy: 10,  sr: 95,  clip: '18% 10%, 78% 0%, 100% 65%, 80% 100%, 15% 95%, 0% 40%',  w: 13, h: 12, del: 360, suckTime: 320, grow: 0.96 },
+            { sx: -45,  sy: 125, sr: -50, clip: '20% 0%, 80% 10%, 100% 60%, 75% 100%, 15% 90%, 0% 40%',  w: 24, h: 20, del: 420, suckTime: 350, grow: 1.00 }
+        ];
+
+        let bouldersLanded = 0;
+
+        for (let i = 0; i < count; i++) {
+            const tmpl = boulderTemplates[i % boulderTemplates.length];
+            const startDelay = i * boulderInterval;
+
+            setTimeout(() => {
+                const bContainer = document.createElement('div');
+                const spawnSpreadX = (Math.random() - 0.5) * 35;
+                const spawnSpreadY = (Math.random() - 0.5) * 35;
+                const bStartX = startX + spawnSpreadX;
+                const bStartY = startY + spawnSpreadY;
+
+                bContainer.style.cssText = `
+                    position: fixed;
+                    left: ${bStartX}px;
+                    top: ${bStartY}px;
+                    width: ${tmpl.w}px;
+                    height: ${tmpl.h}px;
+                    margin-left: -${tmpl.w / 2}px;
+                    margin-top: -${tmpl.h / 2}px;
+                    pointer-events: none;
+                    z-index: 100020;
+                    transform-origin: center center;
+                `;
+
+                // Main Boulder Core (grows incrementally as stream pieces slam into it)
+                const boulderCore = document.createElement('div');
+                boulderCore.style.cssText = `
+                    position: absolute; inset: 0;
+                    transform: scale(0.25);
+                    opacity: 0;
+                    transition: transform 0.16s ease-out, filter 0.16s ease-out, opacity 0.2s ease-out;
+                `;
+
+                // 3D Extruded Depth Underlay
+                const underlay = document.createElement('div');
+                underlay.style.cssText = `
+                    position: absolute;
+                    inset: 0;
+                    transform: translate(2.5px, 4px);
+                    clip-path: polygon(${tmpl.clip});
+                    background: #0d0906;
+                    box-shadow: 0 12px 20px rgba(0, 0, 0, 0.95);
+                `;
+                boulderCore.appendChild(underlay);
+
+                // Textured Stone Face from collapsed_mine.jpg
+                const rockFace = document.createElement('div');
+                rockFace.style.cssText = `
+                    position: absolute;
+                    inset: 0;
+                    clip-path: polygon(${tmpl.clip});
+                    background-image:
+                        linear-gradient(140deg, rgba(255, 240, 205, 0.6) 0%, rgba(185, 140, 95, 0.22) 28%, transparent 58%),
+                        linear-gradient(318deg, rgba(8, 5, 2, 0.95) 0%, rgba(25, 16, 9, 0.65) 45%, transparent 75%),
+                        url('cards/dark_of_mirkwood/caves_of_nibin/collapsed_mine.jpg'),
+                        url('cards/dark_of_mirkwood/caves_of_nibin/crumbling_stairs.jpg'),
+                        linear-gradient(135deg, #5e4c3a 0%, #2b2118 100%);
+                    background-size: cover, cover, 250% auto, 250% auto, cover;
+                    background-position: center, center, ${tmpl.bgX}% ${tmpl.bgY}%, ${tmpl.bgX}% ${tmpl.bgY}%, center;
+                    border-top: 1.5px solid rgba(255, 235, 195, 0.85);
+                    border-left: 1.2px solid rgba(220, 190, 150, 0.6);
+                    border-bottom: 2px solid #0d0804;
+                    box-shadow: inset 2px 2px 3px rgba(255,245,215,0.45), inset -3px -3px 6px rgba(0,0,0,0.92);
+                    filter: drop-shadow(0 3px 5px rgba(0, 0, 0, 0.95));
+                `;
+
+                // High-Relief Jagged Surface Crag Ridge
+                const cragRidge = document.createElement('div');
+                cragRidge.style.cssText = `
+                    position: absolute;
+                    left: 14%;
+                    top: 14%;
+                    width: 62%;
+                    height: 52%;
+                    clip-path: polygon(0% 45%, 28% 0%, 78% 12%, 100% 55%, 72% 100%, 18% 88%);
+                    background-image:
+                        linear-gradient(145deg, rgba(255, 248, 225, 0.62) 0%, rgba(165, 120, 80, 0.2) 35%, rgba(10, 5, 2, 0.88) 100%),
+                        url('cards/dark_of_mirkwood/caves_of_nibin/collapsed_mine.jpg');
+                    background-size: cover, 300% auto;
+                    background-position: center, ${tmpl.bgX + 10}% ${tmpl.bgY + 10}%;
+                    border-top: 1.2px solid rgba(255, 245, 215, 0.85);
+                    box-shadow: inset 1px 1px 2px rgba(255,240,205,0.65), 2px 3px 5px rgba(0,0,0,0.95);
+                `;
+                rockFace.appendChild(cragRidge);
+                boulderCore.appendChild(rockFace);
+                bContainer.appendChild(boulderCore);
+                document.body.appendChild(bContainer);
+
+                // Staggered stream pieces appear and get sucked inward one after another
+                streamPieces.forEach((pItem, pIdx) => {
+                    setTimeout(() => {
+                        const shEl = document.createElement('div');
+                        shEl.style.cssText = `
+                            position: absolute;
+                            left: 50%; top: 50%;
+                            width: ${pItem.w}px; height: ${pItem.h}px;
+                            margin-left: -${pItem.w / 2}px; margin-top: -${pItem.h / 2}px;
+                            clip-path: polygon(${pItem.clip});
+                            background-image:
+                                linear-gradient(135deg, rgba(255,240,210,0.85) 0%, rgba(180,140,100,0.3) 30%, rgba(20,12,6,0.95) 100%),
+                                url('cards/dark_of_mirkwood/caves_of_nibin/collapsed_mine.jpg');
+                            background-size: cover, 300% auto;
+                            background-position: center, ${tmpl.bgX}% ${tmpl.bgY}%;
+                            border-top: 1.5px solid rgba(255, 230, 180, 0.9);
+                            box-shadow: inset 1px 1px 2px rgba(255,240,200,0.5), 0 3px 8px rgba(0,0,0,0.9);
+                            pointer-events: none;
+                            --shard-x: ${pItem.sx}px;
+                            --shard-y: ${pItem.sy}px;
+                            --shard-r: ${pItem.sr}deg;
+                            animation: cmPieceSuckIn ${pItem.suckTime}ms cubic-bezier(0.55, 0, 0.25, 1) forwards;
+                        `;
+                        bContainer.appendChild(shEl);
+
+                        // Upon each piece impacting the center:
+                        setTimeout(() => {
+                            shEl.remove();
+
+                            // Micro-crunch sound for each rock piece impact
+                            try {
+                                const crunch = new Audio('./sound_effects/dark_of_mirkwood/cracked_pillar.mp3');
+                                const vol = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                                crunch.volume = Math.min(1.0, vol * (0.4 + pItem.grow * 0.8));
+                                crunch.playbackRate = 1.6 - pItem.grow * 0.35;
+                                crunch.play().catch(() => {});
+                            } catch(e) {}
+
+                            // Boulder grows incrementally with each colliding piece
+                            boulderCore.style.opacity = '1';
+                            boulderCore.style.transform = `scale(${pItem.grow * 1.15})`;
+                            boulderCore.style.filter = `brightness(${1.4 + pItem.grow * 0.8}) drop-shadow(0 0 ${8 + pItem.grow * 12}px #f59e0b)`;
+
+                            setTimeout(() => {
+                                boulderCore.style.transform = `scale(${pItem.grow})`;
+                                boulderCore.style.filter = 'drop-shadow(0 4px 10px rgba(0,0,0,0.9))';
+                            }, 100);
+                        }, pItem.suckTime);
+                    }, pItem.del);
+                });
+
+                // Boulder finishes formalizing and launches towards threat UI
+                const finalAssembleTime = 420 + 350 + 60; // 830ms total assembly time
+
+                setTimeout(() => {
+                    boulderCore.style.transition = 'none';
+
+                    const lateralArc = (i % 2 === 0 ? -1 : 1) * (45 + Math.random() * 45);
+                    const lift = 80 + Math.random() * 50;
+                    const p0 = { x: bStartX, y: bStartY };
+                    const p1 = { x: (bStartX + targetX) / 2 + lateralArc, y: Math.min(bStartY, targetY) - lift };
+                    const p2 = { x: targetX, y: targetY };
+
+                    const spinX = (Math.random() > 0.5 ? 1 : -1) * (460 + Math.random() * 320);
+                    const spinY = (Math.random() > 0.5 ? 1 : -1) * (500 + Math.random() * 340);
+                    const spinZ = (Math.random() > 0.5 ? 1 : -1) * (360 + Math.random() * 240);
+                    const launchTime = performance.now();
+
+                    const anim = (now) => {
+                        const elapsed = now - launchTime;
+                        const progress = Math.min(1, elapsed / flightDuration);
+                        const t = progress;
+                        const invT = 1 - t;
+
+                        const curX = invT * invT * p0.x + 2 * invT * t * p1.x + t * t * p2.x;
+                        const curY = invT * invT * p0.y + 2 * invT * t * p1.y + t * t * p2.y;
+
+                        const curRotX = t * spinX;
+                        const curRotY = t * spinY;
+                        const curRotZ = t * spinZ;
+                        const scale = 0.95 + Math.sin(t * Math.PI) * 0.45;
+
+                        bContainer.style.left = `${curX}px`;
+                        bContainer.style.top = `${curY}px`;
+                        bContainer.style.transform = `perspective(700px) rotateX(${curRotX}deg) rotateY(${curRotY}deg) rotateZ(${curRotZ}deg) scale(${scale})`;
+
+                        if (progress < 1) {
+                            requestAnimationFrame(anim);
+                        } else {
+                            bContainer.remove();
+                            bouldersLanded++;
+
+                            // Step-by-step threat increment visibly updated on each impact
+                            if (game) {
+                                game.threats[targetPIdx] = (game.threats[targetPIdx] || 0) + 1;
+                                if (targetPIdx === 0 || game.numPlayers === 1) {
+                                    game.threat = game.threats[targetPIdx];
+                                }
+
+                                if (hudThreat) {
+                                    hudThreat.textContent = String(game.threats[targetPIdx]);
+                                    hudThreat.style.transform = 'scale(1.36)';
+                                    hudThreat.style.color = '#ff3030';
+                                    setTimeout(() => {
+                                        if (hudThreat) {
+                                            hudThreat.style.transform = '';
+                                            hudThreat.style.color = '';
+                                        }
+                                    }, 140);
+                                }
+
+                                const diffEl = document.getElementById('hud-threat-diff');
+                                if (diffEl) {
+                                    diffEl.textContent = `+${bouldersLanded}`;
+                                    diffEl.classList.remove('threat-diff-active');
+                                    void diffEl.offsetWidth;
+                                    diffEl.classList.add('threat-diff-active');
+                                }
+                            }
+
+                            // Reliable threat increase audio playback with fallback
+                            try {
+                                const volSlider = document.getElementById('volume-slider');
+                                const vol = volSlider ? parseFloat(volSlider.value) : (parseFloat(localStorage.getItem('lotr_sfx_volume') || '0.25') || 0.25);
+                                const snd = new Audio('./sound_effects/threat_increase.mp3');
+                                snd.volume = Math.min(1.0, Math.max(0.1, vol * 1.5));
+                                snd.currentTime = 0;
+                                const p = snd.play();
+                                if (p !== undefined) {
+                                    p.catch(() => {
+                                        try {
+                                            const fb = new Audio('sound_effects/threat_increase.mp3');
+                                            fb.volume = Math.min(1.0, Math.max(0.1, vol * 1.5));
+                                            fb.play().catch(() => {});
+                                        } catch(e2) {}
+                                    });
+                                }
+                            } catch(e) {}
+
+                            if (window.LotrEngine && window.LotrEngine.window && window.LotrEngine.window.screenShake) {
+                                window.LotrEngine.window.screenShake(5, 180);
+                            }
+
+                            // Shards & Dust on Impact
+                            for (let k = 0; k < 10; k++) {
+                                const ang = Math.random() * Math.PI * 2;
+                                const dist = 18 + Math.random() * 30;
+                                const shard = document.createElement('div');
+                                shard.style.cssText = `
+                                    position: fixed;
+                                    left: ${targetX}px;
+                                    top: ${targetY}px;
+                                    width: ${3 + Math.random() * 4}px;
+                                    height: ${3 + Math.random() * 4}px;
+                                    background: ${Math.random() > 0.4 ? '#8d7b68' : '#3e352d'};
+                                    box-shadow: 0 0 6px rgba(0,0,0,0.85);
+                                    clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+                                    pointer-events: none;
+                                    z-index: 100021;
+                                    transition: transform 0.38s ease-out, opacity 0.38s ease-out;
+                                    opacity: 1;
+                                `;
+                                document.body.appendChild(shard);
+                                requestAnimationFrame(() => {
+                                    shard.style.transform = `translate(${Math.cos(ang) * dist}px, ${Math.sin(ang) * dist}px) scale(0.2) rotate(${Math.random() * 360}deg)`;
+                                    shard.style.opacity = '0';
+                                });
+                                setTimeout(() => shard.remove(), 380);
+                            }
+
+                            // Final cleanup when the last boulder hits
+                            if (bouldersLanded === count) {
+                                window._gandalfThreatAnimating = false;
+                                if (engine && engine.render) engine.render();
+                                if (game && game.threats[targetPIdx] >= 50 && engine && engine.eliminatePlayer) {
+                                    engine.eliminatePlayer(targetPIdx);
+                                }
+                            }
+                        }
+                    };
+                    requestAnimationFrame(anim);
+                }, finalAssembleTime);
+            }, startDelay);
+        }
+    }
+    window.triggerCollapsedMineThreatBoulders = triggerCollapsedMineThreatBoulders;
+
+    function injectCollapsedMineAuraStyles() {
+        if (document.getElementById('collapsed-mine-aura-style')) return;
+        const style = document.createElement('style');
+        style.id = 'collapsed-mine-aura-style';
+        style.textContent = `
+            .collapsed-mine-aura {
+                position: absolute;
+                inset: -5px;
+                border-radius: 9px;
+                pointer-events: none;
+                z-index: 10;
+                overflow: visible;
+            }
+            .cm-ambient-glow {
+                position: absolute;
+                inset: 0;
+                border-radius: 9px;
+                border: 2px solid rgba(251, 191, 36, 0.85);
+                box-shadow: 0 0 22px rgba(245, 158, 11, 0.7), 0 0 40px rgba(217, 119, 6, 0.4), inset 0 0 16px rgba(251, 191, 36, 0.35);
+                animation: cmGlowPulseAlpha 3.4s ease-in-out infinite alternate;
+                will-change: opacity;
+            }
+            .cm-dust-layer {
+                position: absolute;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                height: 55%;
+                background: radial-gradient(ellipse at bottom center, rgba(245, 158, 11, 0.45) 0%, rgba(146, 64, 14, 0.25) 40%, transparent 75%);
+                border-radius: 0 0 9px 9px;
+                animation: cmGlowPulseAlpha 2.6s ease-in-out infinite alternate;
+                will-change: opacity;
+            }
+            .cm-rock-viewport {
+                position: absolute;
+                inset: 0;
+                overflow: hidden;
+                border-radius: 6px;
+                pointer-events: none;
+            }
+            .cm-aura-rock {
+                position: absolute;
+                transform-origin: center center;
+                animation: cmFloatRockDown linear infinite;
+                will-change: transform, opacity, top;
+            }
+            .cm-aura-mote {
+                position: absolute;
+                border-radius: 50%;
+                background: #fde68a;
+                box-shadow: 0 0 4px #f59e0b;
+                animation: cmFloatMoteDown linear infinite;
+                will-change: transform, opacity, top;
+            }
+            @keyframes cmGlowPulseAlpha {
+                0% { opacity: 0.5; }
+                100% { opacity: 1; }
+            }
+            @keyframes cmFloatRockDown {
+                0% {
+                    top: -4%;
+                    opacity: 0;
+                    transform: scale(0.65) rotate(0deg) translateX(0px);
+                }
+                14% {
+                    opacity: 0.95;
+                    transform: scale(1) rotate(calc(var(--rot) * 0.15)) translateX(calc(var(--drift) * 0.12));
+                }
+                45% {
+                    opacity: 0.85;
+                    transform: scale(0.95) rotate(calc(var(--rot) * 0.48)) translateX(calc(var(--drift) * 0.45));
+                }
+                75% {
+                    opacity: 0.35;
+                    transform: scale(0.88) rotate(calc(var(--rot) * 0.78)) translateX(calc(var(--drift) * 0.75));
+                }
+                100% {
+                    top: 55%;
+                    opacity: 0;
+                    transform: scale(0.7) rotate(var(--rot)) translateX(var(--drift));
+                }
+            }
+            @keyframes cmFloatMoteDown {
+                0% {
+                    top: 0%;
+                    opacity: 0;
+                    transform: translateX(0px) scale(0.5);
+                }
+                20% {
+                    opacity: 0.9;
+                    transform: translateX(calc(var(--drift) * 0.2)) scale(1);
+                }
+                70% {
+                    opacity: 0.4;
+                    transform: translateX(calc(var(--drift) * 0.7)) scale(0.8);
+                }
+                100% {
+                    top: 52%;
+                    opacity: 0;
+                    transform: translateX(var(--drift)) scale(0.4);
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    function createCollapsedMineAuraElement() {
+        injectCollapsedMineAuraStyles();
+        const wrap = document.createElement('div');
+        wrap.className = 'collapsed-mine-aura';
+
+        const rocksConfig = [
+            { w: 9, h: 8, l: 14, clip: '25% 0%, 75% 15%, 100% 60%, 80% 100%, 20% 90%, 0% 45%', bg: 'linear-gradient(135deg, #8c7e6f 0%, #4f443b 60%, #26201a 100%)', bs: 'inset 1px 1px 1px rgba(255,220,160,0.5)', drift: -8, rot: 120, dur: 3.1, del: -0.5 },
+            { w: 6, h: 7, l: 28, clip: '50% 0%, 90% 30%, 80% 85%, 35% 100%, 0% 70%, 15% 20%', bg: 'linear-gradient(120deg, #786a5d 0%, #3e352d 70%, #1c1612 100%)', bs: '', drift: 10, rot: -130, dur: 3.4, del: -1.6 },
+            { w: 11, h: 9, l: 42, clip: '30% 0%, 85% 10%, 100% 75%, 60% 100%, 10% 85%, 0% 30%', bg: 'linear-gradient(140deg, #968371 0%, #5e4c3d 50%, #b86e24 55%, #33271e 100%)', bs: 'inset 1px 1px 2px rgba(255,200,120,0.6)', drift: -12, rot: 150, dur: 3.6, del: -2.2 },
+            { w: 5, h: 5, l: 56, clip: '40% 5%, 95% 40%, 70% 95%, 20% 90%, 5% 50%', bg: 'linear-gradient(135deg, #a39281 0%, #564739 100%)', bs: '', drift: 8, rot: 90, dur: 2.6, del: -0.8 },
+            { w: 8, h: 8, l: 70, clip: '15% 15%, 70% 0%, 100% 40%, 85% 90%, 30% 100%, 0% 60%', bg: 'linear-gradient(125deg, #7c6f63 0%, #483d34 65%, #241d18 100%)', bs: '', drift: 14, rot: -140, dur: 3.2, del: -2.7 },
+            { w: 10, h: 9, l: 84, clip: '25% 5%, 80% 0%, 100% 55%, 75% 100%, 15% 95%, 0% 40%', bg: 'linear-gradient(135deg, #8f7d6a 0%, #594738 50%, #2b211a 100%)', bs: 'inset 1px 1px 1px rgba(255,230,170,0.4)', drift: -10, rot: 130, dur: 3.5, del: -1.1 }
+        ];
+
+        const motesConfig = [
+            { s: 3, l: 20, drift: 8, dur: 2.2, del: -0.4 },
+            { s: 2, l: 36, drift: -6, dur: 2.7, del: -1.3 },
+            { s: 3, l: 50, drift: 10, dur: 2.4, del: -0.8 },
+            { s: 2, l: 65, drift: -8, dur: 2.9, del: -2.1 },
+            { s: 3, l: 80, drift: 7, dur: 2.5, del: -1.0 }
+        ];
+
+        let rocksHtml = rocksConfig.map(r => `
+            <div class="cm-aura-rock" style="
+                width: ${r.w}px; height: ${r.h}px; left: ${r.l}%;
+                clip-path: polygon(${r.clip});
+                background: ${r.bg};
+                box-shadow: ${r.bs};
+                --drift: ${r.drift}px;
+                --rot: ${r.rot}deg;
+                animation-duration: ${r.dur}s;
+                animation-delay: ${r.del}s;
+            "></div>
+        `).join('');
+
+        let motesHtml = motesConfig.map(m => `
+            <div class="cm-aura-mote" style="
+                width: ${m.s}px; height: ${m.s}px; left: ${m.l}%;
+                --drift: ${m.drift}px;
+                animation-duration: ${m.dur}s;
+                animation-delay: ${m.del}s;
+            "></div>
+        `).join('');
+
+        wrap.innerHTML = `
+            <div class="cm-ambient-glow"></div>
+            <div class="cm-dust-layer"></div>
+            <div class="cm-rock-viewport" style="position: absolute; inset: 5px; overflow: hidden; border-radius: 6px; pointer-events: none;">
+                ${rocksHtml}
+                ${motesHtml}
+            </div>
+        `;
+        return wrap;
+    }
+
+    let _persistentStairsAura = null;
+    let _persistentMineAura = null;
+    let _nibinStagingSyncTick = 0;
+
+    function syncNibinStagingAuras() {
+        const game = window.game || (window.LotrEngine && window.LotrEngine.game);
+        if (!game) {
+            setTimeout(syncNibinStagingAuras, 100);
+            return;
+        }
+
+        _nibinStagingSyncTick++;
+
+        // Clean up stale inline auras efficiently (runs ~twice per second to prevent build-up)
+        if (_nibinStagingSyncTick % 15 === 0) {
+            const staleStairs = document.getElementsByClassName('crumbling-stairs-aura');
+            for (let i = 0; i < staleStairs.length; i++) {
+                if (staleStairs[i].parentNode !== document.body) staleStairs[i].remove();
+            }
+            const staleMines = document.getElementsByClassName('collapsed-mine-aura');
+            for (let i = 0; i < staleMines.length; i++) {
+                if (staleMines[i].parentNode !== document.body) staleMines[i].remove();
+            }
+        }
+
+        // --- 1. CRUMBLING STAIRS PERSISTENT AURA ---
+        const isStairsInStaging = game.stagingArea && game.stagingArea.some(c => c && (c.id === 'nibin_crumbling_stairs' || c.id === 'crumbling_stairs'));
+        const stairsCardEl = document.querySelector('#staging-content [data-id="nibin_crumbling_stairs"], #staging-content [data-id="crumbling_stairs"]');
+
+        if (isStairsInStaging && stairsCardEl && stairsCardEl.style.display !== 'none' && stairsCardEl.style.visibility !== 'hidden' && stairsCardEl.style.opacity !== '0') {
+            if (!_persistentStairsAura) {
+                _persistentStairsAura = createCrumblingStairsAuraElement();
+                _persistentStairsAura.style.position = 'fixed';
+                _persistentStairsAura.style.pointerEvents = 'none';
+                _persistentStairsAura.style.zIndex = '15';
+                _persistentStairsAura.style.opacity = '1';
+                _persistentStairsAura.style.transition = 'opacity 0.35s ease-out';
+                // Lock coordinates to (0,0) and move entirely via hardware-accelerated transforms
+                _persistentStairsAura.style.left = '0px';
+                _persistentStairsAura.style.top = '0px';
+                document.body.appendChild(_persistentStairsAura);
+            }
+            const r = stairsCardEl.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+                _persistentStairsAura.style.transform = `translate3d(${r.left - 5}px, ${r.top - 5}px, 0)`;
+                _persistentStairsAura.style.width = `${r.width + 10}px`;
+                _persistentStairsAura.style.height = `${r.height + 10}px`;
+                if (_persistentStairsAura.style.opacity === '0') _persistentStairsAura.style.opacity = '1';
+            } else {
+                _persistentStairsAura.style.opacity = '0';
+            }
+        } else if (_persistentStairsAura) {
+            _persistentStairsAura.style.opacity = '0';
+            const oldAura = _persistentStairsAura;
+            _persistentStairsAura = null;
+            setTimeout(() => { if (oldAura && oldAura.parentNode) oldAura.remove(); }, 360);
+        }
+
+        // --- 2. COLLAPSED MINE PERSISTENT AURA ---
+        const isMineInStaging = game.stagingArea && game.stagingArea.some(c => c && (c.id === 'nibin_collapsed_mine' || c.id === 'collapsed_mine'));
+        const mineCardEl = document.querySelector('#staging-content [data-id="nibin_collapsed_mine"], #staging-content [data-id="collapsed_mine"]');
+
+        if (isMineInStaging && mineCardEl && mineCardEl.style.display !== 'none' && mineCardEl.style.visibility !== 'hidden' && mineCardEl.style.opacity !== '0') {
+            if (!_persistentMineAura) {
+                _persistentMineAura = createCollapsedMineAuraElement();
+                _persistentMineAura.style.position = 'fixed';
+                _persistentMineAura.style.pointerEvents = 'none';
+                _persistentMineAura.style.zIndex = '15';
+                _persistentMineAura.style.opacity = '1';
+                _persistentMineAura.style.transition = 'opacity 0.35s ease-out';
+                // Lock coordinates to (0,0) and move entirely via hardware-accelerated transforms
+                _persistentMineAura.style.left = '0px';
+                _persistentMineAura.style.top = '0px';
+                document.body.appendChild(_persistentMineAura);
+            }
+            const r = mineCardEl.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+                _persistentMineAura.style.transform = `translate3d(${r.left - 5}px, ${r.top - 5}px, 0)`;
+                _persistentMineAura.style.width = `${r.width + 10}px`;
+                _persistentMineAura.style.height = `${r.height + 10}px`;
+                if (_persistentMineAura.style.opacity === '0') _persistentMineAura.style.opacity = '1';
+            } else {
+                _persistentMineAura.style.opacity = '0';
+            }
+        } else if (_persistentMineAura) {
+            _persistentMineAura.style.opacity = '0';
+            const oldAura = _persistentMineAura;
+            _persistentMineAura = null;
+            setTimeout(() => { if (oldAura && oldAura.parentNode) oldAura.remove(); }, 360);
+        }
+
+        setTimeout(syncNibinStagingAuras, 33);
+    }
+    setTimeout(syncNibinStagingAuras, 33);
+
+    window.updateCollapsedMineAura = syncNibinStagingAuras;
+    window.updateCrumblingStairsAura = syncNibinStagingAuras;
+
+    function playGoblinDungeonAudio(card) {
+        if (card && card._goblinDungeonFlippedAudio) return;
+        if (card) card._goblinDungeonFlippedAudio = true;
+        if (window._goblinDungeonAudioCooldown) return;
+        window._goblinDungeonAudioCooldown = true;
+        setTimeout(() => { window._goblinDungeonAudioCooldown = false; }, 3000);
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/goblin_dungeon.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch (e) {}
+    }
+    window.playGoblinDungeonAudio = playGoblinDungeonAudio;
+
+    function playGoblinDungeonGateAnimation(callback) {
+        const deckEl = document.getElementById('encounter-deck-pile');
+        if (!deckEl) {
+            if (callback) callback();
+            return;
+        }
+
+        const dRect = deckEl.getBoundingClientRect();
+        const W = dRect.width;
+        const H = dRect.height;
+
+        try {
+            const snd = new Audio('./sound_effects/chains.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch (e) {}
+
+        const gateWrap = document.createElement('div');
+        gateWrap.className = 'gd-gate-animation-wrap';
+        gateWrap.style.cssText = `
+            position: fixed;
+            left: ${dRect.left}px;
+            top: ${dRect.top}px;
+            width: ${W}px;
+            height: ${H}px;
+            pointer-events: none;
+            z-index: 10005;
+            perspective: 650px;
+            perspective-origin: 50% 50%;
+            border-radius: 6px;
+            overflow: visible;
+            opacity: 0;
+            transition: opacity 0.25s ease-out;
+        `;
+
+        const abyssBg = document.createElement('div');
+        abyssBg.style.cssText = `
+            position: absolute;
+            inset: 0;
+            border-radius: 6px;
+            background: radial-gradient(ellipse at 50% 50%, rgba(220, 38, 38, 0.6) 0%, rgba(120, 15, 15, 0.45) 40%, rgba(12, 2, 4, 0.98) 85%, #050002 100%);
+            box-shadow: inset 0 0 20px rgba(0,0,0,0.95), 0 0 25px rgba(220, 38, 38, 0.5);
+            border: 2px solid #5a1a1a;
+        `;
+        gateWrap.appendChild(abyssBg);
+
+        const doorsContainer = document.createElement('div');
+        doorsContainer.style.cssText = `
+            position: absolute;
+            inset: 0;
+            border-radius: 6px;
+            overflow: visible;
+            transform-style: preserve-3d;
+        `;
+
+        const leftDoor = document.createElement('div');
+        leftDoor.className = 'gd-gate-left';
+        leftDoor.style.cssText = `
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 50%;
+            height: 100%;
+            transform-origin: left center;
+            transform: rotateY(0deg);
+            border-radius: 5px 0 0 5px;
+            background:
+                linear-gradient(90deg, #1a120c 0%, #2a1f17 25%, #3d2f24 50%, #2a1f17 75%, #140e09 100%),
+                repeating-linear-gradient(90deg, transparent, transparent 11px, rgba(0,0,0,0.6) 12px),
+                repeating-linear-gradient(0deg, transparent, transparent 24px, #100b07 26px, #423225 28px, #0d0906 30px, transparent 32px);
+            box-shadow: inset 1px 1px 2px rgba(255,220,160,0.3), inset -2px 0 6px rgba(0,0,0,0.85), 2px 0 6px rgba(0,0,0,0.9);
+            border: 1.5px solid #2e1d14;
+            border-right: 1.5px solid #0f0906;
+            transition: transform 0.7s cubic-bezier(0.2, 0.85, 0.35, 1);
+            backface-visibility: hidden;
+        `;
+        leftDoor.innerHTML = `
+            <div style="position:absolute; right:8px; top:50%; width:16px; height:16px; margin-top:-8px; border:2.5px solid #5a4636; border-radius:50%; box-shadow:0 2px 4px #000, inset 0 1px 2px rgba(0,0,0,0.9);"></div>
+            <div style="position:absolute; inset:6px; border:1px solid rgba(80,60,45,0.4); pointer-events:none;"></div>
+        `;
+
+        const rightDoor = document.createElement('div');
+        rightDoor.className = 'gd-gate-right';
+        rightDoor.style.cssText = `
+            position: absolute;
+            right: 0;
+            top: 0;
+            width: 50%;
+            height: 100%;
+            transform-origin: right center;
+            transform: rotateY(0deg);
+            border-radius: 0 5px 5px 0;
+            background:
+                linear-gradient(90deg, #140e09 0%, #2a1f17 25%, #3d2f24 50%, #2a1f17 75%, #1a120c 100%),
+                repeating-linear-gradient(90deg, transparent, transparent 11px, rgba(0,0,0,0.6) 12px),
+                repeating-linear-gradient(0deg, transparent, transparent 24px, #100b07 26px, #423225 28px, #0d0906 30px, transparent 32px);
+            box-shadow: inset -1px 1px 2px rgba(255,220,160,0.3), inset 2px 0 6px rgba(0,0,0,0.85), -2px 0 6px rgba(0,0,0,0.9);
+            border: 1.5px solid #2e1d14;
+            border-left: 1.5px solid #0f0906;
+            transition: transform 0.7s cubic-bezier(0.2, 0.85, 0.35, 1);
+            backface-visibility: hidden;
+        `;
+        rightDoor.innerHTML = `
+            <div style="position:absolute; left:8px; top:50%; width:16px; height:16px; margin-top:-8px; border:2.5px solid #5a4636; border-radius:50%; box-shadow:0 2px 4px #000, inset 0 1px 2px rgba(0,0,0,0.9);"></div>
+            <div style="position:absolute; inset:6px; border:1px solid rgba(80,60,45,0.4); pointer-events:none;"></div>
+        `;
+
+        doorsContainer.appendChild(leftDoor);
+        doorsContainer.appendChild(rightDoor);
+        gateWrap.appendChild(doorsContainer);
+
+        const lockBar = document.createElement('div');
+        lockBar.style.cssText = `
+            position: absolute;
+            left: 10%;
+            top: 48%;
+            width: 80%;
+            height: 10px;
+            background: linear-gradient(180deg, #6b5344 0%, #30241b 45%, #140e09 100%);
+            border: 1.5px solid #140e09;
+            border-radius: 2px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.95), inset 0 1px 2px rgba(255,230,170,0.4);
+            z-index: 10;
+            transition: transform 0.32s cubic-bezier(0.55, 0.055, 0.675, 0.19), opacity 0.28s ease-in;
+        `;
+        gateWrap.appendChild(lockBar);
+
+        const archFrame = document.createElement('div');
+        archFrame.style.cssText = `
+            position: absolute;
+            inset: -5px;
+            border: 4px solid #3d2d20;
+            border-radius: 9px;
+            box-shadow: inset 0 0 10px rgba(0,0,0,0.9), 0 0 18px rgba(0,0,0,0.85);
+            background: transparent;
+            pointer-events: none;
+            z-index: 12;
+        `;
+        gateWrap.appendChild(archFrame);
+
+        document.body.appendChild(gateWrap);
+
+        requestAnimationFrame(() => {
+            gateWrap.style.opacity = '1';
+        });
+
+        setTimeout(() => {
+            deckEl.classList.add('cs-deck-shudder');
+            setTimeout(() => deckEl.classList.remove('cs-deck-shudder'), 550);
+
+            lockBar.style.transform = 'translateY(28px) rotate(6deg)';
+            lockBar.style.opacity = '0';
+
+            if (window.LotrEngine && window.LotrEngine.screenShake) {
+                window.LotrEngine.screenShake(6, 250);
+            }
+        }, 240);
+
+        setTimeout(() => {
+            leftDoor.style.transform = 'rotateY(-84deg)';
+            rightDoor.style.transform = 'rotateY(84deg)';
+
+            const numMotes = 8;
+            for (let m = 0; m < numMotes; m++) {
+                const mote = document.createElement('div');
+                const s = 14 + Math.random() * 18;
+                mote.style.cssText = `
+                    position: absolute;
+                    left: ${30 + Math.random() * 40}%;
+                    top: ${40 + Math.random() * 30}%;
+                    width: ${s}px;
+                    height: ${s}px;
+                    border-radius: 50%;
+                    background: radial-gradient(circle, rgba(220, 60, 40, 0.6) 0%, rgba(140, 30, 20, 0.3) 50%, transparent 75%);
+                    filter: blur(4px);
+                    pointer-events: none;
+                    z-index: 15;
+                    transition: transform 0.8s ease-out, opacity 0.8s ease-out;
+                    opacity: 0.9;
+                `;
+                gateWrap.appendChild(mote);
+                requestAnimationFrame(() => {
+                    const dx = (Math.random() - 0.5) * 50;
+                    const dy = -30 - Math.random() * 30;
+                    mote.style.transform = `translate(${dx}px, ${dy}px) scale(2.2)`;
+                    mote.style.opacity = '0';
+                });
+            }
+        }, 450);
+
+        setTimeout(() => {
+            gateWrap.style.transition = 'opacity 0.4s ease-out';
+            gateWrap.style.opacity = '0';
+            setTimeout(() => {
+                if (gateWrap.parentNode) gateWrap.parentNode.removeChild(gateWrap);
+                if (callback) callback();
+            }, 400);
+        }, 1150);
+    }
+    window.playGoblinDungeonGateAnimation = playGoblinDungeonGateAnimation;
+
+    function createGoblinDungeonBreakoutEffect(canvas) {
+      const ctx = canvas.getContext("2d");
+
+      const EFFECT = {
+        shake: 0.2, flash: 0, flashColor: "#c89cff",
+        layers: [
+          { shape: "glow", count: 2, speed: 0, life: 0.45, lifeVar: 0, size: 220, sizeEnd: 80, colors: ["#ffffff", "#c89cff", "#3a0a8a"] },
+          { shape: "ring", count: 1, speed: 0, life: 0.6, lifeVar: 0, size: 10, sizeEnd: 280, sizeVar: 0, colors: ["#ffffff", "#c89cff", "#5a10c0"] },
+          { shape: "glow", blend: "normal", duration: 2.2, count: 16, speed: 0, life: 0.6, size: 70, sizeEnd: 62, fade: "none", colors: ["#05000a", "#12002a"] },
+          { shape: "spark", emitter: "ring", radius: 70, duration: 2.2, count: 260, speed: 14, swirl: 3.2, attract: 0.15, life: 1.1, size: 6, stretch: 0.6, colors: ["#ffffff", "#e0b0ff", "#9a4cff", "#2a0060"] },
+          { shape: "glint", emitter: "ring", radius: 54, duration: 2.2, count: 28, speed: 0, swirl: -1.4, life: 1.4, sizeEnd: 10, spin: 60, fade: "inout", colors: ["#ffffff", "#d89cff", "#7b2cff"] },
+          { shape: "glow", duration: 2.2, count: 22, speed: 0, size: 160, sizeEnd: 120, fade: "pulse", colors: ["#8a3cff", "#4a10a0", "#100020"] },
+          { shape: "ring", duration: 2.2, count: 8, speed: 0, life: 0.9, size: 160, sizeEnd: 20, fade: "inout", colors: ["#e0b0ff", "#7b2cff"] },
+          { shape: "spark", emitter: "ring", radius: 120, delay: 1.9, duration: 0.3, count: 80, speed: 0, attract: 4, life: 0.45, size: 5, sizeEnd: 1, stretch: 1.2, colors: ["#ffffff", "#e0b0ff", "#7b2cff"] },
+          { shape: "ring", delay: 2.25, count: 1, speed: 0, life: 0.35, lifeVar: 0, size: 150, sizeVar: 0, colors: ["#ffffff", "#c89cff"] },
+          { shape: "glow", emitter: "circle", radius: 60, delay: 2.3, duration: 0.4, count: 30, speed: 40, gravity: -40, life: 1.1, size: 8, fade: "flicker", colors: ["#ffffff", "#e0b0ff"] },
+        ],
+      };
+      const LAYER_DEFAULTS = { blend: "add", emitter: "point", radius: 0, delay: 0, duration: 0, speed: 200, speedVar: 0.5, angle: -90, spread: 360, gravity: 0, drag: 1, swirl: 0, attract: 0, turbulence: 0, bounce: 0, life: 0.8, lifeVar: 0.3, size: 16, sizeEnd: 0, sizeVar: 0.4, spin: 0, stretch: 0, fade: "out", ox: 0, oy: 0 };
+      const GLOW = 1;
+
+      const STEPS = 16, SPR = 64;
+      const newCanvas = (w, h) => Object.assign(document.createElement("canvas"), { width: w, height: h });
+      const hex = (h) => { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
+      function tint(colors, t) {
+        const f = Math.min(0.9999, t) * (colors.length - 1), i = Math.floor(f), k = f - i;
+        const a = hex(colors[i]), b = hex(colors[Math.min(i + 1, colors.length - 1)]);
+        return a.map((c, j) => Math.round(c + (b[j] - c) * k));
+      }
+      const DRAW = {
+        glow(g, m, col) {
+          const gr = g.createRadialGradient(m, m, 0, m, m, m);
+          gr.addColorStop(0, col(1)); gr.addColorStop(0.25, col(0.55)); gr.addColorStop(0.6, col(0.15)); gr.addColorStop(1, col(0));
+          g.fillStyle = gr; g.fillRect(0, 0, m * 2, m * 2);
+        },
+        ring(g, m, col) {
+          g.strokeStyle = col(1); g.lineWidth = m * 0.1; g.shadowColor = col(1); g.shadowBlur = 6;
+          g.beginPath(); g.arc(m, m, m - 5, 0, 7); g.stroke();
+          g.strokeStyle = "rgba(255,255,255,0.7)"; g.lineWidth = m * 0.03; g.stroke();
+        },
+        spark(g, m, col) {
+          const gr = g.createRadialGradient(m, m, 0, m, m, m);
+          gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(0.18, col(1)); gr.addColorStop(0.45, col(0.25)); gr.addColorStop(1, col(0));
+          g.fillStyle = gr; g.fillRect(0, 0, m * 2, m * 2);
+        },
+        glint(g, m, col, v) { 
+          g.translate(m, m); g.fillStyle = col(1); g.shadowColor = col(1); g.shadowBlur = 8;
+          const star = (n, R, r0, rot) => { g.beginPath(); for (let i = 0; i < n * 2; i++) { const a = rot + (i / (n * 2)) * Math.PI * 2, rr = i % 2 ? r0 : R; g.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); } g.closePath(); g.fill(); };
+          const k = v % 4;
+          if (k === 0) star(4, m * 0.92, m * 0.16, -Math.PI / 2);
+          else if (k === 1) { star(4, m * 0.92, m * 0.14, -Math.PI / 2); g.globalAlpha = 0.7; star(4, m * 0.5, m * 0.12, -Math.PI / 4); g.globalAlpha = 1; }
+          else if (k === 2) { g.beginPath(); g.moveTo(0, -m * 0.7); g.lineTo(m * 0.45, 0); g.lineTo(0, m * 0.7); g.lineTo(-m * 0.45, 0); g.closePath(); g.fill(); g.fillStyle = "rgba(255,255,255,0.55)"; g.beginPath(); g.moveTo(0, -m * 0.7); g.lineTo(m * 0.45, 0); g.lineTo(0, 0); g.closePath(); g.fill(); }
+          else star(4, m * 0.95, m * 0.08, -Math.PI / 2 + 0.3);
+          g.fillStyle = "rgba(255,255,255,0.95)"; g.beginPath(); g.arc(0, 0, m * 0.12, 0, 7); g.fill();
+        },
+      };
+      const SOFT = { ring: 1, glint: 1 };
+      function blurInto(dst, src, px, alpha) {
+        const g = dst.getContext("2d");
+        g.globalAlpha = alpha;
+        if (typeof g.filter === "string") { g.filter = `blur(${px}px)`; g.drawImage(src, 0, 0); g.filter = "none"; }
+        else { const k = Math.max(1.5, px), t = newCanvas(Math.ceil(src.width / k), Math.ceil(src.height / k)); t.getContext("2d").drawImage(src, 0, 0, t.width, t.height); g.drawImage(t, 0, 0, dst.width, dst.height); }
+        g.globalAlpha = 1;
+      }
+      function makeSprite(shape, rgb, v) {
+        const col = (a) => `rgba(${rgb},${a})`;
+        const size = SOFT[shape] ? SPR * 1.5 : SPR, c = newCanvas(size, size), g = c.getContext("2d");
+        g.translate((size - SPR) / 2, (size - SPR) / 2);
+        DRAW[shape](g, SPR / 2, col, v);
+        if (!SOFT[shape]) return c;
+        const out = newCanvas(size, size);
+        blurInto(out, c, 5, 0.22);
+        blurInto(out, c, 1.2, 1);
+        return out;
+      }
+      const VARIANTS = {glint: 4};
+      for (const l of EFFECT.layers) {
+        for (const k in LAYER_DEFAULTS) if (l[k] === undefined) l[k] = LAYER_DEFAULTS[k];
+        l.pad = SOFT[l.shape] ? 1.5 : 1;
+        l.css = []; l.sprites = [];
+        for (let v = 0; v < (VARIANTS[l.shape] || 1); v++) {
+          const row = [];
+          for (let i = 0; i < STEPS; i++) {
+            const rgb = tint(l.colors, i / (STEPS - 1));
+            row.push(makeSprite(l.shape, rgb, v));
+            if (!v) l.css.push(`rgb(${rgb})`);
+          }
+          l.sprites.push(row);
+        }
+      }
+
+      let parts = [], bursts = [], shake = 0, flash = 0, flashX = 0, flashY = 0, flashColor = "#fff", time = 0, last = 0, running = false;
+      let view = { w: 1, h: 1 };
+      function measure() { const r = canvas.getBoundingClientRect(); view = { w: r.width || canvas.width, h: r.height || canvas.height }; }
+
+      function spawn(b, l, n) {
+        let x = b.x + l.ox, y = b.y + l.oy, ringAngle = null;
+        if (l.emitter === "circle") { const a = Math.random() * 6.283, d = Math.sqrt(Math.random()) * l.radius; x += Math.cos(a) * d; y += Math.sin(a) * d; }
+        if (l.emitter === "ring") { const a = Math.random() * 6.283; ringAngle = a; x += Math.cos(a) * l.radius; y += Math.sin(a) * l.radius; }
+        let ang = (l.angle + (Math.random() - 0.5) * l.spread) * Math.PI / 180;
+        if (ringAngle !== null && l.spread >= 359) ang = ringAngle;
+        const sp = l.speed * (1 - l.speedVar * Math.random()), sv = 1 - l.sizeVar * Math.random() * 0.8;
+        parts.push({
+          b, l, x, y, sx: x, sy: y, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, age: 0,
+          life: l.life * (1 - l.lifeVar * Math.random() * 0.9), s0: l.size * sv, s1: l.sizeEnd * sv,
+          rot: Math.random() * 6.283, vr: l.spin * (Math.PI / 180) * (0.5 + Math.random()),
+          seed: Math.random(), v: Math.floor(Math.random() * l.sprites.length),
+        });
+      }
+
+      function update(dt) {
+        time += dt;
+        for (const b of bursts) {
+          const prev = b.t;
+          b.t += dt;
+          b.fx.layers.forEach((l, i) => {
+            if (b.t < l.delay || b.n[i] >= l.count) return;
+            if (l.duration <= 0) { while (b.n[i] < l.count) { spawn(b, l, b.n[i]); b.n[i]++; } return; }
+            b.acc[i] += Math.max(0, Math.min(b.t, l.delay + l.duration) - Math.max(prev, l.delay)) * (l.count / l.duration);
+            while (b.acc[i] >= 1 && b.n[i] < l.count) { spawn(b, l, b.n[i]); b.n[i]++; b.acc[i] -= 1; }
+            if (b.t >= l.delay + l.duration) b.n[i] = l.count;
+          });
+        }
+        bursts = bursts.filter((b) => b.n.some((n, i) => n < b.fx.layers[i].count));
+        parts = parts.filter((p) => {
+          const l = p.l;
+          p.age += dt;
+          if (p.age >= p.life) return false;
+          if (l.attract) {
+            const dx = p.x - p.b.x, dy = p.y - p.b.y;
+            p.vx -= dx * l.attract * 4 * dt; p.vy -= dy * l.attract * 4 * dt;
+            if (l.attract > 0 && dx * dx + dy * dy < 30 && p.age > 0.1) return false;
+          }
+          p.vy += l.gravity * dt;
+          if (l.drag) { const k = Math.exp(-l.drag * dt); p.vx *= k; p.vy *= k; }
+          p.x += p.vx * dt; p.y += p.vy * dt;
+          if (l.swirl) {
+            const dx = p.x - p.b.x, dy = p.y - p.b.y, c = Math.cos(l.swirl * dt), s = Math.sin(l.swirl * dt);
+            p.x = p.b.x + dx * c - dy * s; p.y = p.b.y + dx * s + dy * c;
+          }
+          p.rot += p.vr * dt;
+          return true;
+        });
+        shake = Math.max(0, shake - dt * 2.2);
+        flash = Math.max(0, flash - dt * 3.5);
+      }
+
+      function fadeAt(fade, t, seed) {
+        if (fade === "inout") return Math.sin(Math.PI * Math.min(1, t));
+        if (fade === "flicker") return (1 - t) * (Math.random() < 0.3 ? 0.25 : 1);
+        if (fade === "pulse") return (1 - t * 0.7) * (0.55 + 0.45 * Math.sin(t * 28 + seed * 6));
+        if (fade === "none") return t > 0.9 ? (1 - t) * 10 : 1;
+        return Math.min(1, t * 25) * (1 - t);
+      }
+      function drawParticles(g, glowPass) {
+        for (const p of parts) {
+          const l = p.l;
+          if (glowPass && l.blend !== "add") continue;
+          const t = p.age / p.life, a = fadeAt(l.fade, t, p.seed);
+          if (a <= 0.003) continue;
+          g.globalCompositeOperation = l.blend === "add" ? "lighter" : "source-over";
+          g.globalAlpha = Math.min(1, a);
+          const si = Math.min(STEPS - 1, Math.floor(t * STEPS));
+          const size = Math.max(0.5, p.s0 + (p.s1 - p.s0) * t) * (glowPass ? 1.2 : 1);
+          const img = l.sprites[p.v][si], s = size * l.pad;
+          g.save();
+          g.translate(p.x, p.y);
+          if (l.stretch > 0) {
+            const len = s * (1 + (Math.hypot(p.vx, p.vy) / 120) * l.stretch);
+            g.rotate(Math.atan2(p.vy, p.vx));
+            g.drawImage(img, -len / 2, -s / 2, len, s);
+            g.restore();
+            continue;
+          }
+          if (p.vr || [].includes(l.shape)) g.rotate(p.rot);
+          g.drawImage(img, -s / 2, -s / 2, s, s);
+          g.restore();
+        }
+      }
+
+      const glowBuf = newCanvas(8, 8), wideBuf = newCanvas(4, 4);
+      function bloom(w, h) {
+        const bw = Math.ceil(w / 4), bh = Math.ceil(h / 4);
+        if (glowBuf.width !== bw || glowBuf.height !== bh) { glowBuf.width = bw; glowBuf.height = bh; wideBuf.width = Math.ceil(bw / 3); wideBuf.height = Math.ceil(bh / 3); }
+        const g = glowBuf.getContext("2d"), wg = wideBuf.getContext("2d");
+        g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = "destination-out";
+        g.fillStyle = "rgba(0,0,0,0.62)"; g.fillRect(0, 0, bw, bh);
+        g.setTransform(0.25, 0, 0, 0.25, 0, 0);
+        drawParticles(g, true);
+        wg.clearRect(0, 0, wideBuf.width, wideBuf.height); wg.drawImage(glowBuf, 0, 0, wideBuf.width, wideBuf.height);
+        ctx.globalCompositeOperation = "lighter";
+        ctx.globalAlpha = Math.min(1, 0.16 * GLOW); ctx.drawImage(glowBuf, 0, 0, w, h);
+        ctx.globalAlpha = Math.min(1, 0.17 * GLOW); ctx.drawImage(wideBuf, -6, -6, w + 12, h + 12);
+      }
+
+      function render() {
+        const { w, h } = view, k = canvas.width / w;
+        ctx.setTransform(k, 0, 0, k, 0, 0);
+        ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+        ctx.clearRect(0, 0, w, h);
+        const sh = shake * shake * 16;
+        ctx.translate((Math.random() * 2 - 1) * sh, (Math.random() * 2 - 1) * sh);
+        drawParticles(ctx, false);
+        if (GLOW > 0) bloom(w, h);
+        if (flash > 0) {
+          const f = Math.min(1, flash), gr = ctx.createRadialGradient(flashX, flashY, 0, flashX, flashY, Math.hypot(w, h) * (0.55 + (1 - f) * 0.5));
+          gr.addColorStop(0, flashColor); gr.addColorStop(0.35, flashColor); gr.addColorStop(1, "rgba(0,0,0,0)");
+          ctx.globalCompositeOperation = "lighter"; ctx.globalAlpha = Math.min(0.62, f * 0.52); ctx.fillStyle = gr; ctx.fillRect(-20, -20, w + 40, h + 40);
+        }
+      }
+
+      function frame(now) {
+        update(Math.min(0.05, (now - last) / 1000));
+        last = now;
+        render();
+        if (parts.length || bursts.length || flash > 0) requestAnimationFrame(frame);
+        else { running = false; render(); }
+      }
+
+      function start(fx, x, y) {
+        bursts.push({ fx, x, y, t: 0, n: fx.layers.map(() => 0), acc: fx.layers.map(() => 0) });
+        shake = Math.max(shake, fx.shake);
+        if (fx.flash > 0) { flash = Math.max(flash, fx.flash); flashColor = fx.flashColor; flashX = x; flashY = y; }
+        if (!running) { running = true; last = performance.now(); requestAnimationFrame(frame); }
+      }
+      function aim(x, y) {
+        measure();
+        return x == null || y == null ? [view.w / 2, view.h * 0.55] : [x, y];
+      }
+
+      function fire(x, y) {
+        [x, y] = aim(x, y);
+        start(EFFECT, x, y);
+      }
+
+      return { fire };
+    }
+    window.createGoblinDungeonBreakoutEffect = createGoblinDungeonBreakoutEffect;
+
+    window.playGoblinDungeonBreakout = function(loc, engine, callback) {
+        const p1Idx = engine.game.firstPlayerIdx || 0;
+        
+        if (engine.game.activeTabPlayerIdx !== p1Idx && engine.window && engine.window._switchTab) {
+            engine.window._switchTab(p1Idx);
+        }
+
+        setTimeout(() => {
+            try {
+                const snd = new Audio('./sound_effects/dark_of_mirkwood/goblin_dungeon_travelled.mp3');
+                const volSlider = document.getElementById('volume-slider');
+                snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                snd.play().catch(() => {});
+            } catch (e) {}
+
+            const deckEl = document.getElementById('player-deck-pile');
+            const dRect = deckEl ? deckEl.getBoundingClientRect() : {left: window.innerWidth - 100, top: window.innerHeight - 150, width: 100, height: 140};
+            const deckCenterX = dRect.left + dRect.width / 2;
+            const deckCenterY = dRect.top + dRect.height / 2;
+
+            const fxCanvas = document.createElement('canvas');
+            fxCanvas.style.cssText = `
+                position: fixed; top: 0; left: 0;
+                width: 100vw; height: 100vh;
+                pointer-events: none; z-index: 99999;
+            `;
+            const dpr = window.devicePixelRatio || 1;
+            fxCanvas.width = window.innerWidth * dpr;
+            fxCanvas.height = window.innerHeight * dpr;
+            document.body.appendChild(fxCanvas);
+
+            const fx = window.createGoblinDungeonBreakoutEffect(fxCanvas);
+            fx.fire(deckCenterX, deckCenterY);
+
+            setTimeout(() => {
+                if (callback) callback();
+            }, 500);
+
+            setTimeout(() => {
+                if (fxCanvas.parentNode) fxCanvas.remove();
+            }, 3000);
+        }, 100);
+    };
+
+    function playCrumblingStairsAudio(card) {
+        if (card && card._goblinDungeonFlippedAudio) return;
+        if (card) card._goblinDungeonFlippedAudio = true;
+        if (window._goblinDungeonAudioCooldown) return;
+        window._goblinDungeonAudioCooldown = true;
+        setTimeout(() => { window._goblinDungeonAudioCooldown = false; }, 3000);
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/goblin_dungeon.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch (e) {}
+    }
+    window.playGoblinDungeonAudio = playGoblinDungeonAudio;
+
+    function triggerGoblinDungeonChainComet(dungeonLoc, callback) {
+        const dungeonEl = document.querySelector(`[data-uid="${dungeonLoc._uid}"]`) || document.querySelector('[data-id="nibin_goblin_dungeon"]');
+        const deckEl = document.getElementById('encounter-deck-pile');
+        if (!dungeonEl || !deckEl) {
+            if (callback) callback();
+            return;
+        }
+
+        const dRect = dungeonEl.getBoundingClientRect();
+        const deckRect = deckEl.getBoundingClientRect();
+
+        try {
+            const snd = new Audio('./sound_effects/chains.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.playbackRate = 1.35;
+            snd.play().catch(() => {});
+        } catch (e) {}
+
+        const startX = dRect.left + dRect.width / 2;
+        const startY = dRect.top + dRect.height / 2;
+        const endX = deckRect.left + deckRect.width / 2;
+        const endY = deckRect.top + deckRect.height / 2;
+
+        const midX = (startX + endX) / 2 + (Math.random() - 0.5) * 80;
+        const midY = Math.min(startY, endY) - 140;
+
+        const p0 = { x: startX, y: startY };
+        const p1 = { x: midX, y: midY };
+        const p2 = { x: endX, y: endY };
+
+        const comet = document.createElement('div');
+        comet.style.cssText = `
+            position: fixed;
+            width: 38px;
+            height: 18px;
+            margin-left: -19px;
+            margin-top: -9px;
+            border-radius: 9px;
+            border: 3px solid #71717a;
+            background: radial-gradient(ellipse at center, #d4d4d8 0%, #3f3f46 65%, #18181b 100%);
+            box-shadow: 0 0 16px #f5d76e, 0 0 30px #ea580c, inset 0 0 6px #ffffff;
+            z-index: 10020;
+            pointer-events: none;
+            opacity: 1;
+        `;
+        document.body.appendChild(comet);
+
+        const duration = 600;
+        const startTime = performance.now();
+
+        const anim = (now) => {
+            const elapsed = now - startTime;
+            const t = Math.min(1, elapsed / duration);
+            const invT = 1 - t;
+
+            const curX = invT * invT * p0.x + 2 * invT * t * p1.x + t * t * p2.x;
+            const curY = invT * invT * p0.y + 2 * invT * t * p1.y + t * t * p2.y;
+
+            const vx = 2 * invT * (p1.x - p0.x) + 2 * t * (p2.x - p1.x);
+            const vy = 2 * invT * (p1.y - p0.y) + 2 * t * (p2.y - p1.y);
+            const angle = Math.atan2(vy, vx) * (180 / Math.PI);
+
+            comet.style.left = `${curX}px`;
+            comet.style.top = `${curY}px`;
+            comet.style.transform = `rotate(${angle}deg) scale(${0.85 + Math.sin(t * Math.PI) * 0.4})`;
+
+            if (t > 0.05 && t < 0.95 && Math.random() < 0.7) {
+                const link = document.createElement('div');
+                link.style.cssText = `
+                    position: fixed;
+                    left: ${curX - 8}px;
+                    top: ${curY - 5}px;
+                    width: 16px;
+                    height: 10px;
+                    border: 2px solid #a1a1aa;
+                    border-radius: 5px;
+                    box-shadow: 0 0 8px #f5d76e;
+                    transform: rotate(${angle + (Math.random() - 0.5) * 40}deg);
+                    pointer-events: none;
+                    z-index: 10019;
+                    transition: opacity 0.35s ease-out, transform 0.35s ease-out;
+                    opacity: 0.9;
+                `;
+                document.body.appendChild(link);
+                requestAnimationFrame(() => {
+                    link.style.opacity = '0';
+                    link.style.transform += ' translateY(12px) scale(0.6)';
+                });
+                setTimeout(() => link.remove(), 350);
+            }
+
+            if (t < 1) {
+                requestAnimationFrame(anim);
+            } else {
+                comet.remove();
+                if (window.LotrEngine && window.LotrEngine.spawnBurstAtElement) {
+                    window.LotrEngine.spawnBurstAtElement(deckEl, '#f5d76e', 25);
+                    window.LotrEngine.spawnBurstAtElement(deckEl, '#a1a1aa', 20);
+                }
+                if (window.LotrEngine && window.LotrEngine.screenShake) {
+                    window.LotrEngine.screenShake(8, 220);
+                }
+                if (callback) callback();
+            }
+        };
+        requestAnimationFrame(anim);
+    }
+    window.triggerGoblinDungeonChainComet = triggerGoblinDungeonChainComet;
+
+    function playGoblinDungeonGateAnimation(callback) {
+        const deckEl = document.getElementById('encounter-deck-pile');
+        if (!deckEl) {
+            if (callback) callback();
+            return;
+        }
+
+        const dRect = deckEl.getBoundingClientRect();
+        const W = dRect.width;
+        const H = dRect.height;
+
+        try {
+            const snd = new Audio('./sound_effects/chains.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch (e) {}
+
+        const gateWrap = document.createElement('div');
+        gateWrap.className = 'gd-gate-animation-wrap';
+        gateWrap.style.cssText = `
+            position: fixed;
+            left: ${dRect.left - 6}px;
+            top: ${dRect.top - 6}px;
+            width: ${W + 12}px;
+            height: ${H + 12}px;
+            pointer-events: none;
+            z-index: 10005;
+            perspective: 700px;
+            perspective-origin: 50% 50%;
+            border-radius: 6px;
+            overflow: visible;
+            opacity: 0;
+            transition: opacity 0.25s ease-out;
+        `;
+
+        // Surrounding rough masonry blocks matching card art
+        const stoneArch = document.createElement('div');
+        stoneArch.style.cssText = `
+            position: absolute;
+            inset: 0;
+            border-radius: 6px;
+            box-shadow: inset 0 0 20px #000, 0 10px 30px rgba(0,0,0,0.95);
+            background:
+                linear-gradient(90deg, #181412 0%, #30261f 12%, transparent 16%, transparent 84%, #30261f 88%, #181412 100%),
+                linear-gradient(180deg, #181412 0%, #352a22 10%, transparent 14%, transparent 88%, #241c16 94%, #100c09 100%),
+                repeating-linear-gradient(0deg, transparent, transparent 20px, rgba(0,0,0,0.7) 21px, #1a1410 23px, transparent 24px);
+            border: 4px solid #140f0c;
+            z-index: 5;
+        `;
+        gateWrap.appendChild(stoneArch);
+
+        // Dark cell background with red dungeon eye/ember glow
+        const cellAbyss = document.createElement('div');
+        cellAbyss.style.cssText = `
+            position: absolute;
+            inset: 6px;
+            border-radius: 4px;
+            background: radial-gradient(ellipse at 50% 65%, rgba(185, 28, 28, 0.45) 0%, rgba(90, 10, 15, 0.4) 35%, rgba(12, 4, 6, 0.98) 75%, #050102 100%);
+            box-shadow: inset 0 0 25px rgba(0,0,0,0.98);
+            z-index: 1;
+        `;
+        gateWrap.appendChild(cellAbyss);
+
+        const doorsContainer = document.createElement('div');
+        doorsContainer.style.cssText = `
+            position: absolute;
+            inset: 6px;
+            transform-style: preserve-3d;
+            z-index: 3;
+        `;
+
+        // Heavy grid bar texture directly representing Goblin Dungeon artwork
+        const gridTexture = `
+            repeating-linear-gradient(90deg, transparent 0px, transparent 10px, rgba(10,8,6,0.95) 10px, #423933 12px, #685b52 14px, #1a1410 16px, transparent 16px),
+            repeating-linear-gradient(0deg, transparent 0px, transparent 18px, rgba(10,8,6,0.95) 18px, #423933 20px, #685b52 22px, #1a1410 24px, transparent 24px),
+            radial-gradient(ellipse at 50% 50%, rgba(35,28,24,0.75) 0%, rgba(10,8,6,0.95) 100%)
+        `;
+
+        const leftGate = document.createElement('div');
+        leftGate.style.cssText = `
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 50%;
+            height: 100%;
+            transform-origin: left center;
+            transform: rotateY(0deg);
+            background: ${gridTexture};
+            border: 2px solid #201a16;
+            border-right: 2px solid #0a0806;
+            box-shadow: inset 1px 1px 3px rgba(255,255,255,0.2), 2px 0 6px rgba(0,0,0,0.9);
+            transition: transform 0.75s cubic-bezier(0.2, 0.85, 0.35, 1);
+            backface-visibility: hidden;
+        `;
+
+        const rightGate = document.createElement('div');
+        rightGate.style.cssText = `
+            position: absolute;
+            right: 0;
+            top: 0;
+            width: 50%;
+            height: 100%;
+            transform-origin: right center;
+            transform: rotateY(0deg);
+            background: ${gridTexture};
+            border: 2px solid #201a16;
+            border-left: 2px solid #0a0806;
+            box-shadow: inset -1px 1px 3px rgba(255,255,255,0.2), -2px 0 6px rgba(0,0,0,0.9);
+            transition: transform 0.75s cubic-bezier(0.2, 0.85, 0.35, 1);
+            backface-visibility: hidden;
+        `;
+
+        doorsContainer.appendChild(leftGate);
+        doorsContainer.appendChild(rightGate);
+        gateWrap.appendChild(doorsContainer);
+
+        // Center iron lock and chains binding the grid
+        const lockBar = document.createElement('div');
+        lockBar.style.cssText = `
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            width: 44px;
+            height: 18px;
+            margin-left: -22px;
+            margin-top: -9px;
+            background: linear-gradient(180deg, #4b5563 0%, #1f2937 50%, #030712 100%);
+            border: 1.5px solid #111827;
+            border-radius: 4px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.95), 0 0 10px rgba(239, 68, 68, 0.4);
+            z-index: 10;
+            transition: transform 0.35s cubic-bezier(0.55, 0.055, 0.675, 0.19), opacity 0.3s ease-in;
+        `;
+        gateWrap.appendChild(lockBar);
+
+        document.body.appendChild(gateWrap);
+
+        requestAnimationFrame(() => {
+            gateWrap.style.opacity = '1';
+        });
+
+        setTimeout(() => {
+            lockBar.style.transform = 'translateY(30px) rotate(15deg)';
+            lockBar.style.opacity = '0';
+        }, 220);
+
+        setTimeout(() => {
+            leftGate.style.transform = 'rotateY(-84deg)';
+            rightGate.style.transform = 'rotateY(84deg)';
+
+            const numMotes = 10;
+            for (let m = 0; m < numMotes; m++) {
+                const mote = document.createElement('div');
+                const s = 12 + Math.random() * 16;
+                mote.style.cssText = `
+                    position: absolute;
+                    left: ${30 + Math.random() * 40}%;
+                    top: ${40 + Math.random() * 30}%;
+                    width: ${s}px;
+                    height: ${s}px;
+                    border-radius: 50%;
+                    background: radial-gradient(circle, rgba(239, 68, 68, 0.75) 0%, rgba(185, 28, 28, 0.35) 45%, transparent 75%);
+                    filter: blur(4px);
+                    pointer-events: none;
+                    z-index: 15;
+                    transition: transform 0.75s ease-out, opacity 0.75s ease-out;
+                    opacity: 0.95;
+                `;
+                gateWrap.appendChild(mote);
+                requestAnimationFrame(() => {
+                    const dx = (Math.random() - 0.5) * 60;
+                    const dy = -25 - Math.random() * 35;
+                    mote.style.transform = `translate(${dx}px, ${dy}px) scale(2.2)`;
+                    mote.style.opacity = '0';
+                });
+            }
+        }, 440);
+
+        setTimeout(() => {
+            gateWrap.style.transition = 'opacity 0.35s ease-out';
+            gateWrap.style.opacity = '0';
+            setTimeout(() => {
+                gateWrap.remove();
+                if (callback) callback();
+            }, 360);
+        }, 1150);
+    }
+    window.playGoblinDungeonGateAnimation = playGoblinDungeonGateAnimation;
+
+    function playCrumblingStairsAudio(card) {
+        if (card && card._crumblingStairsFlippedAudio) return;
+        if (card) card._crumblingStairsFlippedAudio = true;
+        if (window._crumblingStairsAudioCooldown) return;
+        window._crumblingStairsAudioCooldown = true;
+        setTimeout(() => { window._crumblingStairsAudioCooldown = false; }, 3000);
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/crumbling_stairs.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch (e) {}
+    }
+    window.playCrumblingStairsAudio = playCrumblingStairsAudio;
+
+    function injectCrumblingStairsAuraStyles() {
+        if (document.getElementById('crumbling-stairs-aura-style')) return;
+        const style = document.createElement('style');
+        style.id = 'crumbling-stairs-aura-style';
+        style.textContent = `
+            .crumbling-stairs-aura {
+                position: absolute;
+                inset: -5px;
+                border-radius: 9px;
+                pointer-events: none;
+                z-index: 10;
+                overflow: visible;
+            }
+            .cs-ambient-glow {
+                position: absolute;
+                inset: 0;
+                border-radius: 9px;
+                border: 2px solid rgba(255, 195, 85, 0.8);
+                box-shadow: 0 0 22px rgba(245, 165, 60, 0.7), 0 0 40px rgba(185, 100, 25, 0.4), inset 0 0 16px rgba(255, 180, 70, 0.35);
+                animation: csGlowPulseAlpha 3.2s ease-in-out infinite alternate;
+                will-change: opacity;
+            }
+            .cs-fissure-layer {
+                position: absolute;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                height: 52%;
+                background: radial-gradient(ellipse at bottom center, rgba(240, 155, 45, 0.42) 0%, rgba(165, 90, 25, 0.22) 35%, rgba(55, 30, 15, 0.08) 70%, transparent 100%);
+                border-radius: 0 0 9px 9px;
+                animation: csGlowPulseAlpha 2.4s ease-in-out infinite alternate;
+                will-change: opacity;
+            }
+            .cs-rock-viewport {
+                position: absolute;
+                inset: 0;
+                overflow: hidden;
+                border-radius: 6px;
+                pointer-events: none;
+            }
+            .cs-rock {
+                position: absolute;
+                transform-origin: center center;
+                animation: csFloatRockUp linear infinite;
+                will-change: transform, opacity, bottom;
+            }
+            .cs-mote {
+                position: absolute;
+                border-radius: 50%;
+                background: #ffe4b5;
+                box-shadow: 0 0 4px #ffb347;
+                animation: csFloatMoteUp linear infinite;
+                will-change: transform, opacity, bottom;
+            }
+            @keyframes csGlowPulseAlpha {
+                0% { opacity: 0.45; }
+                100% { opacity: 1; }
+            }
+            @keyframes csFloatRockUp {
+                0% {
+                    bottom: -2%;
+                    opacity: 0;
+                    transform: scale(0.65) rotate(0deg) translateX(0px);
+                }
+                14% {
+                    opacity: 0.95;
+                    transform: scale(1) rotate(calc(var(--rot) * 0.14)) translateX(calc(var(--drift) * 0.12));
+                }
+                42% {
+                    opacity: 0.85;
+                    transform: scale(0.96) rotate(calc(var(--rot) * 0.45)) translateX(calc(var(--drift) * 0.45));
+                }
+                72% {
+                    opacity: 0.35;
+                    transform: scale(0.9) rotate(calc(var(--rot) * 0.75)) translateX(calc(var(--drift) * 0.75));
+                }
+                100% {
+                    bottom: 50%;
+                    opacity: 0;
+                    transform: scale(0.7) rotate(var(--rot)) translateX(var(--drift));
+                }
+            }
+            @keyframes csFloatMoteUp {
+                0% {
+                    bottom: 0%;
+                    opacity: 0;
+                    transform: translateX(0px) scale(0.5);
+                }
+                20% {
+                    opacity: 0.9;
+                    transform: translateX(calc(var(--drift) * 0.2)) scale(1);
+                }
+                70% {
+                    opacity: 0.4;
+                    transform: translateX(calc(var(--drift) * 0.7)) scale(0.8);
+                }
+                100% {
+                    bottom: 50%;
+                    opacity: 0;
+                    transform: translateX(var(--drift)) scale(0.4);
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    function createCrumblingStairsAuraElement() {
+        injectCrumblingStairsAuraStyles();
+        const wrap = document.createElement('div');
+        wrap.className = 'crumbling-stairs-aura';
+
+        const rocksConfig = [
+            { w: 9, h: 8, l: 12, clip: '25% 0%, 75% 15%, 100% 60%, 80% 100%, 20% 90%, 0% 45%', bg: 'linear-gradient(135deg, #8c7e6f 0%, #4f443b 60%, #26201a 100%)', bs: 'inset 1px 1px 1px rgba(255,220,160,0.5)', drift: -9, rot: 110, dur: 2.8, del: -0.4 },
+            { w: 6, h: 7, l: 24, clip: '50% 0%, 90% 30%, 80% 85%, 35% 100%, 0% 70%, 15% 20%', bg: 'linear-gradient(120deg, #786a5d 0%, #3e352d 70%, #1c1612 100%)', bs: '', drift: 12, rot: -130, dur: 3.2, del: -1.7 },
+            { w: 12, h: 10, l: 38, clip: '30% 0%, 85% 10%, 100% 75%, 60% 100%, 10% 85%, 0% 30%', bg: 'linear-gradient(140deg, #968371 0%, #5e4c3d 50%, #b86e24 55%, #33271e 100%)', bs: 'inset 1px 1px 2px rgba(255,200,120,0.6)', drift: -14, rot: 160, dur: 3.5, del: -2.3 },
+            { w: 5, h: 5, l: 47, clip: '40% 5%, 95% 40%, 70% 95%, 20% 90%, 5% 50%', bg: 'linear-gradient(135deg, #a39281 0%, #564739 100%)', bs: '', drift: 8, rot: 90, dur: 2.4, del: -0.9 },
+            { w: 8, h: 9, l: 58, clip: '15% 15%, 70% 0%, 100% 40%, 85% 90%, 30% 100%, 0% 60%', bg: 'linear-gradient(125deg, #7c6f63 0%, #483d34 65%, #241d18 100%)', bs: '', drift: 15, rot: -150, dur: 3.1, del: -2.9 },
+            { w: 11, h: 9, l: 72, clip: '25% 5%, 80% 0%, 100% 55%, 75% 100%, 15% 95%, 0% 40%', bg: 'linear-gradient(135deg, #8f7d6a 0%, #594738 50%, #2b211a 100%)', bs: 'inset 1px 1px 1px rgba(255,230,170,0.4)', drift: -11, rot: 140, dur: 3.4, del: -1.2 },
+            { w: 7, h: 6, l: 84, clip: '50% 0%, 100% 40%, 75% 100%, 25% 100%, 0% 40%', bg: 'linear-gradient(145deg, #6e6155 0%, #3a3128 100%)', bs: '', drift: -8, rot: -100, dur: 2.6, del: -0.1 },
+            { w: 4, h: 4, l: 8, clip: '30% 0%, 90% 20%, 80% 100%, 10% 80%', bg: '#91806f', bs: '', drift: 7, rot: 80, dur: 2.3, del: -1.5 },
+            { w: 10, h: 8, l: 19, clip: '20% 0%, 75% 10%, 100% 65%, 65% 100%, 25% 85%, 0% 35%', bg: 'linear-gradient(130deg, #887867 0%, #4d4034 60%, #b06922 65%, #271f18 100%)', bs: '', drift: 10, rot: -120, dur: 3.3, del: -2.5 },
+            { w: 6, h: 6, l: 32, clip: '40% 0%, 100% 30%, 85% 90%, 20% 100%, 0% 50%', bg: 'linear-gradient(140deg, #796c60 0%, #3f362e 100%)', bs: '', drift: -10, rot: 130, dur: 2.7, del: -0.8 },
+            { w: 8, h: 7, l: 52, clip: '20% 10%, 80% 0%, 100% 70%, 70% 100%, 10% 80%, 0% 30%', bg: 'linear-gradient(135deg, #8a7a6a 0%, #504236 100%)', bs: '', drift: -13, rot: -90, dur: 3.0, del: -1.9 },
+            { w: 5, h: 6, l: 66, clip: '50% 0%, 90% 40%, 60% 100%, 10% 90%, 0% 30%', bg: '#716458', bs: '', drift: 9, rot: 110, dur: 2.5, del: -2.1 },
+            { w: 9, h: 9, l: 78, clip: '30% 0%, 85% 15%, 100% 60%, 75% 100%, 15% 90%, 0% 45%', bg: 'linear-gradient(125deg, #948270 0%, #58473a 60%, #2d231b 100%)', bs: 'inset 1px 1px 1px rgba(255,210,140,0.4)', drift: 12, rot: -140, dur: 3.6, del: -0.6 },
+            { w: 4, h: 4, l: 91, clip: '40% 0%, 100% 50%, 60% 100%, 0% 70%', bg: '#887869', bs: '', drift: -6, rot: 70, dur: 2.2, del: -1.3 },
+            { w: 7, h: 8, l: 15, clip: '35% 0%, 90% 25%, 85% 90%, 25% 100%, 0% 55%', bg: 'linear-gradient(135deg, #7c6f62 0%, #443a31 100%)', bs: '', drift: -7, rot: 100, dur: 2.9, del: -3.1 },
+            { w: 10, h: 9, l: 44, clip: '25% 0%, 75% 10%, 100% 70%, 70% 100%, 20% 90%, 0% 40%', bg: 'linear-gradient(140deg, #8f7f6f 0%, #554538 50%, #a8631e 55%, #2a2018 100%)', bs: 'inset 1px 1px 2px rgba(255,210,130,0.5)', drift: 11, rot: -120, dur: 3.3, del: -0.3 },
+            { w: 5, h: 5, l: 62, clip: '50% 0%, 100% 30%, 70% 100%, 10% 80%', bg: '#7e7063', bs: '', drift: -9, rot: 85, dur: 2.4, del: -1.8 },
+            { w: 8, h: 7, l: 81, clip: '15% 20%, 70% 0%, 100% 50%, 80% 100%, 20% 90%, 0% 50%', bg: 'linear-gradient(130deg, #857464 0%, #4b3e34 100%)', bs: '', drift: -12, rot: 135, dur: 3.0, del: -2.7 }
+        ];
+
+        const motesConfig = [
+            { s: 3, l: 18, drift: 8, dur: 2.1, del: -0.5 },
+            { s: 2, l: 30, drift: -6, dur: 2.6, del: -1.4 },
+            { s: 3, l: 42, drift: 10, dur: 2.3, del: -0.9 },
+            { s: 2, l: 55, drift: -8, dur: 2.8, del: -2.2 },
+            { s: 3, l: 70, drift: 7, dur: 2.4, del: -1.1 },
+            { s: 2, l: 85, drift: -9, dur: 2.5, del: -0.3 }
+        ];
+
+        let rocksHtml = rocksConfig.map(r => `
+            <div class="cs-rock" style="
+                width: ${r.w}px; height: ${r.h}px; left: ${r.l}%;
+                clip-path: polygon(${r.clip});
+                background: ${r.bg};
+                box-shadow: ${r.bs};
+                --drift: ${r.drift}px;
+                --rot: ${r.rot}deg;
+                animation-duration: ${r.dur}s;
+                animation-delay: ${r.del}s;
+            "></div>
+        `).join('');
+
+        let motesHtml = motesConfig.map(m => `
+            <div class="cs-mote" style="
+                width: ${m.s}px; height: ${m.s}px; left: ${m.l}%;
+                --drift: ${m.drift}px;
+                animation-duration: ${m.dur}s;
+                animation-delay: ${m.del}s;
+            "></div>
+        `).join('');
+
+        wrap.innerHTML = `
+            <div class="cs-ambient-glow"></div>
+            <div class="cs-fissure-layer"></div>
+            <div class="cs-rock-viewport" style="position: absolute; inset: 5px; overflow: hidden; border-radius: 6px; pointer-events: none;">
+                ${rocksHtml}
+                ${motesHtml}
+            </div>
+        `;
+        return wrap;
+    }
+
+    window.updateCrumblingStairsAura = syncNibinStagingAuras;
+
+    function playCrumblingStairsDeckAnimation(callback) {
+        const deckEl = document.getElementById('encounter-deck-pile');
+        if (!deckEl) {
+            if (callback) callback();
+            return;
+        }
+
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/crumbling_stairs.mp3');
+            const volSlider = document.getElementById('volume-slider');
+            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+            snd.play().catch(() => {});
+        } catch (e) {}
+
+        if (!document.getElementById('cs-deck-crumble-styles')) {
+            const style = document.createElement('style');
+            style.id = 'cs-deck-crumble-styles';
+            style.textContent = `
+                @keyframes csSceneFadeIn {
+                    0% {
+                        opacity: 0;
+                        transform: scale(0.95);
+                        filter: brightness(1.22);
+                    }
+                    100% {
+                        opacity: 1;
+                        transform: scale(1);
+                        filter: brightness(1);
+                    }
+                }
+                @keyframes csInitialPoof {
+                    0% {
+                        opacity: 0;
+                        transform: translate(0, 0) scale(0.28);
+                    }
+                    22% {
+                        opacity: 0.82;
+                    }
+                    60% {
+                        opacity: 0.55;
+                        transform: translate(var(--p-tx, 0px), var(--p-ty, 0px)) scale(var(--p-scale, 1.4));
+                    }
+                    100% {
+                        opacity: 0;
+                        transform: translate(calc(var(--p-tx, 0px) * 1.4), calc(var(--p-ty, 0px) * 1.4 - 10px)) scale(calc(var(--p-scale, 1.4) * 1.3));
+                    }
+                }
+                @keyframes csDeckTremor {
+                    0% { transform: translate(0, 0) rotate(0deg); }
+                    12% { transform: translate(-3px, 2px) rotate(-0.8deg); }
+                    25% { transform: translate(3.5px, -1.5px) rotate(0.8deg); }
+                    38% { transform: translate(-2px, -2.5px) rotate(-0.5deg); }
+                    50% { transform: translate(3px, 1.5px) rotate(0.6deg); }
+                    65% { transform: translate(-1.5px, 1px) rotate(-0.3deg); }
+                    80% { transform: translate(1px, -0.5px) rotate(0.2deg); }
+                    100% { transform: translate(0, 0) rotate(0deg); }
+                }
+                .cs-deck-shudder {
+                    animation: csDeckTremor 0.55s ease-in-out;
+                }
+                @keyframes csAbyssPulse {
+                    0% { opacity: 0; transform: scale(0.92); }
+                    25% { opacity: 1; transform: scale(1); }
+                    80% { opacity: 0.9; }
+                    100% { opacity: 0; }
+                }
+                @keyframes csFragmentFall {
+                    0% {
+                        transform: translate3d(0, 0, 0) rotateX(0deg) rotateY(0deg) rotateZ(0deg) scale(1);
+                        filter: brightness(1) drop-shadow(0 2px 4px rgba(0,0,0,0.9));
+                        opacity: 1;
+                    }
+                    18% {
+                        transform: translate3d(calc(var(--fx, 0px) * 0.18), calc(var(--fy, 20px) * 0.15), 10px) rotateX(calc(var(--rx, 20deg) * 0.2)) rotateY(calc(var(--ry, 10deg) * 0.2)) rotateZ(calc(var(--rz, 5deg) * 0.25)) scale(0.99);
+                        filter: brightness(1.3) drop-shadow(0 6px 12px rgba(0,0,0,0.95));
+                        opacity: 0.98;
+                    }
+                    45% {
+                        transform: translate3d(calc(var(--fx, 0px) * 0.55), calc(var(--fy, 80px) * 0.5), -14px) rotateX(calc(var(--rx, 20deg) * 0.55)) rotateY(calc(var(--ry, 10deg) * 0.55)) rotateZ(calc(var(--rz, 5deg) * 0.55)) scale(0.95);
+                        opacity: 0.9;
+                        filter: brightness(0.95) drop-shadow(0 10px 18px rgba(0,0,0,0.95));
+                    }
+                    75% {
+                        transform: translate3d(calc(var(--fx, 0px) * 0.85), calc(var(--fy, 130px) * 0.85), -38px) rotateX(calc(var(--rx, 40deg) * 0.85)) rotateY(calc(var(--ry, 20deg) * 0.85)) rotateZ(calc(var(--rz, 10deg) * 0.85)) scale(0.85);
+                        opacity: 0.6;
+                        filter: brightness(0.55) drop-shadow(0 14px 26px rgba(0,0,0,0.95));
+                    }
+                    100% {
+                        transform: translate3d(var(--fx, 0px), var(--fy, 160px), -68px) rotateX(var(--rx, 75deg)) rotateY(var(--ry, 35deg)) rotateZ(var(--rz, 25deg)) scale(0.64);
+                        filter: brightness(0.18) drop-shadow(0 18px 34px rgba(0,0,0,0.95));
+                        opacity: 0;
+                    }
+                }
+                .cs-stair-fragment {
+                    transform-style: preserve-3d;
+                    backface-visibility: hidden;
+                    will-change: transform, opacity, filter;
+                }
+                @keyframes csDustBillow {
+                    0% {
+                        transform: translate(-50%, -50%) scale(0.3);
+                        opacity: 0;
+                    }
+                    20% {
+                        opacity: 0.88;
+                    }
+                    60% {
+                        opacity: 0.55;
+                    }
+                    100% {
+                        transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, -25px))) scale(var(--dust-scale, 2.8));
+                        opacity: 0;
+                    }
+                }
+                @keyframes csPebbleShower {
+                    0% {
+                        transform: translate(0, 0) rotate(0deg) scale(1);
+                        opacity: 1;
+                    }
+                    80% {
+                        opacity: 0.85;
+                    }
+                    100% {
+                        transform: translate(var(--p-dx, 15px), var(--p-dy, 140px)) rotate(var(--p-rot, 320deg)) scale(0.6);
+                        opacity: 0;
+                    }
+                }
+            `;
+            document.head.appendChild(style);
+        }
+
+        const deckRect = deckEl.getBoundingClientRect();
+        
+        // Tremor shudders right as the stairs finish fading in
+        setTimeout(() => {
+            deckEl.classList.add('cs-deck-shudder');
+            setTimeout(() => deckEl.classList.remove('cs-deck-shudder'), 580);
+        }, 260);
+
+        const animWrap = document.createElement('div');
+        animWrap.className = 'cs-deck-crumble-container';
+        animWrap.style.cssText = `
+            position: fixed;
+            left: ${deckRect.left}px;
+            top: ${deckRect.top}px;
+            width: ${deckRect.width}px;
+            height: ${deckRect.height}px;
+            pointer-events: none;
+            z-index: 10000;
+            perspective: 750px;
+            perspective-origin: 50% 25%;
+            overflow: visible;
+            border-radius: 6px;
+            animation: csSceneFadeIn 0.38s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+        `;
+        document.body.appendChild(animWrap);
+
+        // Initial smoke poof billowing outward as the stairs emerge
+        const poofs = [
+            { x: 18, y: 30, tx: -24, ty: -10, s: 36, scale: 1.6, del: 0 },
+            { x: 82, y: 25, tx: 26, ty: -12, s: 38, scale: 1.7, del: 25 },
+            { x: 12, y: 75, tx: -22, ty: 12, s: 42, scale: 1.5, del: 40 },
+            { x: 88, y: 78, tx: 24, ty: 14, s: 44, scale: 1.6, del: 30 },
+            { x: 50, y: 15, tx: 0, ty: -22, s: 40, scale: 1.8, del: 15 },
+            { x: 48, y: 88, tx: 0, ty: 18, s: 46, scale: 1.6, del: 50 },
+            { x: 50, y: 50, tx: 0, ty: -4, s: 52, scale: 1.9, del: 10 }
+        ];
+
+        poofs.forEach(p => {
+            const pEl = document.createElement('div');
+            pEl.style.cssText = `
+                position: absolute;
+                left: ${p.x}%; top: ${p.y}%;
+                width: ${p.s}px; height: ${p.s}px;
+                margin-left: -${p.s / 2}px; margin-top: -${p.s / 2}px;
+                border-radius: 50%;
+                background: radial-gradient(circle, rgba(225, 185, 140, 0.82) 0%, rgba(165, 120, 80, 0.48) 45%, rgba(75, 45, 25, 0.12) 72%, transparent 100%);
+                filter: blur(4px);
+                pointer-events: none;
+                z-index: 40;
+                --p-tx: ${p.tx}px;
+                --p-ty: ${p.ty}px;
+                --p-scale: ${p.scale};
+                animation: csInitialPoof 0.72s cubic-bezier(0.18, 0.85, 0.4, 1) ${p.del}ms forwards;
+            `;
+            animWrap.appendChild(pEl);
+        });
+
+        // Subterranean dark chasm background with fiery orange cavern glow revealed when stairs collapse
+        const chasmBg = document.createElement('div');
+        chasmBg.style.cssText = `
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            border-radius: 6px;
+            background: radial-gradient(ellipse at 50% 75%, rgba(240, 110, 30, 0.5) 0%, rgba(130, 40, 10, 0.4) 40%, rgba(20, 8, 3, 0.98) 75%, #080301 100%);
+            box-shadow: inset 0 0 20px rgba(0,0,0,0.95);
+            animation: csAbyssPulse 1.4s ease-out forwards;
+            z-index: 1;
+        `;
+        animWrap.appendChild(chasmBg);
+
+        const W = deckRect.width;
+        const H = deckRect.height;
+
+        // Base delay allows user to clearly see the stairs fade in and the smoke poof before crumbling begins
+        const baseDelay = 340;
+
+        // Broken, highly-fractured stair masonry fragments with jagged clefts and 3D chiseled depth
+        const fragments = [
+            // Left Jagged Pillar Upper Capital
+            { type: 'wall', left: 0, top: 0, width: 28, height: 22, clip: 'polygon(0% 0%, 94% 0%, 100% 12%, 84% 28%, 96% 46%, 82% 64%, 92% 82%, 76% 100%, 0% 100%)', fx: -24, fy: 145, rx: 60, ry: -18, rz: -22, delay: baseDelay + 85, z: 25 },
+            // Left Jagged Pillar Mid-Upper Block
+            { type: 'wall', left: 0, top: 20, width: 32, height: 26, clip: 'polygon(0% 0%, 82% 0%, 94% 22%, 78% 44%, 96% 62%, 82% 80%, 90% 100%, 0% 100%)', fx: -28, fy: 155, rx: 62, ry: -14, rz: -18, delay: baseDelay + 140, z: 24 },
+            // Left Balustrade Wall Mid-Lower Ashlar
+            { type: 'wall', left: 0, top: 44, width: 34, height: 28, clip: 'polygon(0% 0%, 88% 0%, 76% 22%, 94% 42%, 80% 64%, 92% 86%, 84% 100%, 0% 100%)', fx: -32, fy: 165, rx: 68, ry: -20, rz: -14, delay: baseDelay + 200, z: 23 },
+            // Left Foreground Base Plinth Block
+            { type: 'wall', left: 0, top: 70, width: 35, height: 30, clip: 'polygon(0% 0%, 84% 0%, 96% 24%, 82% 48%, 98% 70%, 86% 88%, 92% 100%, 0% 100%)', fx: -20, fy: 180, rx: 72, ry: -12, rz: -9, delay: baseDelay + 265, z: 22 },
+
+            // Right Tiered Buttress Upper Coping Stone
+            { type: 'buttress', left: 66, top: 0, width: 34, height: 24, clip: 'polygon(18% 0%, 100% 0%, 100% 100%, 22% 100%, 10% 82%, 26% 60%, 12% 40%, 28% 20%)', fx: 24, fy: 148, rx: 55, ry: 16, rz: 18, delay: baseDelay + 100, z: 25 },
+            // Right Stepped Parapet Mid-Upper Shelf
+            { type: 'buttress', left: 62, top: 22, width: 38, height: 26, clip: 'polygon(20% 0%, 100% 0%, 100% 100%, 16% 100%, 6% 78%, 24% 56%, 12% 34%, 28% 16%)', fx: 30, fy: 162, rx: 62, ry: 22, rz: 22, delay: baseDelay + 165, z: 24 },
+            // Right Stepped Parapet Mid-Lower Shelf
+            { type: 'buttress', left: 58, top: 46, width: 42, height: 26, clip: 'polygon(22% 0%, 100% 0%, 100% 100%, 14% 100%, 8% 80%, 26% 58%, 10% 36%, 24% 18%)', fx: 34, fy: 174, rx: 68, ry: 20, rz: 20, delay: baseDelay + 225, z: 23 },
+            // Right Foreground Rampart Foundational Boulder
+            { type: 'buttress', left: 52, top: 70, width: 48, height: 30, clip: 'polygon(24% 0%, 100% 0%, 100% 100%, 12% 100%, 6% 82%, 22% 64%, 8% 44%, 26% 24%)', fx: 26, fy: 188, rx: 76, ry: 14, rz: 14, delay: baseDelay + 280, z: 22 },
+
+            // Top Stair Landing Left Chipped Slab
+            { type: 'step', left: 26, top: 2, width: 28, height: 16, clip: 'polygon(4% 0%, 96% 0%, 88% 28%, 100% 55%, 86% 82%, 92% 100%, 64% 94%, 38% 100%, 14% 92%, 0% 100%, 6% 48%)', fx: -8, fy: 138, rx: 80, ry: -14, rz: -7, delay: baseDelay + 55, z: 21 },
+            // Top Stair Landing Right Cracked Tread
+            { type: 'step', left: 50, top: 2, width: 26, height: 16, clip: 'polygon(4% 0%, 98% 0%, 92% 44%, 100% 100%, 76% 94%, 48% 100%, 22% 92%, 0% 100%, 12% 52%, 2% 26%)', fx: 9, fy: 142, rx: 78, ry: 12, rz: 6, delay: baseDelay + 65, z: 21 },
+
+            // Upper Flight Tread Left Splinter
+            { type: 'step', left: 24, top: 16, width: 24, height: 16, clip: 'polygon(4% 0%, 96% 2%, 88% 26%, 100% 52%, 84% 78%, 94% 100%, 68% 94%, 42% 100%, 16% 92%, 0% 100%, 8% 50%)', fx: -18, fy: 152, rx: 76, ry: -16, rz: -17, delay: baseDelay + 80, z: 20 },
+            // Upper Flight Collapsing Keystone Void Piece (drops first)
+            { type: 'step', left: 44, top: 15, width: 16, height: 17, clip: 'polygon(12% 0%, 88% 0%, 100% 28%, 86% 56%, 98% 84%, 84% 100%, 16% 100%, 4% 76%, 18% 48%, 2% 24%)', fx: 0, fy: 165, rx: 90, ry: 5, rz: -2, delay: baseDelay + 40, z: 20 },
+            // Upper Flight Tread Right Shattered Overhang
+            { type: 'step', left: 56, top: 16, width: 22, height: 16, clip: 'polygon(6% 0%, 96% 0%, 90% 48%, 98% 100%, 74% 94%, 46% 100%, 20% 92%, 0% 100%, 14% 54%, 2% 28%)', fx: 20, fy: 156, rx: 76, ry: 16, rz: 19, delay: baseDelay + 90, z: 20 },
+
+            // Middle Stair Upper Flight Left Tread
+            { type: 'step', left: 20, top: 30, width: 28, height: 17, clip: 'polygon(3% 0%, 96% 0%, 90% 28%, 98% 56%, 86% 82%, 94% 100%, 68% 94%, 40% 100%, 14% 92%, 0% 100%, 6% 48%)', fx: -6, fy: 160, rx: 84, ry: -12, rz: -8, delay: baseDelay + 130, z: 19 },
+            // Middle Stair Upper Flight Right Tread
+            { type: 'step', left: 46, top: 30, width: 28, height: 17, clip: 'polygon(4% 0%, 98% 0%, 92% 46%, 100% 100%, 74% 94%, 46% 100%, 20% 92%, 0% 100%, 12% 52%, 2% 26%)', fx: 8, fy: 162, rx: 84, ry: 10, rz: 9, delay: baseDelay + 145, z: 19 },
+
+            // Middle Stair Lower Flight Left Tread
+            { type: 'step', left: 17, top: 45, width: 30, height: 17, clip: 'polygon(2% 0%, 98% 0%, 90% 30%, 100% 60%, 86% 84%, 92% 100%, 66% 94%, 38% 100%, 14% 92%, 0% 100%, 8% 50%)', fx: -10, fy: 168, rx: 86, ry: -14, rz: -9, delay: baseDelay + 185, z: 18 },
+            // Middle Stair Lower Flight Right Tread
+            { type: 'step', left: 44, top: 45, width: 30, height: 17, clip: 'polygon(4% 0%, 98% 0%, 92% 48%, 98% 100%, 72% 94%, 44% 100%, 18% 92%, 0% 100%, 12% 54%, 2% 26%)', fx: 12, fy: 170, rx: 86, ry: 14, rz: 10, delay: baseDelay + 195, z: 18 },
+
+            // Lower Stair Flight Left Slab
+            { type: 'step', left: 14, top: 60, width: 33, height: 18, clip: 'polygon(2% 0%, 98% 0%, 90% 28%, 100% 58%, 86% 82%, 94% 100%, 66% 94%, 38% 100%, 12% 92%, 0% 100%, 6% 48%)', fx: -9, fy: 176, rx: 88, ry: -10, rz: -6, delay: baseDelay + 235, z: 17 },
+            // Lower Stair Flight Right Slab
+            { type: 'step', left: 43, top: 60, width: 33, height: 18, clip: 'polygon(4% 0%, 98% 0%, 92% 46%, 100% 100%, 72% 94%, 44% 100%, 18% 92%, 0% 100%, 12% 52%, 2% 26%)', fx: 11, fy: 178, rx: 88, ry: 12, rz: 7, delay: baseDelay + 245, z: 17 },
+
+            // Bottom Foreground Massive Left Threshold Slab
+            { type: 'step', left: 8, top: 76, width: 38, height: 24, clip: 'polygon(0% 0%, 98% 0%, 90% 30%, 100% 62%, 88% 84%, 96% 100%, 66% 94%, 36% 100%, 10% 92%, 0% 100%, 4% 48%)', fx: -4, fy: 186, rx: 90, ry: -8, rz: 4, delay: baseDelay + 275, z: 16 },
+            // Bottom Foreground Massive Right Threshold Slab
+            { type: 'step', left: 42, top: 76, width: 38, height: 24, clip: 'polygon(4% 0%, 100% 0%, 94% 48%, 100% 100%, 72% 94%, 42% 100%, 16% 92%, 0% 100%, 12% 54%, 2% 26%)', fx: 5, fy: 188, rx: 90, ry: 8, rz: -4, delay: baseDelay + 285, z: 16 }
+        ];
+
+        fragments.forEach((frag) => {
+            const fragEl = document.createElement('div');
+            fragEl.className = 'cs-stair-fragment';
+            
+            const leftPx = (frag.left / 100) * W;
+            const topPx = (frag.top / 100) * H;
+            const widthPx = (frag.width / 100) * W;
+            const heightPx = (frag.height / 100) * H;
+
+            // Chiseled stone masonry gradients with stone veins, fracture highlights, and deep bevel shadows
+            let gradientOverlay = '';
+            let borderStyle = '';
+            let boxShadowStyle = '';
+
+            if (frag.type === 'step') {
+                gradientOverlay = `
+                    linear-gradient(180deg, rgba(255,235,185,0.72) 0%, rgba(225,160,80,0.32) 16%, rgba(65,32,14,0.65) 58%, rgba(16,7,2,0.96) 100%),
+                    repeating-linear-gradient(112deg, transparent, transparent 7px, rgba(255,240,200,0.2) 8px, rgba(20,8,3,0.4) 10px, transparent 12px),
+                    repeating-linear-gradient(90deg, transparent, transparent 15px, rgba(0,0,0,0.32) 16px, transparent 17px)
+                `;
+                borderStyle = `border-top: 1.8px solid rgba(255, 235, 185, 0.95); border-bottom: 2px solid rgba(16, 7, 2, 0.98); border-left: 1px solid rgba(245, 180, 95, 0.55); border-right: 1.2px solid rgba(25, 10, 4, 0.85);`;
+                boxShadowStyle = `box-shadow: inset 0 2px 3px rgba(255, 245, 210, 0.65), inset 0 -3px 5px rgba(0, 0, 0, 0.95), inset 2px 0 3px rgba(255, 220, 140, 0.35), inset -2px 0 3px rgba(0, 0, 0, 0.8);`;
+            } else if (frag.type === 'buttress') {
+                gradientOverlay = `
+                    linear-gradient(135deg, rgba(255,230,165,0.6) 0%, rgba(200,130,55,0.3) 30%, rgba(48,22,10,0.75) 70%, rgba(14,6,2,0.98) 100%),
+                    repeating-linear-gradient(135deg, transparent, transparent 9px, rgba(255,245,210,0.18) 10px, rgba(0,0,0,0.38) 12px, transparent 14px)
+                `;
+                borderStyle = `border-top: 2px solid rgba(255, 235, 175, 0.95); border-right: 1.8px solid rgba(245, 175, 95, 0.75); border-bottom: 1.6px solid rgba(18, 7, 2, 0.95); border-left: 1px solid rgba(120, 60, 20, 0.6);`;
+                boxShadowStyle = `box-shadow: inset 0 2px 3px rgba(255, 240, 195, 0.6), inset -2px 0 4px rgba(255, 215, 140, 0.4), inset 0 -3px 5px rgba(0, 0, 0, 0.95);`;
+            } else {
+                gradientOverlay = `
+                    linear-gradient(120deg, rgba(240,195,140,0.52) 0%, rgba(140,75,25,0.26) 42%, rgba(24,11,4,0.9) 100%),
+                    repeating-linear-gradient(68deg, transparent, transparent 8px, rgba(255,235,185,0.16) 9px, rgba(0,0,0,0.35) 11px, transparent 13px)
+                `;
+                borderStyle = `border-top: 1.8px solid rgba(245, 190, 125, 0.85); border-left: 1.8px solid rgba(190, 120, 60, 0.65); border-bottom: 1.6px solid rgba(16, 7, 2, 0.95); border-right: 1px solid rgba(20, 8, 3, 0.85);`;
+                boxShadowStyle = `box-shadow: inset 0 2px 3px rgba(255, 230, 175, 0.55), inset 2px 0 3px rgba(255, 210, 130, 0.35), inset 0 -3px 5px rgba(0, 0, 0, 0.95);`;
+            }
+
+            fragEl.style.cssText = `
+                position: absolute;
+                left: ${leftPx}px;
+                top: ${topPx}px;
+                width: ${widthPx}px;
+                height: ${heightPx}px;
+                background-image: ${gradientOverlay}, url('cards/dark_of_mirkwood/caves_of_nibin/crumbling_stairs.jpg'), url('./assets/aistudio/stairs_35b6bfeb.PNG'), url('/assets/aistudio/stairs_35b6bfeb.PNG');
+                background-size: cover, ${W}px ${H}px, ${W}px ${H}px, ${W}px ${H}px;
+                background-position: center, -${leftPx}px -${topPx}px, -${leftPx}px -${topPx}px, -${leftPx}px -${topPx}px;
+                background-repeat: no-repeat;
+                background-color: #4a2816;
+                clip-path: ${frag.clip};
+                ${borderStyle}
+                ${boxShadowStyle}
+                filter: drop-shadow(0 2px 3px rgba(0,0,0,0.95)) drop-shadow(0 6px 12px rgba(0,0,0,0.85));
+                pointer-events: none;
+                z-index: ${frag.z};
+                --fx: ${frag.fx}px;
+                --fy: ${frag.fy}px;
+                --rx: ${frag.rx}deg;
+                --ry: ${frag.ry}deg;
+                --rz: ${frag.rz}deg;
+                animation: csFragmentFall 0.68s cubic-bezier(0.55, 0.055, 0.675, 0.19) ${frag.delay}ms forwards;
+            `;
+            animWrap.appendChild(fragEl);
+
+            // Billowing dust clouds at fracture points
+            const numDust = 2;
+            for (let d = 0; d < numDust; d++) {
+                const dust = document.createElement('div');
+                const dustSize = 16 + Math.random() * 22;
+                const dustX = leftPx + (Math.random() * widthPx);
+                const dustY = topPx + (Math.random() * heightPx * 0.7);
+                const dustDelay = frag.delay + 30 + Math.random() * 80;
+                const driftX = (Math.random() - 0.5) * 45;
+                const driftY = -10 + Math.random() * 30;
+                const dustScale = 2.4 + Math.random() * 1.4;
+
+                dust.style.cssText = `
+                    position: absolute;
+                    left: ${dustX}px;
+                    top: ${dustY}px;
+                    width: ${dustSize}px;
+                    height: ${dustSize}px;
+                    border-radius: 50%;
+                    background: radial-gradient(circle, rgba(215, 175, 135, 0.85) 0%, rgba(160, 115, 80, 0.5) 45%, rgba(80, 50, 30, 0.15) 75%, transparent 100%);
+                    filter: blur(3.5px);
+                    pointer-events: none;
+                    z-index: 35;
+                    --dx: ${driftX}px;
+                    --dy: ${driftY}px;
+                    --dust-scale: ${dustScale};
+                    animation: csDustBillow 0.75s ease-out ${dustDelay}ms forwards;
+                `;
+                animWrap.appendChild(dust);
+            }
+
+            // Tumbling stone pebbles and debris chunks
+            const numPebbles = 2;
+            for (let p = 0; p < numPebbles; p++) {
+                const pebble = document.createElement('div');
+                const pSize = 3 + Math.random() * 6;
+                const pX = leftPx + (Math.random() * widthPx);
+                const pY = topPx + 2;
+                const pDelay = frag.delay + 20 + Math.random() * 60;
+                const pDx = (Math.random() - 0.5) * 60;
+                const pDy = 80 + Math.random() * 90;
+                const pRot = (Math.random() - 0.5) * 480;
+
+                pebble.style.cssText = `
+                    position: absolute;
+                    left: ${pX}px;
+                    top: ${pY}px;
+                    width: ${pSize}px;
+                    height: ${pSize}px;
+                    background: ${Math.random() > 0.5 ? '#99633e' : '#452615'};
+                    clip-path: polygon(${Math.random() > 0.5 ? '20% 0%, 100% 20%, 80% 100%, 0% 80%' : '50% 0%, 100% 40%, 60% 100%, 0% 60%'});
+                    box-shadow: 0 1px 3px rgba(0,0,0,0.85);
+                    pointer-events: none;
+                    z-index: 30;
+                    --p-dx: ${pDx}px;
+                    --p-dy: ${pDy}px;
+                    --p-rot: ${pRot}deg;
+                    animation: csPebbleShower 0.65s cubic-bezier(0.55, 0.055, 0.675, 0.19) ${pDelay}ms forwards;
+                `;
+                animWrap.appendChild(pebble);
+            }
+        });
+
+        setTimeout(() => {
+            if (animWrap.parentNode) animWrap.parentNode.removeChild(animWrap);
+        }, 1950);
+
+        if (callback) {
+            setTimeout(callback, 980);
+        }
+    }
+    window.playCrumblingStairsDeckAnimation = playCrumblingStairsDeckAnimation;
+    const initChieftainRevealObserver = () => {
+        const targetBody = document.body;
+        if (!targetBody) {
+            setTimeout(initChieftainRevealObserver, 100);
+            return;
+        }
+        const observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType === 1) {
+                        const ghostEl = node.id === 'encounter-reveal-ghost' 
+                            ? node 
+                            : (node.querySelector ? node.querySelector('#encounter-reveal-ghost') : null);
+
+                        if (ghostEl && !ghostEl._nibinRevealAudioPlayed) {
+                            const isChieftain = ghostEl.querySelector('[data-id="nibin_goblin_chieftain"], [data-id="goblin_chieftain"], img[alt*="Goblin Chieftain"]');
+                            const isScavengers = ghostEl.querySelector('[data-id="nibin_goblintown_scavengers"], [data-id="goblintown_scavengers"], img[alt*="Goblintown Scavengers"]');
+                            const isRunners = ghostEl.querySelector('[data-id="nibin_goblin_runners"], [data-id="goblin_runners"], img[alt*="Goblin Runners"]');
+                            const isPillar = ghostEl.querySelector('[data-id="nibin_cracked_pillar"], [data-id="cracked_pillar"], img[alt*="Cracked Pillar"]');
+                            const isTroll = ghostEl.querySelector('[data-id="nibin_great_cave_troll"], [data-id="great_cave_troll"], img[alt*="Great Cave-troll"]');
+                            const isArrows = ghostEl.querySelector('[data-id="nibin_obsidian_arrows"], [data-id="obsidian_arrows"], img[alt*="Obsidian Arrows"]');
+                            const isEyes = ghostEl.querySelector('[data-id="nibin_eyes_in_the_dark"], [data-id="eyes_in_the_dark"], img[alt*="Eyes in the Dark"]');
+                            const isGoblinsUponYou = ghostEl.querySelector('[data-id="nibin_goblins_are_upon_you"], [data-id="goblins_are_upon_you"], img[alt*="Goblins are Upon You"]');
+                            const isWatchful = ghostEl.querySelector('[data-id="nibin_watchful_eyes"], [data-id="watchful_eyes"], img[alt*="Watchful Eyes"]');
+                            const isLost = ghostEl.querySelector('[data-id="nibin_lost_in_the_dark"], [data-id="lost_in_the_dark"], img[alt*="Lost in the Dark"]');
+                            const isCrumblingRuin = ghostEl.querySelector('[data-id="nibin_crumbling_ruin"], [data-id="crumbling_ruin"], img[alt*="Crumbling Ruin"]');
+                            const isCrumblingStairs = ghostEl.querySelector('[data-id="nibin_crumbling_stairs"], [data-id="crumbling_stairs"], img[alt*="Crumbling Stairs"]');
+                            const isDungeon = ghostEl.querySelector('[data-id="nibin_goblin_dungeon"], [data-id="goblin_dungeon"], img[alt*="Goblin Dungeon"]');
+                            const isCollapsedMine = ghostEl.querySelector('[data-id="nibin_collapsed_mine"], [data-id="collapsed_mine"], img[alt*="Collapsed Mine"]');
+                            const isBranchingPaths = ghostEl.querySelector('[data-id="nibin_branching_paths"], [data-id="branching_paths"], img[alt*="Branching Paths"]');
+                            const isLightless = ghostEl.querySelector('[data-id="nibin_lightless_passage"], [data-id="lightless_passage"], img[alt*="Lightless Passage"]');
+                            const isTunnels = ghostEl.querySelector('[data-id="nibin_goblin_tunnels"], [data-id="goblin_tunnels"], img[alt*="Goblin Tunnels"]');
+                            
+                            if (isChieftain) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    const snd = new Audio('./sound_effects/dark_of_mirkwood/goblin_chieftain.mp3');
+                                    snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                                    snd.play().catch(() => {});
+                                }, 500);
+                            } else if (isScavengers) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                if (typeof window.playScavengersRevealAudio === 'function') {
+                                    window.playScavengersRevealAudio();
+                                } else {
+                                    setTimeout(() => {
+                                        const snd = new Audio('./sound_effects/dark_of_mirkwood/goblintown_scavengers.mp3');
+                                        snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                                        snd.play().catch(() => {});
+                                    }, 450);
+                                }
+                            } else if (isRunners) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                if (typeof window.playGoblinRunnersRevealAudio === 'function') {
+                                    setTimeout(() => window.playGoblinRunnersRevealAudio(), 450);
+                                } else {
+                                    setTimeout(() => {
+                                        const snd = new Audio('./sound_effects/dark_of_mirkwood/goblin_runners.mp3');
+                                        const volSlider = document.getElementById('volume-slider');
+                                        snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                                        snd.play().catch(() => {});
+                                    }, 450);
+                                }
+                                if (typeof window.triggerGoblinRunnersSurgeSpear === 'function') {
+                                    setTimeout(() => window.triggerGoblinRunnersSurgeSpear(ghostEl), 850);
+                                }
+                            } else if (isPillar) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    try {
+                                        const snd = new Audio('./sound_effects/dark_of_mirkwood/cracked_pillar.mp3');
+                                        const volSlider = document.getElementById('volume-slider');
+                                        snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                                        snd.play().catch(() => {});
+                                    } catch(e) {}
+                                }, 450);
+                            } else if (isTroll) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    try {
+                                        const snd = new Audio('./sound_effects/dark_of_mirkwood/great_cave_troll.mp3');
+                                        const volSlider = document.getElementById('volume-slider');
+                                        snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                                        snd.play().catch(() => {});
+                                    } catch(e) {}
+                                }, 450);
+                            } else if (isArrows) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playObsidianArrowsAudio === 'function') {
+                                        window.playObsidianArrowsAudio();
+                                    }
+                                }, 450);
+                            } else if (isEyes) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playEyesInTheDarkAudio === 'function') {
+                                        window.playEyesInTheDarkAudio();
+                                    }
+                                }, 600);
+                            } else if (isGoblinsUponYou) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playGoblinsAreUponYouAudio === 'function') {
+                                        window.playGoblinsAreUponYouAudio();
+                                    }
+                                }, 600);
+                            } else if (isWatchful) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playWatchfulEyesAudio === 'function') {
+                                        window.playWatchfulEyesAudio();
+                                    }
+                                }, 450);
+                            } else if (isLost) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playLostInTheDarkAudio === 'function') {
+                                        window.playLostInTheDarkAudio();
+                                    }
+                                }, 450);
+                            } else if (isCrumblingRuin) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playCrumblingRuinAudio === 'function') {
+                                        window.playCrumblingRuinAudio();
+                                    }
+                                }, 450);
+                            } else if (isCrumblingStairs) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playCrumblingStairsAudio === 'function') {
+                                        window.playCrumblingStairsAudio();
+                                    }
+                                }, 450);
+                            } else if (isDungeon) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playGoblinDungeonAudio === 'function') {
+                                        window.playGoblinDungeonAudio();
+                                    }
+                                }, 450);
+                            } else if (isCollapsedMine) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playCollapsedMineAudio === 'function') {
+                                        window.playCollapsedMineAudio();
+                                    }
+                                }, 450);
+                            } else if (isBranchingPaths) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playBranchingPathsAudio === 'function') {
+                                        window.playBranchingPathsAudio();
+                                    }
+                                }, 450);
+                                setTimeout(() => {
+                                    if (typeof window.triggerBranchingPathsEpicThreatTokens === 'function') {
+                                        window.triggerBranchingPathsEpicThreatTokens();
+                                    }
+                                }, 1600);
+                            } else if (isLightless) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playLightlessPassageAudio === 'function') {
+                                        window.playLightlessPassageAudio();
+                                    }
+                                }, 450);
+                            } else if (isTunnels) {
+                                ghostEl._nibinRevealAudioPlayed = true;
+                                setTimeout(() => {
+                                    if (typeof window.playGoblinTunnelsAudio === 'function') {
+                                        window.playGoblinTunnelsAudio();
+                                    }
+                                }, 450);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        observer.observe(targetBody, { childList: true, subtree: true });
+    };
+    initChieftainRevealObserver();
 
     // Global capture-phase input blockers active during Watchful Eyes resolution
     document.addEventListener('click', (e) => {
@@ -828,6 +6291,12 @@ if (typeof window !== 'undefined') {
         const snd = new Audio('./sound_effects/cave_torch_dead.mp3');
         snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
         snd.play().catch(() => {});
+        
+        try {
+            const fireSnd = new Audio('./sound_effects/dark_of_mirkwood/cave_torch.mp3');
+            fireSnd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+            fireSnd.play().catch(() => {});
+        } catch(e) {}
 
         const cardW = (startRect && startRect.width) ? startRect.width : (parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144);
         const cardH = (startRect && startRect.height) ? startRect.height : (parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202);
@@ -1062,17 +6531,1232 @@ if (typeof window !== 'undefined') {
 								isPlayer = false;
 								card._tempDestId = 'encounter-discard-pile';
 						}
-						return origAnimateCardToDiscard.call(this, card, isPlayer, callback, startRect);
-				};
-		}
+						if (card && (card.id === 'nibin_goblin_chieftain' || card.id === 'goblin_chieftain')) {
+								const snd = new Audio('./sound_effects/dark_of_mirkwood/goblin_chieftain_death.mp3');
+								snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+								snd.play().catch(() => {});
+						}
+						if (card && (card.id === 'nibin_cavern_warg' || card.id === 'cavern_warg')) {
+                                const snd = new Audio('./sound_effects/dark_of_mirkwood/cavern_warg_death.mp3');
+                                snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                                snd.play().catch(() => {
+                                        const fallback = new Audio('./sound_effects/cavern_warg_death.mp3');
+                                        fallback.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                                        fallback.play().catch(() => {});
+                                });
+                        }
+                        if (card && (card.id === 'nibin_great_cave_troll' || card.id === 'great_cave_troll')) {
+                                const snd = new Audio('./sound_effects/dark_of_mirkwood/great_cave_troll_death.mp3');
+                                snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                                snd.play().catch(() => {});
+                        }
+                        return origAnimateCardToDiscard.call(this, card, isPlayer, callback, startRect);
+                };
+        }
+
+    // Particle Disintegration for Player # Badge when returning to Staging Area
+    window.disintegratePlayerBadge = function(badgeEl, originX, originY, onComplete) {
+        if (!badgeEl && (!originX || !originY)) {
+            if (onComplete) onComplete();
+            return;
+        }
+
+        // Animate badge element white/ruby flash and disintegration (no sound played)
+        if (badgeEl) {
+            badgeEl.style.transition = 'filter 0.3s ease-out, transform 0.35s ease-out, opacity 0.35s ease-out';
+            badgeEl.style.filter = 'brightness(2.8) drop-shadow(0 0 14px #ff4d4d) drop-shadow(0 0 20px #ffffff)';
+            badgeEl.style.transform = 'translateY(-4px) scale(1.08)';
+            badgeEl.style.opacity = '0';
+            setTimeout(() => {
+                badgeEl.remove();
+            }, 360);
+        }
+
+        // Setup canvas for gentle, slowly upward-drifting crystal and gem particles
+        const canvas = document.createElement('canvas');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        canvas.style.cssText = `
+            position: fixed; inset: 0; width: 100vw; height: 100vh;
+            pointer-events: none; z-index: 10020;
+        `;
+        document.body.appendChild(canvas);
+
+        const ctx = canvas.getContext('2d');
+        const particles = [];
+        const bloodRubyPalette = ['#e63946', '#ff4d4d', '#ff758f', '#b7094c', '#890620', '#ff0033', '#c9184a'];
+        const goldPalette = ['#f5d76e', '#e9c46a', '#f4a261', '#ee9b00', '#d4a373'];
+        const darkStonePalette = ['#2b0d0d', '#1a0a0a', '#3a1515', '#4a2828', '#202020'];
+        const allGemPalette = [...bloodRubyPalette, ...goldPalette];
+
+        // 1. Faceted Diamond Gem Shards (rising gently and slowly upward)
+        for (let i = 0; i < 40; i++) {
+            const baseCol = allGemPalette[Math.floor(Math.random() * allGemPalette.length)];
+            particles.push({
+                type: 'shard',
+                x: originX + (Math.random() - 0.5) * 44,
+                y: originY + (Math.random() - 0.5) * 16,
+                vx: (Math.random() - 0.5) * 0.75,
+                vy: - (Math.random() * 0.45 + 0.32),
+                ax: 0,
+                ay: - 0.0025,
+                size: Math.random() * 3.4 + 2.2,
+                rot: Math.random() * Math.PI * 2,
+                vrot: (Math.random() - 0.5) * 0.04,
+                aspect: 0.55 + Math.random() * 0.35,
+                color: baseCol,
+                alpha: 1,
+                decay: 0.0045 + Math.random() * 0.0025,
+                phase: Math.random() * Math.PI * 2
+            });
+        }
+
+        // 2. Multi-Faceted Crystal Grains (rising gently and slowly upward)
+        for (let i = 0; i < 40; i++) {
+            const numVerts = 5 + Math.floor(Math.random() * 2);
+            const verts = [];
+            const baseRadius = Math.random() * 2.2 + 1.4;
+            for (let v = 0; v < numVerts; v++) {
+                const angle = (v / numVerts) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
+                const r = baseRadius * (0.7 + Math.random() * 0.55);
+                verts.push({ x: Math.cos(angle) * r, y: Math.sin(angle) * r });
+            }
+            particles.push({
+                type: 'grain',
+                x: originX + (Math.random() - 0.5) * 46,
+                y: originY + (Math.random() - 0.5) * 18,
+                vx: (Math.random() - 0.5) * 0.65,
+                vy: - (Math.random() * 0.4 + 0.28),
+                ax: 0,
+                ay: - 0.002,
+                size: baseRadius,
+                rot: Math.random() * Math.PI * 2,
+                vrot: (Math.random() - 0.5) * 0.035,
+                verts: verts,
+                color: allGemPalette[Math.floor(Math.random() * allGemPalette.length)],
+                alpha: 1,
+                decay: 0.0048 + Math.random() * 0.0025,
+                phase: Math.random() * Math.PI * 2
+            });
+        }
+
+        // 3. Sparkling 4-Point Star Glints (rising slowly upward)
+        for (let i = 0; i < 20; i++) {
+            particles.push({
+                type: 'spark',
+                x: originX + (Math.random() - 0.5) * 48,
+                y: originY + (Math.random() - 0.5) * 18,
+                vx: (Math.random() - 0.5) * 0.7,
+                vy: - (Math.random() * 0.45 + 0.3),
+                ax: 0,
+                ay: - 0.0025,
+                size: Math.random() * 2.8 + 2.0,
+                rot: Math.random() * Math.PI * 2,
+                vrot: (Math.random() - 0.5) * 0.035,
+                color: Math.random() > 0.4 ? '#ffffff' : (Math.random() > 0.5 ? '#ff758f' : '#fff3b0'),
+                pulsePhase: Math.random() * Math.PI * 2,
+                pulseSpeed: 0.06 + Math.random() * 0.06,
+                alpha: 1,
+                decay: 0.005 + Math.random() * 0.0025,
+                phase: Math.random() * Math.PI * 2
+            });
+        }
+
+        // 4. Chunky Shattered Badge Fragments (rising slowly upward)
+        for (let i = 0; i < 20; i++) {
+            const numV = 5 + Math.floor(Math.random() * 2);
+            const fVerts = [];
+            const bR = Math.random() * 3.2 + 2.4;
+            for (let v = 0; v < numV; v++) {
+                const angle = (v / numV) * Math.PI * 2 + (Math.random() - 0.5) * 0.4;
+                const r = bR * (0.65 + Math.random() * 0.65);
+                fVerts.push({ x: Math.cos(angle) * r, y: Math.sin(angle) * r });
+            }
+            particles.push({
+                type: 'rock',
+                x: originX + (Math.random() - 0.5) * 44,
+                y: originY + (Math.random() - 0.5) * 16,
+                vx: (Math.random() - 0.5) * 0.6,
+                vy: - (Math.random() * 0.35 + 0.22),
+                ax: 0,
+                ay: - 0.0018,
+                size: bR,
+                verts: fVerts,
+                rot: Math.random() * Math.PI * 2,
+                vrot: (Math.random() - 0.5) * 0.035,
+                color: darkStonePalette[Math.floor(Math.random() * darkStonePalette.length)],
+                alpha: 1,
+                decay: 0.005 + Math.random() * 0.0025
+            });
+        }
+
+        // 5. Atmospheric Upward Vapor Streamlines (rising gently)
+        for (let i = 0; i < 10; i++) {
+            particles.push({
+                type: 'upwardstream',
+                x: originX + (Math.random() - 0.5) * 40,
+                y: originY + (Math.random() - 0.5) * 18,
+                vx: (Math.random() - 0.5) * 0.35,
+                vy: - (Math.random() * 0.75 + 0.45),
+                len: Math.random() * 16 + 10,
+                alpha: 0.65,
+                decay: 0.007 + Math.random() * 0.003
+            });
+        }
+
+        // Render loop
+        let animId = null;
+        const renderParticles = () => {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            let activeCount = 0;
+
+            for (let i = 0; i < particles.length; i++) {
+                const p = particles[i];
+                if (p.alpha <= 0) continue;
+                activeCount++;
+
+                p.x += p.vx;
+                p.y += p.vy;
+                if (p.ax) p.vx += p.ax;
+                if (p.ay) p.vy += p.ay;
+                p.alpha -= p.decay;
+
+                ctx.save();
+                ctx.globalAlpha = Math.max(0, p.alpha);
+
+                if (p.type === 'shard') {
+                    p.x += Math.sin(p.y * 0.02 + p.phase) * 0.22;
+                    p.rot += p.vrot;
+                    ctx.translate(p.x, p.y);
+                    ctx.rotate(p.rot);
+                    const scaleX = Math.cos(p.rot * 1.8);
+                    ctx.scale(scaleX, 1);
+
+                    const sz = p.size;
+                    const asp = p.aspect;
+
+                    // Main facet
+                    ctx.fillStyle = p.color;
+                    ctx.beginPath();
+                    ctx.moveTo(0, -sz * 1.4);
+                    ctx.lineTo(sz * asp, 0);
+                    ctx.lineTo(0, sz * 1.2);
+                    ctx.lineTo(-sz * asp, 0);
+                    ctx.closePath();
+                    ctx.fill();
+
+                    // Specular highlight facet
+                    ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
+                    ctx.beginPath();
+                    ctx.moveTo(0, -sz * 1.4);
+                    ctx.lineTo(sz * asp, 0);
+                    ctx.lineTo(0, 0);
+                    ctx.closePath();
+                    ctx.fill();
+
+                    // Shadow facet
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+                    ctx.beginPath();
+                    ctx.moveTo(0, sz * 1.2);
+                    ctx.lineTo(-sz * asp, 0);
+                    ctx.lineTo(0, 0);
+                    ctx.closePath();
+                    ctx.fill();
+
+                    // Center hairline
+                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
+                    ctx.lineWidth = 0.5;
+                    ctx.beginPath();
+                    ctx.moveTo(0, -sz * 1.4);
+                    ctx.lineTo(0, sz * 1.2);
+                    ctx.stroke();
+
+                } else if (p.type === 'grain') {
+                    p.x += Math.sin(p.y * 0.02 + p.phase) * 0.2;
+                    p.rot += p.vrot;
+                    ctx.translate(p.x, p.y);
+                    ctx.rotate(p.rot);
+
+                    ctx.fillStyle = p.color;
+                    ctx.beginPath();
+                    for (let v = 0; v < p.verts.length; v++) {
+                        const pt = p.verts[v];
+                        if (v === 0) ctx.moveTo(pt.x, pt.y);
+                        else ctx.lineTo(pt.x, pt.y);
+                    }
+                    ctx.closePath();
+                    ctx.fill();
+
+                    if (p.verts.length >= 2) {
+                        ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+                        ctx.beginPath();
+                        ctx.moveTo(0, 0);
+                        ctx.lineTo(p.verts[0].x, p.verts[0].y);
+                        ctx.lineTo(p.verts[1].x, p.verts[1].y);
+                        ctx.closePath();
+                        ctx.fill();
+                    }
+
+                    ctx.strokeStyle = 'rgba(0, 0, 0, 0.25)';
+                    ctx.lineWidth = 0.6;
+                    ctx.stroke();
+
+                } else if (p.type === 'spark') {
+                    p.x += Math.sin(p.y * 0.022 + p.phase) * 0.35;
+                    p.pulsePhase += p.pulseSpeed;
+                    p.rot += p.vrot;
+                    ctx.translate(p.x, p.y);
+                    ctx.rotate(p.rot);
+
+                    const sp = p.size * (0.75 + 0.35 * Math.sin(p.pulsePhase));
+
+                    ctx.fillStyle = p.color;
+                    ctx.beginPath();
+                    ctx.moveTo(0, -sp * 1.8);
+                    ctx.quadraticCurveTo(0, 0, sp * 1.8, 0);
+                    ctx.quadraticCurveTo(0, 0, 0, sp * 1.8);
+                    ctx.quadraticCurveTo(0, 0, -sp * 1.8, 0);
+                    ctx.quadraticCurveTo(0, 0, 0, -sp * 1.8);
+                    ctx.closePath();
+                    ctx.fill();
+
+                    ctx.fillStyle = '#ffffff';
+                    ctx.beginPath();
+                    ctx.moveTo(0, -sp * 0.9);
+                    ctx.quadraticCurveTo(0, 0, sp * 0.9, 0);
+                    ctx.quadraticCurveTo(0, 0, 0, sp * 0.9);
+                    ctx.quadraticCurveTo(0, 0, -sp * 0.9, 0);
+                    ctx.quadraticCurveTo(0, 0, 0, -sp * 0.9);
+                    ctx.closePath();
+                    ctx.fill();
+
+                } else if (p.type === 'rock') {
+                    p.rot += p.vrot;
+                    ctx.translate(p.x, p.y);
+                    ctx.rotate(p.rot);
+
+                    ctx.fillStyle = p.color;
+                    ctx.beginPath();
+                    for (let v = 0; v < p.verts.length; v++) {
+                        const pt = p.verts[v];
+                        if (v === 0) ctx.moveTo(pt.x, pt.y);
+                        else ctx.lineTo(pt.x, pt.y);
+                    }
+                    ctx.closePath();
+                    ctx.fill();
+
+                    if (p.verts.length >= 3) {
+                        ctx.fillStyle = 'rgba(255, 255, 255, 0.28)';
+                        ctx.beginPath();
+                        ctx.moveTo(0, 0);
+                        ctx.lineTo(p.verts[0].x, p.verts[0].y);
+                        ctx.lineTo(p.verts[1].x, p.verts[1].y);
+                        ctx.closePath();
+                        ctx.fill();
+                    }
+
+                    ctx.strokeStyle = 'rgba(0, 0, 0, 0.45)';
+                    ctx.lineWidth = 0.8;
+                    ctx.stroke();
+
+                } else if (p.type === 'upwardstream') {
+                    ctx.strokeStyle = 'rgba(255, 120, 120, 0.6)';
+                    ctx.lineWidth = 1.6;
+                    ctx.lineCap = 'round';
+                    ctx.beginPath();
+                    ctx.moveTo(p.x, p.y);
+                    ctx.lineTo(p.x + p.vx * 1.2, p.y + p.len);
+                    ctx.stroke();
+                }
+
+                ctx.restore();
+            }
+
+            if (activeCount > 0) {
+                animId = requestAnimationFrame(renderParticles);
+            } else {
+                if (animId) cancelAnimationFrame(animId);
+                canvas.remove();
+                if (onComplete) onComplete();
+            }
+        };
+
+        animId = requestAnimationFrame(renderParticles);
+    };
+
+    window.triggerWargChompOnTorch = function(torchUid, onComplete) {
+        const torchEl = document.querySelector(`.is-attachment[data-uid="${torchUid}"]`) ||
+                        document.querySelector(`[data-uid="${torchUid}"]`) ||
+                        document.querySelector('[data-id="nibin_cave_torch"]');
+        if (!torchEl) {
+            if (onComplete) onComplete();
+            return;
+        }
+
+        const r = torchEl.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) {
+            if (onComplete) onComplete();
+            return;
+        }
+
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/cavern_warg_attack.mp3');
+            snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+            snd.playbackRate = 1.28;
+            snd.play().catch(() => {});
+        } catch(e) {}
+
+        const uid = Math.random().toString(36).slice(2, 8);
+        const padX = 80;
+        const padY = 80;
+        const w = r.width + padX * 2;
+        const h = r.height + padY * 2;
+
+        const ghost = document.createElement('div');
+        ghost.style.cssText = `
+            position: fixed;
+            left: ${r.left - padX}px;
+            top: ${r.top - padY}px;
+            width: ${w}px;
+            height: ${h}px;
+            pointer-events: none;
+            z-index: 10050;
+            overflow: visible;
+        `;
+
+        const upperTeethPath = `
+            M -15 35 Q -25 55 -10 75 Q 0 55 -3 35 Z
+            M 0 35 Q -10 65 5 85 Q 15 65 12 35 Z
+            M 15 32 Q 5 70 20 95 Q 35 70 30 32 Z
+            M 32 25 C 20 90, 45 150, 70 180 C 60 120, 55 60, 55 25 Z
+            M 58 25 Q 55 60 68 85 Q 78 60 74 25 Z
+            M 75 25 Q 72 60 85 85 Q 95 60 91 25 Z
+            M 92 25 Q 93 60 104 85 Q 113 60 108 25 Z
+            M 109 25 Q 114 60 123 85 Q 134 60 127 25 Z
+            M 129 25 C 129 60, 124 120, 114 180 C 139 150, 164 90, 152 25 Z
+            M 154 32 Q 149 70 164 95 Q 179 70 169 32 Z
+            M 172 35 Q 169 65 179 85 Q 194 65 184 35 Z
+            M 187 35 Q 184 55 194 75 Q 209 55 199 35 Z
+        `;
+
+        const lowerTeethPath = `
+            M -10 225 Q -20 205 -5 185 Q 5 205 2 225 Z
+            M 5 225 Q -5 195 10 175 Q 20 195 17 225 Z
+            M 20 228 Q 10 190 25 165 Q 40 190 35 228 Z
+            M 37 235 C 25 170, 50 110, 75 80 C 65 140, 60 200, 60 235 Z
+            M 63 235 Q 60 200 73 175 Q 83 200 79 235 Z
+            M 80 235 Q 77 200 90 175 Q 100 200 96 235 Z
+            M 97 235 Q 98 200 109 175 Q 118 200 113 235 Z
+            M 114 235 Q 119 200 128 175 Q 139 200 132 235 Z
+            M 134 235 C 134 200, 129 140, 119 80 C 144 110, 169 170, 157 235 Z
+            M 159 228 Q 154 190 169 165 Q 184 190 174 228 Z
+            M 177 225 Q 174 195 184 175 Q 199 195 189 225 Z
+            M 192 225 Q 189 205 199 185 Q 214 205 204 225 Z
+        `;
+
+        ghost.innerHTML = `
+            <svg viewBox="-20 -20 240 300" style="position:absolute; inset:0; width:100%; height:100%; overflow:visible;">
+                <defs>
+                    <filter id="wet3D_${uid}" x="-30%" y="-30%" width="160%" height="160%">
+                        <feDropShadow dx="0" dy="6" stdDeviation="4" flood-color="#050000" flood-opacity="0.95" result="shadow" />
+                        <feGaussianBlur in="SourceAlpha" stdDeviation="3" result="blur" />
+                        <feSpecularLighting in="blur" surfaceScale="6" specularConstant="1.8" specularExponent="35" lighting-color="#ffffff" result="specOut">
+                            <fePointLight x="100" y="130" z="200" />
+                        </feSpecularLighting>
+                        <feComposite in="specOut" in2="SourceAlpha" operator="in" result="specular" />
+                        <feMerge>
+                            <feMergeNode in="shadow" />
+                            <feMergeNode in="SourceGraphic" />
+                            <feMergeNode in="specular" />
+                        </feMerge>
+                    </filter>
+                    
+                    <linearGradient id="boneGrad_${uid}" x1="0%" y1="0%" x2="100%" y2="0%">
+                        <stop offset="0%" stop-color="#2a0808" />
+                        <stop offset="15%" stop-color="#d4cbb3" />
+                        <stop offset="45%" stop-color="#fdf9ec" />
+                        <stop offset="85%" stop-color="#8a7350" />
+                        <stop offset="100%" stop-color="#4a2818" />
+                    </linearGradient>
+
+                    <linearGradient id="bloodRootUpper_${uid}" x1="0%" y1="0%" x2="0%" y2="100%">
+                        <stop offset="0%" stop-color="#4a0000" stop-opacity="1" />
+                        <stop offset="25%" stop-color="#990000" stop-opacity="0.9" />
+                        <stop offset="45%" stop-color="#ff0000" stop-opacity="0.2" />
+                        <stop offset="70%" stop-color="#ffffff" stop-opacity="0" />
+                    </linearGradient>
+
+                    <linearGradient id="bloodRootLower_${uid}" x1="0%" y1="100%" x2="0%" y2="0%">
+                        <stop offset="0%" stop-color="#4a0000" stop-opacity="1" />
+                        <stop offset="25%" stop-color="#990000" stop-opacity="0.9" />
+                        <stop offset="45%" stop-color="#ff0000" stop-opacity="0.2" />
+                        <stop offset="70%" stop-color="#ffffff" stop-opacity="0" />
+                    </linearGradient>
+
+                    <!-- Compact Gums Fading to Zero Opacity -->
+                    <linearGradient id="gumUpper_${uid}" x1="0%" y1="100%" x2="0%" y2="0%">
+                        <stop offset="0%" stop-color="#55000d" stop-opacity="0.95" />
+                        <stop offset="45%" stop-color="#330007" stop-opacity="0.7" />
+                        <stop offset="80%" stop-color="#180003" stop-opacity="0.2" />
+                        <stop offset="100%" stop-color="#100002" stop-opacity="0" />
+                    </linearGradient>
+
+                    <linearGradient id="gumLower_${uid}" x1="0%" y1="0%" x2="0%" y2="100%">
+                        <stop offset="0%" stop-color="#55000d" stop-opacity="0.95" />
+                        <stop offset="45%" stop-color="#330007" stop-opacity="0.7" />
+                        <stop offset="80%" stop-color="#180003" stop-opacity="0.2" />
+                        <stop offset="100%" stop-color="#100002" stop-opacity="0" />
+                    </linearGradient>
+
+                    <filter id="gumSoft_${uid}" x="-20%" y="-20%" width="140%" height="140%">
+                        <feGaussianBlur in="SourceGraphic" stdDeviation="2.5" />
+                    </filter>
+                </defs>
+
+                <!-- UPPER JAW -->
+                <g id="warg-upper_${uid}" style="transform: translateY(-42px) scale(0.73); transform-origin: 100px 100px; transition: transform 0.20s cubic-bezier(0.18, 0.85, 0.25, 1.15);">
+                    <!-- Compact Faded Gums -->
+                    <path d="M -20 48 Q 92 82 205 48 Q 150 20 92 22 Q 30 20 -20 48 Z" fill="url(#gumUpper_${uid})" filter="url(#gumSoft_${uid})" />
+                    <!-- 3D Base Fangs -->
+                    <g fill="url(#boneGrad_${uid})" filter="url(#wet3D_${uid})">
+                        <path d="${upperTeethPath}" />
+                    </g>
+                    <!-- Bloody Root Overlay -->
+                    <g fill="url(#bloodRootUpper_${uid})" style="mix-blend-mode: multiply;">
+                        <path d="${upperTeethPath}" />
+                    </g>
+                </g>
+
+                <!-- LOWER JAW -->
+                <g id="warg-lower_${uid}" style="transform: translateY(42px) scale(0.73); transform-origin: 100px 160px; transition: transform 0.20s cubic-bezier(0.18, 0.85, 0.25, 1.15);">
+                    <!-- Compact Faded Gums -->
+                    <path d="M -15 212 Q 92 178 200 212 Q 150 240 92 238 Q 35 240 -15 212 Z" fill="url(#gumLower_${uid})" filter="url(#gumSoft_${uid})" />
+                    <!-- 3D Base Fangs -->
+                    <g fill="url(#boneGrad_${uid})" filter="url(#wet3D_${uid})">
+                        <path d="${lowerTeethPath}" />
+                    </g>
+                    <!-- Bloody Root Overlay -->
+                    <g fill="url(#bloodRootLower_${uid})" style="mix-blend-mode: multiply;">
+                        <path d="${lowerTeethPath}" />
+                    </g>
+                </g>
+            </svg>
+            <canvas class="chomp-canvas" width="${w}" height="${h}" style="position:absolute; inset:0; width:100%; height:100%; pointer-events:none;"></canvas>
+        `;
+        document.body.appendChild(ghost);
+
+        const upper = ghost.querySelector(`#warg-upper_${uid}`);
+        const lower = ghost.querySelector(`#warg-lower_${uid}`);
+        const canvas = ghost.querySelector('.chomp-canvas');
+        const ctx = canvas ? canvas.getContext('2d') : null;
+
+        const isExhausted = torchEl.classList.contains('exhausted');
+        const baseRot = isExhausted ? 'rotate(90deg) ' : '';
+
+        const particles = [];
+        let shockwaveAlpha = 1;
+        let shockwaveRadius = 10;
+        let animId = null;
+
+        const spawnImpactSparks = () => {
+            const cx = w / 2;
+            const cy = h / 2;
+            
+            for (let i = 0; i < 110; i++) {
+                const ang = Math.random() * Math.PI * 2;
+                const spd = 4 + Math.random() * 16;
+                const isSpark = Math.random() > 0.92;
+                const isChunk = Math.random() > 0.86;
+                
+                particles.push({
+                    x: cx + (Math.random() - 0.5) * 32,
+                    y: cy + (Math.random() - 0.5) * 16,
+                    vx: Math.cos(ang) * spd,
+                    vy: Math.sin(ang) * spd + 1.8,
+                    size: isChunk ? (6 + Math.random() * 7) : (1.8 + Math.random() * 4.5),
+                    color: isSpark ? '#f59e0b' : (Math.random() > 0.7 ? '#ff1a1a' : (Math.random() > 0.5 ? '#990000' : '#4d0000')),
+                    alpha: 1,
+                    decay: 0.018 + Math.random() * 0.035,
+                    stretch: isSpark ? 1 : (1 + Math.random() * 2.5),
+                    isChunk: isChunk
+                });
+            }
+        };
+
+        const renderLoop = () => {
+            if (!ctx) return;
+            ctx.clearRect(0, 0, w, h);
+            
+            if (shockwaveAlpha > 0) {
+                ctx.save();
+                ctx.globalAlpha = shockwaveAlpha;
+                ctx.beginPath();
+                ctx.arc(w / 2, h / 2, shockwaveRadius, 0, Math.PI * 2);
+                ctx.lineWidth = 12;
+                ctx.strokeStyle = '#ff0000';
+                ctx.stroke();
+                ctx.fillStyle = 'rgba(255, 0, 0, 0.35)';
+                ctx.fill();
+                ctx.restore();
+                
+                shockwaveRadius += 14;
+                shockwaveAlpha -= 0.10;
+            }
+
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.x += p.vx;
+                p.y += p.vy;
+                p.vy += 0.22;
+                p.alpha -= p.decay;
+                
+                if (p.alpha <= 0) {
+                    particles.splice(i, 1);
+                    continue;
+                }
+                
+                ctx.save();
+                ctx.globalAlpha = Math.max(0, p.alpha);
+                ctx.fillStyle = p.color;
+                ctx.shadowColor = p.stretch > 1 ? '#ff0000' : p.color;
+                ctx.shadowBlur = p.size * 2;
+                
+                if (p.isChunk) {
+                    ctx.translate(p.x, p.y);
+                    ctx.rotate(p.vx * 0.1);
+                    ctx.beginPath();
+                    ctx.moveTo(-p.size, -p.size/2);
+                    ctx.lineTo(p.size, -p.size);
+                    ctx.lineTo(p.size/2, p.size);
+                    ctx.lineTo(-p.size/2, p.size/2);
+                    ctx.fill();
+                } else if (p.stretch > 1) {
+                    const angle = Math.atan2(p.vy, p.vx);
+                    ctx.translate(p.x, p.y);
+                    ctx.rotate(angle);
+                    ctx.beginPath();
+                    if (ctx.ellipse) {
+                        ctx.ellipse(0, 0, p.size * p.stretch, p.size, 0, 0, Math.PI * 2);
+                    } else {
+                        ctx.arc(0, 0, p.size, 0, Math.PI * 2);
+                    }
+                    ctx.fill();
+                } else {
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+                ctx.restore();
+            }
+            
+            if (particles.length > 0 || shockwaveAlpha > 0) {
+                animId = requestAnimationFrame(renderLoop);
+            }
+        };
+
+        void ghost.offsetWidth;
+
+        // Step 1: Faster, aggressive snap shut
+        setTimeout(() => {
+            if (upper) upper.style.transform = 'translateY(12px) scale(0.73)';
+            if (lower) lower.style.transform = 'translateY(-12px) scale(0.73)';
+        }, 50);
+
+        // Step 2: Impact crunch as teeth interlock
+        setTimeout(() => {
+            spawnImpactSparks();
+            renderLoop();
+
+            torchEl.style.transition = 'transform 0.08s ease-out, filter 0.08s ease-out';
+            torchEl.style.transform = `${baseRot}translate(-4px, 3px) rotate(-4deg) scale(0.94)`;
+            torchEl.style.filter = 'brightness(1.9) contrast(1.4) drop-shadow(0 0 24px #dc2626) drop-shadow(0 0 8px #f59e0b)';
+
+            if (window.LotrEngine && window.LotrEngine.window && window.LotrEngine.window.screenShake) {
+                window.LotrEngine.window.screenShake(12, 220);
+            }
+        }, 230);
+
+        // Step 3: Dissolve and disappear sooner
+        setTimeout(() => {
+            ghost.style.transition = 'opacity 0.24s cubic-bezier(0.4, 0, 0.2, 1), transform 0.24s cubic-bezier(0.4, 0, 0.2, 1), filter 0.24s ease-out';
+            ghost.style.opacity = '0';
+            ghost.style.transform = 'scale(1.15)';
+            ghost.style.filter = 'blur(8px) contrast(1.6)';
+
+            torchEl.style.transition = 'transform 0.22s ease-out, filter 0.22s ease-out';
+            torchEl.style.transform = isExhausted ? 'rotate(90deg)' : '';
+            torchEl.style.filter = '';
+        }, 460);
+
+        // Step 4: Early cleanup
+        setTimeout(() => {
+            if (animId) cancelAnimationFrame(animId);
+            ghost.remove();
+            if (isExhausted) {
+                torchEl.style.transform = '';
+            }
+            if (onComplete) onComplete();
+        }, 720);
+    };
+
+    window.triggerCavernWargFeralLeap = function(ghost, startRect, targetLeft, targetTop, targetW, targetH) {
+        const canvas = document.createElement('canvas');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        canvas.style.cssText = 'position:fixed; inset:0; width:100vw; height:100vh; pointer-events:none; z-index:1998;';
+        document.body.appendChild(canvas);
+        const ctx = canvas.getContext('2d');
+
+        try {
+            const snd = new Audio('./sound_effects/dark_of_mirkwood/cavern_warg_attack.mp3');
+            snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25) * 0.85;
+            snd.playbackRate = 1.4;
+            snd.play().catch(() => {});
+        } catch(e) {}
+
+        const duration = 540;
+        const startTime = performance.now();
+        const sx = startRect.left;
+        const sy = startRect.top;
+        const sw = startRect.width;
+        const sh = startRect.height;
+        const dx = targetLeft;
+        const dy = targetTop;
+        const dw = targetW;
+        const dh = targetH;
+        const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
+        const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
+
+        const bowDir = dx < sx ? -1 : 1;
+        const ctrlX = sx + (dx - sx) * 0.42 + bowDir * 55;
+
+        const ribbons = [];
+        const streaks = [];
+        const impactParticles = [];
+        let landed = false;
+
+        ghost.style.boxShadow = '0 0 25px rgba(220, 20, 60, 0.85), 0 12px 28px rgba(0,0,0,0.9)';
+
+        const loop = (now) => {
+            const elapsed = now - startTime;
+            const p = Math.min(1, elapsed / duration);
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (p < 1) {
+                const t = p;
+                const inv = 1 - t;
+
+                // Parabolic ballistic arc: curves cleanly up from sy, cresting horizontally at dy
+                const curX = inv * inv * sx + 2 * inv * t * ctrlX + t * t * dx;
+                const curY = Math.max(dy, dy + (sy - dy) * (inv * inv));
+
+                const curScaleX = (sw + (dw - sw) * t) / cardW;
+                const curScaleY = (sh + (dh - sh) * t) / cardH;
+
+                // Dynamic beast jump: launch compression, mid-air apex stretch, banking roll
+                let stretchX = 1;
+                let stretchY = 1;
+                if (p < 0.1) {
+                    const cT = p / 0.1;
+                    stretchX = 1 + 0.08 * (1 - cT);
+                    stretchY = 1 - 0.08 * (1 - cT);
+                } else {
+                    const midSin = Math.sin(Math.PI * p);
+                    stretchX = 1 - 0.05 * midSin;
+                    stretchY = 1 + 0.12 * midSin;
+                }
+
+                const apexZoom = 1 + 0.14 * Math.sin(Math.PI * p);
+                const rotZ = -14 * Math.sin(Math.PI * p) * (1 - 0.25 * p);
+                const tiltX = 10 * Math.sin(Math.PI * p);
+
+                ghost.style.left = `${curX}px`;
+                ghost.style.top = `${curY}px`;
+                ghost.style.transform = `perspective(700px) rotateX(${tiltX}deg) rotateZ(${rotZ}deg) scale(${curScaleX * apexZoom * stretchX}, ${curScaleY * apexZoom * stretchY})`;
+
+                const renderW = cardW * curScaleX * apexZoom;
+                const renderH = cardH * curScaleY * apexZoom;
+                const rad = (rotZ * Math.PI) / 180;
+                const cosR = Math.cos(rad);
+                const sinR = Math.sin(rad);
+
+                const botLeft = { x: curX - sinR * renderH, y: curY + cosR * renderH };
+                const botRight = { x: curX + cosR * renderW - sinR * renderH, y: curY + sinR * renderW + cosR * renderH };
+                const botMid = { x: (botLeft.x + botRight.x) / 2, y: (botLeft.y + botRight.y) / 2 };
+
+                ribbons.push({ p1: botLeft, p2: botRight, pm: botMid, alpha: 0.95 });
+
+                // Crisp, shorter speed dashes that do not smear across the screen
+                if (Math.random() < 0.8) {
+                    const sT = Math.random();
+                    const spawnX = botLeft.x + (botRight.x - botLeft.x) * sT;
+                    const spawnY = botLeft.y + (botRight.y - botLeft.y) * sT;
+                    streaks.push({
+                        x: spawnX, y: spawnY,
+                        vx: (sx - dx) * 0.035 + (Math.random() - 0.5) * 1.5,
+                        vy: (sy - dy) * 0.035 + (Math.random() - 0.5) * 1.5,
+                        width: 1.2 + Math.random() * 1.6,
+                        color: Math.random() > 0.4 ? '#ff2a4b' : '#99001a',
+                        alpha: 1, decay: 0.08 + Math.random() * 0.04
+                    });
+                }
+            } else if (!landed) {
+                landed = true;
+                ghost.style.left = `${dx}px`;
+                ghost.style.top = `${dy}px`;
+                ghost.style.boxShadow = '0 8px 24px rgba(0,0,0,0.6)';
+
+                // Crisp touchdown settle
+                ghost.style.transform = `scale(${(dw / cardW) * 1.04}, ${(dh / cardH) * 0.96}) rotate(0deg)`;
+                setTimeout(() => {
+                    ghost.style.transform = `scale(${dw / cardW}, ${dh / cardH}) rotate(0deg)`;
+                }, 75);
+
+                if (window.LotrEngine && window.LotrEngine.window && window.LotrEngine.window.screenShake) {
+                    window.LotrEngine.window.screenShake(10, 220);
+                }
+
+                for (let i = 0; i < 16; i++) {
+                    const ang = Math.random() * Math.PI * 2;
+                    const spd = 1.5 + Math.random() * 4.5;
+                    impactParticles.push({
+                        x: dx + dw / 2, y: dy + dh / 2,
+                        vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd * 0.4,
+                        size: 2 + Math.random() * 2.5,
+                        color: Math.random() > 0.45 ? '#800010' : '#ff2a4b',
+                        alpha: 1, decay: 0.06
+                    });
+                }
+            }
+
+            // Sleek, tapering ribbon wake
+            for (let i = ribbons.length - 1; i > 0; i--) {
+                const rCur = ribbons[i];
+                const rPrev = ribbons[i - 1];
+                rCur.alpha -= 0.085;
+                if (rCur.alpha <= 0) { ribbons.splice(i, 1); continue; }
+
+                ctx.save();
+                ctx.globalAlpha = Math.max(0, rCur.alpha);
+                const grad = ctx.createLinearGradient(rPrev.pm.x, rPrev.pm.y, rCur.pm.x, rCur.pm.y);
+                grad.addColorStop(0, 'rgba(128, 0, 16, 0)');
+                grad.addColorStop(0.5, 'rgba(180, 0, 30, 0.65)');
+                grad.addColorStop(1, 'rgba(255, 30, 70, 0.9)');
+                ctx.fillStyle = grad;
+
+                ctx.beginPath();
+                ctx.moveTo(rPrev.p1.x, rPrev.p1.y);
+                ctx.lineTo(rCur.p1.x, rCur.p1.y);
+                ctx.lineTo(rCur.p2.x, rCur.p2.y);
+                ctx.lineTo(rPrev.p2.x, rPrev.p2.y);
+                ctx.closePath();
+                ctx.fill();
+
+                ctx.strokeStyle = `rgba(255, 100, 120, ${rCur.alpha * 0.85})`;
+                ctx.lineWidth = 1.8;
+                ctx.beginPath();
+                ctx.moveTo(rPrev.pm.x, rPrev.pm.y);
+                ctx.lineTo(rCur.pm.x, rCur.pm.y);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            // Tight, short speed slashes
+            for (let i = streaks.length - 1; i >= 0; i--) {
+                const s = streaks[i];
+                s.x += s.vx; s.y += s.vy; s.alpha -= s.decay;
+                if (s.alpha <= 0) { streaks.splice(i, 1); continue; }
+                ctx.save();
+                ctx.globalAlpha = Math.max(0, s.alpha);
+                ctx.strokeStyle = s.color;
+                ctx.lineWidth = s.width;
+                ctx.lineCap = 'round';
+                ctx.beginPath();
+                ctx.moveTo(s.x, s.y);
+                ctx.lineTo(s.x - s.vx * 1.3, s.y - s.vy * 1.3);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            for (let i = impactParticles.length - 1; i >= 0; i--) {
+                const ip = impactParticles[i];
+                ip.x += ip.vx; ip.y += ip.vy; ip.alpha -= ip.decay;
+                if (ip.alpha <= 0) { impactParticles.splice(i, 1); continue; }
+                ctx.save();
+                ctx.globalAlpha = Math.max(0, ip.alpha);
+                ctx.fillStyle = ip.color;
+                ctx.beginPath();
+                ctx.arc(ip.x, ip.y, ip.size, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }
+
+            if (p < 1 || ribbons.length > 0 || streaks.length > 0 || impactParticles.length > 0) {
+                requestAnimationFrame(loop);
+            } else {
+                canvas.remove();
+            }
+        };
+        requestAnimationFrame(loop);
+    };
+
+    window.triggerChieftainShadowTether = function(ghost, startRect, targetLeft, targetTop, targetW, targetH) {
+        const uid = Math.random().toString(36).slice(2,9);
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.style.cssText = 'position:fixed; inset:0; width:100vw; height:100vh; pointer-events:none; z-index:1995; overflow:visible;';
+
+        const canvas = document.createElement('canvas');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        canvas.style.cssText = 'position:fixed; inset:0; width:100vw; height:100vh; pointer-events:none; z-index:2005;';
+
+        const anchorX = targetLeft + targetW / 2;
+        const anchorY = targetTop + targetH / 2;
+        const startX = startRect.left + startRect.width / 2;
+        const startY = startRect.top + startRect.height / 2;
+
+        svg.innerHTML = `
+            <defs>
+                <filter id="auraGlow_${uid}" x="-50%" y="-50%" width="200%" height="200%">
+                    <feGaussianBlur in="SourceGraphic" stdDeviation="6" result="blur1" />
+                    <feGaussianBlur in="SourceGraphic" stdDeviation="16" result="blur2" />
+                    <feMerge>
+                        <feMergeNode in="blur2" />
+                        <feMergeNode in="blur1" />
+                        <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                </filter>
+                <filter id="voidTurbulence_${uid}" x="-30%" y="-30%" width="160%" height="160%">
+                    <feTurbulence type="fractalNoise" baseFrequency="0.04" numOctaves="3" result="noise">
+                        <animate attributeName="baseFrequency" values="0.035;0.055;0.035" dur="2.5s" repeatCount="indefinite" />
+                    </feTurbulence>
+                    <feColorMatrix type="matrix" values="1 0 0 0 0.9   0 1 0 0 0.1   0 0 1 0 0.2   0 0 0 3.5 -0.8" in="noise" result="coloredNoise" />
+                    <feComposite operator="in" in="coloredNoise" in2="SourceGraphic" result="textured" />
+                    <feDisplacementMap in="textured" in2="noise" scale="18" xChannelSelector="R" yChannelSelector="G" />
+                </filter>
+                <radialGradient id="portalGrad_${uid}" cx="50%" cy="50%" r="50%">
+                    <stop offset="0%" stop-color="#000000" />
+                    <stop offset="50%" stop-color="#140005" />
+                    <stop offset="78%" stop-color="#550010" />
+                    <stop offset="94%" stop-color="#cc0028" />
+                    <stop offset="100%" stop-color="#ff2a4b" stop-opacity="0.85" />
+                </radialGradient>
+                <radialGradient id="auraWaveGrad_${uid}" cx="50%" cy="50%" r="50%">
+                    <stop offset="45%" stop-color="#ff1a40" stop-opacity="0" />
+                    <stop offset="80%" stop-color="#ff1a40" stop-opacity="0.4" />
+                    <stop offset="95%" stop-color="#ff758f" stop-opacity="0.75" />
+                    <stop offset="100%" stop-color="#ffffff" stop-opacity="0" />
+                </radialGradient>
+                <radialGradient id="coronalFlareGrad_${uid}" cx="50%" cy="50%" r="50%">
+                    <stop offset="25%" stop-color="#ff2a4b" stop-opacity="0.65" />
+                    <stop offset="60%" stop-color="#80001a" stop-opacity="0.25" />
+                    <stop offset="100%" stop-color="#000000" stop-opacity="0" />
+                </radialGradient>
+                <radialGradient id="innerVoidGrad_${uid}" cx="50%" cy="50%" r="50%">
+                    <stop offset="0%" stop-color="#000000" stop-opacity="0.96" />
+                    <stop offset="45%" stop-color="#0d0005" stop-opacity="0.85" />
+                    <stop offset="75%" stop-color="#2a000a" stop-opacity="0.45" />
+                    <stop offset="100%" stop-color="#2a000a" stop-opacity="0" />
+                </radialGradient>
+            </defs>
+            <g id="epic-portal_${uid}" transform="translate(${anchorX}, ${anchorY}) scale(0)" opacity="0">
+                <circle cx="0" cy="0" r="115" fill="url(#coronalFlareGrad_${uid})" filter="url(#auraGlow_${uid})" />
+                <g id="portal-rays_${uid}" filter="url(#auraGlow_${uid})" opacity="0.8">
+                    ${Array.from({length: 12}).map((_, i) => `<ellipse cx="0" cy="-65" rx="14" ry="32" fill="url(#coronalFlareGrad_${uid})" transform="rotate(${i * 30})" opacity="0.6" />`).join('')}
+                </g>
+                <circle id="aura-wave1_${uid}" cx="0" cy="0" r="60" fill="url(#auraWaveGrad_${uid})" filter="url(#auraGlow_${uid})" />
+                <circle id="aura-wave2_${uid}" cx="0" cy="0" r="78" fill="url(#auraWaveGrad_${uid})" filter="url(#auraGlow_${uid})" />
+                <circle id="aura-wave3_${uid}" cx="0" cy="0" r="96" fill="url(#auraWaveGrad_${uid})" filter="url(#auraGlow_${uid})" />
+                <circle cx="0" cy="0" r="56" fill="url(#portalGrad_${uid})" filter="url(#voidTurbulence_${uid})" />
+                <circle cx="0" cy="0" r="44" fill="url(#innerVoidGrad_${uid})" style="mix-blend-mode: multiply;" />
+                <circle cx="0" cy="0" r="32" fill="url(#innerVoidGrad_${uid})" filter="url(#auraGlow_${uid})" />
+            </g>
+        `;
+        document.body.appendChild(svg);
+        document.body.appendChild(canvas);
+
+        const ctx = canvas.getContext('2d');
+        const portal = svg.querySelector(`#epic-portal_${uid}`);
+        const rays = svg.querySelector(`#portal-rays_${uid}`);
+        const wave1 = svg.querySelector(`#aura-wave1_${uid}`);
+        const wave2 = svg.querySelector(`#aura-wave2_${uid}`);
+        const wave3 = svg.querySelector(`#aura-wave3_${uid}`);
+
+        const particles = [];
+        const spawnParticle = (x, y, vx, vy, size, color, life, type) => {
+            particles.push({x, y, vx, vy, size, color, alpha: 1, life, maxLife: life, type});
+        };
+
+        const startTime = performance.now();
+        const openDuration = 450;
+        const launchDuration = 140;
+        const totalDuration = 1010;
+        let chainsSoundPlayed = false;
+        let hasExploded = false;
+        let animId = null;
+
+        const getBezierXY = (t, p0, p1, p2, p3) => {
+            const u = 1 - t, tt = t * t, uu = u * u, uuu = uu * u, ttt = tt * t;
+            return {
+                x: uuu * p0.x + 3 * uu * t * p1.x + 3 * u * tt * p2.x + ttt * p3.x,
+                y: uuu * p0.y + 3 * uu * t * p1.y + 3 * u * tt * p2.y + ttt * p3.y
+            };
+        };
+
+        const getBezierAngle = (t, p0, p1, p2, p3) => {
+            const u = 1 - t;
+            const dx = 3*u*u*(p1.x - p0.x) + 6*u*t*(p2.x - p1.x) + 3*t*t*(p3.x - p2.x);
+            const dy = 3*u*u*(p1.y - p0.y) + 6*u*t*(p2.y - p1.y) + 3*t*t*(p3.y - p2.y);
+            return Math.atan2(dy, dx);
+        };
+
+        const loop = (now) => {
+            const elapsed = now - startTime;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 1. Portal Scale Up & Pulsing Emanating Aura Logic
+            if (elapsed < totalDuration && !hasExploded) {
+                const openProgress = Math.min(1, elapsed / openDuration);
+                const scaleVal = 1 - Math.pow(1 - openProgress, 3);
+                if (portal) {
+                    portal.setAttribute('transform', `translate(${anchorX}, ${anchorY}) scale(${scaleVal})`);
+                    portal.setAttribute('opacity', String(Math.min(1, elapsed / 200)));
+                }
+
+                const w1 = (elapsed * 0.0016) % 1;
+                const w2 = ((elapsed * 0.0016) + 0.33) % 1;
+                const w3 = ((elapsed * 0.0016) + 0.66) % 1;
+                if (wave1) { wave1.setAttribute('r', String(50 + w1 * 50)); wave1.setAttribute('opacity', String((1 - w1) * 0.85)); }
+                if (wave2) { wave2.setAttribute('r', String(50 + w2 * 50)); wave2.setAttribute('opacity', String((1 - w2) * 0.85)); }
+                if (wave3) { wave3.setAttribute('r', String(50 + w3 * 50)); wave3.setAttribute('opacity', String((1 - w3) * 0.85)); }
+                if (rays) { rays.setAttribute('transform', `rotate(${elapsed * 0.04})`); }
+            }
+
+            if (!hasExploded && elapsed >= openDuration && elapsed % 3 === 0) {
+                const ang = Math.random() * Math.PI * 2;
+                spawnParticle(
+                    anchorX + Math.cos(ang) * 25, anchorY + Math.sin(ang) * 25,
+                    Math.cos(ang) * 3, Math.sin(ang) * 3,
+                    15 + Math.random() * 25, '#0a0a0a', 30 + Math.random() * 20, 'smoke'
+                );
+            }
+
+            // Play goblin chieftain return sound when the shadow tether launches
+            if (elapsed >= openDuration && !chainsSoundPlayed) {
+                chainsSoundPlayed = true;
+                try {
+                    const snd = new Audio('./sound_effects/dark_of_mirkwood/goblin_chieftain_return.mp3');
+                    snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                    snd.play().catch(() => {});
+                } catch (e) {}
+                if (ghost) {
+                    ghost.style.boxShadow = '0 0 40px #ff0000, 0 0 80px rgba(120, 0, 40, 0.9)';
+                    ghost.style.filter = 'contrast(1.3) brightness(1.2)';
+                }
+            }
+
+            // 2. Chain Math & Harpoon (Fires only after portal opens)
+            if (elapsed >= openDuration && !hasExploded) {
+                const chainElapsed = elapsed - openDuration;
+                const gRect = ghost ? ghost.getBoundingClientRect() : { left: startX, top: startY, width: 0, height: 0 };
+                const curX = gRect.left + gRect.width / 2;
+                const curY = gRect.top + gRect.height / 2;
+
+                let tipX, tipY;
+                if (chainElapsed <= launchDuration) {
+                    const p = Math.pow(chainElapsed / launchDuration, 1.5);
+                    tipX = anchorX + (startX - anchorX) * p;
+                    tipY = anchorY + (startY - anchorY) * p;
+                } else {
+                    tipX = curX;
+                    tipY = curY;
+                }
+
+                const dx = tipX - anchorX;
+                const dy = tipY - anchorY;
+                const dist = Math.hypot(dx, dy) || 1;
+                const nx = -dy / dist;
+                const ny = dx / dist;
+
+                const progress = Math.min(1, chainElapsed / (totalDuration - openDuration));
+                const rattle = chainElapsed > launchDuration ? 45 : 10;
+                const n1X = (Math.random() - 0.5) * rattle;
+                const n1Y = (Math.random() - 0.5) * rattle;
+                const n2X = (Math.random() - 0.5) * rattle;
+                const n2Y = (Math.random() - 0.5) * rattle;
+
+                const whip = Math.sin(progress * Math.PI * 5) * (1 - progress) * 35;
+                const sag1 = Math.sin(progress * Math.PI) * 45 + whip;
+                const sag2 = -Math.sin(progress * Math.PI) * 35 - whip;
+
+                const p0 = {x: anchorX, y: anchorY};
+                const p1 = {x: anchorX + dx * 0.33 + nx * sag1 + n1X, y: anchorY + dy * 0.33 + ny * sag1 + n1Y};
+                const p2 = {x: anchorX + dx * 0.66 + nx * sag2 + n2X, y: anchorY + dy * 0.66 + ny * sag2 + n2Y};
+                const p3 = {x: tipX, y: tipY};
+
+                const numLinks = Math.max(4, Math.floor(dist / 14));
+                
+                for (let i = 0; i <= numLinks; i++) {
+                    const t = i / numLinks;
+                    const pos = getBezierXY(t, p0, p1, p2, p3);
+                    const ang = getBezierAngle(t, p0, p1, p2, p3);
+                    const isFlat = i % 2 === 0;
+
+                    ctx.save();
+                    ctx.translate(pos.x, pos.y);
+                    ctx.rotate(ang);
+
+                    if (isFlat) {
+                        ctx.fillStyle = '#2a1610';
+                        ctx.strokeStyle = '#59321c';
+                        ctx.lineWidth = 1.5;
+                        if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(-12, -7, 24, 14, 5); ctx.fill(); ctx.stroke(); }
+                        else { ctx.fillRect(-12, -7, 24, 14); ctx.strokeRect(-12, -7, 24, 14); }
+                        ctx.fillStyle = 'rgba(0,0,0,0.85)';
+                        if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(-6, -3, 12, 6, 2); ctx.fill(); }
+                        else { ctx.fillRect(-6, -3, 12, 6); }
+                    } else {
+                        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                        ctx.fillRect(-10, -2, 20, 6);
+                        const grad = ctx.createLinearGradient(0, -4, 0, 4);
+                        grad.addColorStop(0, '#59321c');
+                        grad.addColorStop(0.3, '#d1d5db');
+                        grad.addColorStop(0.7, '#4b5563');
+                        grad.addColorStop(1, '#2a1610');
+                        ctx.fillStyle = grad;
+                        if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(-14, -4, 28, 8, 3); ctx.fill(); }
+                        else { ctx.fillRect(-14, -4, 28, 8); }
+                    }
+                    ctx.restore();
+                }
+
+                // Draw Harpoon Claw
+                ctx.save();
+                ctx.translate(tipX, tipY);
+                ctx.rotate(Math.atan2(dy, dx));
+                ctx.shadowColor = '#ff1a40';
+                ctx.shadowBlur = 12;
+                ctx.fillStyle = '#111';
+                ctx.strokeStyle = '#666';
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                ctx.moveTo(0, 0);
+                ctx.lineTo(-18, -22);
+                ctx.lineTo(-12, -6);
+                ctx.lineTo(-45, -6);
+                ctx.lineTo(-45, 6);
+                ctx.lineTo(-12, 6);
+                ctx.lineTo(-18, 22);
+                ctx.closePath();
+                ctx.fill();
+                ctx.stroke();
+                ctx.strokeStyle = '#ccc';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(0, 0);
+                ctx.lineTo(-18, -22);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            // 3. Shatter & Explode upon arrival
+            if (elapsed >= totalDuration && !hasExploded) {
+                hasExploded = true;
+                svg.style.display = 'none';
+
+                if (window.LotrEngine && window.LotrEngine.window && window.LotrEngine.window.screenShake) {
+                    window.LotrEngine.window.screenShake(30, 450);
+                }
+
+                for (let i = 0; i < 65; i++) {
+                    const ang = Math.random() * Math.PI * 2;
+                    const spd = 6 + Math.random() * 12;
+                    spawnParticle(
+                        anchorX, anchorY,
+                        Math.cos(ang) * spd, Math.sin(ang) * spd,
+                        5 + Math.random() * 9, Math.random() > 0.5 ? '#111' : '#333',
+                        25 + Math.random() * 15, 'shard'
+                    );
+                }
+                for (let i = 0; i < 40; i++) {
+                    spawnParticle(
+                        anchorX + (Math.random() - 0.5) * 40, anchorY + (Math.random() - 0.5) * 40,
+                        (Math.random() - 0.5) * 8, (Math.random() - 0.5) * 8,
+                        30 + Math.random() * 55, '#050505', 40 + Math.random() * 20, 'smoke'
+                    );
+                }
+                for (let i = 0; i < 20; i++) {
+                    const ang = Math.random() * Math.PI * 2;
+                    const spd = 4 + Math.random() * 8;
+                    spawnParticle(
+                        anchorX, anchorY,
+                        Math.cos(ang) * spd, Math.sin(ang) * spd,
+                        3 + Math.random() * 4, '#ff3030', 30 + Math.random() * 10, 'spark'
+                    );
+                }
+            }
+
+            // 4. Render Canvas Particles
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.x += p.vx;
+                p.y += p.vy;
+                p.life--;
+                const pNorm = Math.max(0, p.life / p.maxLife);
+
+                ctx.save();
+                ctx.globalAlpha = pNorm;
+                if (p.type === 'smoke') {
+                    ctx.fillStyle = p.color;
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.size * (1 + (1 - pNorm) * 0.5), 0, Math.PI * 2);
+                    ctx.fill();
+                } else if (p.type === 'spark') {
+                    ctx.fillStyle = p.color;
+                    ctx.shadowColor = '#ff1a40';
+                    ctx.shadowBlur = 8;
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.size * pNorm, 0, Math.PI * 2);
+                    ctx.fill();
+                } else if (p.type === 'shard') {
+                    ctx.fillStyle = p.color;
+                    ctx.translate(p.x, p.y);
+                    ctx.rotate(p.life * 0.4);
+                    ctx.fillRect(-p.size/2, -p.size/3, p.size, p.size * 1.2);
+                }
+                ctx.restore();
+
+                if (p.life <= 0) particles.splice(i, 1);
+            }
+
+            if (elapsed < totalDuration + 900) {
+                animId = requestAnimationFrame(loop);
+            } else {
+                if (animId) cancelAnimationFrame(animId);
+                if (svg.parentNode) svg.remove();
+                if (canvas.parentNode) canvas.remove();
+            }
+        };
+
+        animId = requestAnimationFrame(loop);
+
+        setTimeout(() => {
+            if (svg.parentNode) svg.remove();
+            if (canvas.parentNode) canvas.remove();
+        }, totalDuration + 1200);
+    };
 
     const origAnimateReturnToStaging = window.animateReturnToStaging;
-    if (origAnimateReturnToStaging && !window._nibinReturnStagingPatched) {
+    if (!window._nibinReturnStagingPatched) {
         window._nibinReturnStagingPatched = true;
         window.animateReturnToStaging = function(card, callback) {
+            if (!card) {
+                if (callback) callback();
+                return;
+            }
             if (card) card._returnedToStaging = true;
             const engine = window.LotrEngine;
-            const game = engine ? engine.game : null;
+            const game = engine ? engine.game : window.game;
 
             if (card && game && game.stagingArea && game.stagingArea.some(x => x._uid === card._uid) && (!game.engagedEnemies || !game.engagedEnemies.some(x => x._uid === card._uid))) {
                 if (callback) callback();
@@ -1081,7 +7765,7 @@ if (typeof window !== 'undefined') {
 
             const parent = (game && card._attachedToUid) ? [...game.heroes, ...game.allies].find(x => x._uid === card._attachedToUid) : null;
             
-            if (card && card.id === 'nibin_cave_torch' && parent) {
+            if (card && card.id === 'nibin_cave_torch') {
                 const el = document.querySelector(`.is-attachment[data-uid="${card._uid}"]`) || document.querySelector(`[data-uid="${card._uid}"]`);
                 let sRect = el ? el.getBoundingClientRect() : null;
                 if (!sRect || (sRect.width === 0 && sRect.height === 0)) {
@@ -1097,14 +7781,220 @@ if (typeof window !== 'undefined') {
                     parent.attached = parent.attached.filter(a => a._uid !== card._uid);
                 }
                 delete card._attachedToUid;
+                card._removedFromGame = true;
 
                 window._triggerCaveTorchBurn(card, sRect, () => {
+                    if (game && game.stagingArea) {
+                        game.stagingArea = game.stagingArea.filter(c => c._uid !== card._uid && c.id !== 'nibin_cave_torch');
+                    }
                     if (engine && engine.render) engine.render();
                 });
                 return;
             }
-            if (origAnimateReturnToStaging) origAnimateReturnToStaging.apply(this, arguments);
+
+            // Pixel-perfect return to staging area (resolves snap-to-left bug)
+            let el = document.querySelector(`.zone-content [data-uid="${card._uid}"]`) || document.querySelector(`[data-uid="${card._uid}"]`);
+            const stagingContent = document.getElementById('staging-content');
+            if (!el || !stagingContent || !game) {
+                if (callback) callback();
+                return;
+            }
+
+            // Check if card has an engaged player label or was engaged with a player
+            const existingBadge = el ? el.querySelector('.engaged-player-label') : null;
+            let pIdx = card._engagedWithPlayerIdx;
+            if (pIdx === undefined && existingBadge) {
+                const match = existingBadge.textContent.match(/\d+/);
+                if (match) pIdx = parseInt(match[0], 10) - 1;
+            }
+            if (pIdx === undefined && game && game.engagedEnemies && game.engagedEnemies.some(e => e._uid === card._uid)) {
+                pIdx = (game.activeTabPlayerIdx !== undefined) ? game.activeTabPlayerIdx : 0;
+            }
+            const hadPlayerBadge = Boolean(existingBadge || (pIdx !== undefined) || (game && game.engagedEnemies && game.engagedEnemies.some(e => e._uid === card._uid)));
+            const badgeText = existingBadge ? existingBadge.textContent.trim() : `Player ${(pIdx !== undefined ? pIdx : 0) + 1}`;
+
+            const startRect = el.getBoundingClientRect();
+            const cardElHtml = el.innerHTML;
+            const cardElClass = el.className;
+
+            // 1. Calculate the exact slot and pixel offset that renderStaging uses
+            const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
+            const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
+            const stepX = cardW + 10;
+            const scale = window._resolutionScale || 1;
+            const occupiedSlots = new Set();
+            const cardPositionsMap = window.cardPositions || (engine && engine.window && engine.window.cardPositions) || {};
+
+            (game.stagingArea || []).forEach(c => {
+                if (c._uid !== card._uid && cardPositionsMap[c._uid]) {
+                    const slot = Math.round((cardPositionsMap[c._uid].x - 10) / stepX);
+                    occupiedSlots.add(slot);
+                }
+            });
+
+            let targetSlot = 0;
+            while (occupiedSlots.has(targetSlot)) {
+                targetSlot++;
+            }
+
+            const targetX = 10 + targetSlot * stepX;
+            const targetY = 19;
+
+            // Lock this slot for the card so both pre-render and post-render stay exactly at this position
+            cardPositionsMap[card._uid] = { x: targetX, y: targetY };
+            if (window.cardPositions) window.cardPositions[card._uid] = { x: targetX, y: targetY };
+            if (engine && engine.window && engine.window.cardPositions) engine.window.cardPositions[card._uid] = { x: targetX, y: targetY };
+
+            // 2. Measure stagingContent's viewport position
+            const stagingRect = stagingContent.getBoundingClientRect();
+            const targetLeft = stagingRect.left + (targetX * scale);
+            const targetTop = stagingRect.top + (targetY * scale);
+            const targetW = cardW * scale;
+            const targetH = cardH * scale;
+
+            // Hide original element in engaged area while ghost is flying
+            el.style.opacity = '0';
+
+            // 3. Create flight ghost with matching style and visuals
+            const isChieftain = (card.id === 'nibin_goblin_chieftain' || card.id === 'goblin_chieftain');
+            const ghost = document.createElement('div');
+            ghost.className = cardElClass;
+            ghost.style.cssText = `
+                position: fixed; z-index: 2000;
+                width: ${cardW}px; height: ${cardH}px;
+                left: ${startRect.left}px; top: ${startRect.top}px;
+                transform: scale(${startRect.width / cardW}, ${startRect.height / cardH});
+                transform-origin: top left;
+                transition: ${(card._cavernWargShadowReturn && !isChieftain) ? 'none' : (isChieftain ? 'all 0.42s cubic-bezier(0.65, 0, 0.15, 1)' : 'all 0.6s cubic-bezier(0.25, 0.8, 0.25, 1)')};
+                pointer-events: none;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+                border-radius: 6px; overflow: visible;
+            `;
+            ghost.innerHTML = cardElHtml;
+
+            // Ensure flight ghost visibly carries the Player # badge above the card if engaged
+            if (!ghost.querySelector('.engaged-player-label') && hadPlayerBadge) {
+                const flightBadge = document.createElement('div');
+                flightBadge.className = 'engaged-player-label';
+                flightBadge.style.cssText = `position:absolute; top:-14px; left:50%; transform:translateX(-50%); background:rgba(0,0,0,0.95); border:2px solid var(--blood, #990000); color:var(--blood-bright, #ff4d4d); padding:4px 12px; border-radius:6px; font-family:'Cinzel',serif; font-size:1.15rem; font-weight:900; z-index:40 !important; white-space:nowrap; box-shadow:0 4px 8px rgba(0,0,0,0.9);`;
+                flightBadge.textContent = badgeText;
+                ghost.appendChild(flightBadge);
+            }
+
+            document.body.appendChild(ghost);
+
+            if (isChieftain && window.triggerChieftainShadowTether) {
+                window.triggerChieftainShadowTether(ghost, startRect, targetLeft, targetTop, targetW, targetH);
+            } else if (card._cavernWargShadowReturn && window.triggerCavernWargFeralLeap) {
+                window.triggerCavernWargFeralLeap(ghost, startRect, targetLeft, targetTop, targetW, targetH);
+            } else if (card._surprisingSpeedShadowReturn) {
+                if (typeof window.playSurprisingSpeedEnemyReturnAudio === 'function') {
+                    window.playSurprisingSpeedEnemyReturnAudio();
+                }
+                if (window.createSurprisingSpeedWarp) {
+                    window.createSurprisingSpeedWarp(ghost);
+                }
+            } else if (card._skipReturnWhoosh) {
+                try {
+                    const snd = new Audio('./sound_effects/enemy_move.mp3');
+                    snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                    snd.play().catch(() => {});
+                } catch(e) {}
+            } else if (window.SoundFX && window.SoundFX.playWhoosh && !isChieftain) {
+                window.SoundFX.playWhoosh();
+            }
+
+            void ghost.offsetWidth;
+
+            // 4. Animate to the exact target coordinates where renderStaging places the card
+            if (isChieftain) {
+                setTimeout(() => {
+                    ghost.style.left = `${targetLeft}px`;
+                    ghost.style.top = `${targetTop}px`;
+                    ghost.style.transform = `scale(${targetW / cardW}, ${targetH / cardH})`;
+                }, 590);
+            } else if (!card._cavernWargShadowReturn) {
+                ghost.style.left = `${targetLeft}px`;
+                ghost.style.top = `${targetTop}px`;
+                ghost.style.transform = `scale(${targetW / cardW}, ${targetH / cardH})`;
+            }
+
+            setTimeout(() => {
+                // Ensure card positions remains locked to targetX and targetY
+                if (window.cardPositions) window.cardPositions[card._uid] = { x: targetX, y: targetY };
+                if (engine && engine.window && engine.window.cardPositions) engine.window.cardPositions[card._uid] = { x: targetX, y: targetY };
+
+                // Get exact screen position of the Player # badge above the enemy card in the Staging Area
+                const ghostBadge = ghost.querySelector('.engaged-player-label');
+                let bRect = ghostBadge ? ghostBadge.getBoundingClientRect() : null;
+                if (!bRect || bRect.width === 0 || bRect.height === 0) {
+                    const badgeW = 92;
+                    const badgeH = 28;
+                    bRect = {
+                        left: targetLeft + (targetW - badgeW) / 2,
+                        top: targetTop - 18 * scale,
+                        width: badgeW,
+                        height: badgeH
+                    };
+                }
+
+                // If the enemy had a Player # badge, create a floating badge in place above the card in staging
+                let floatingBadge = null;
+                if (hadPlayerBadge) {
+                    floatingBadge = document.createElement('div');
+                    floatingBadge.className = 'engaged-player-label disintegrating-player-badge';
+                    floatingBadge.style.cssText = `
+                        position: fixed; z-index: 10010;
+                        left: ${bRect.left}px; top: ${bRect.top}px;
+                        width: ${bRect.width}px; height: ${bRect.height}px;
+                        background: rgba(0,0,0,0.95); border: 2px solid var(--blood, #990000);
+                        color: var(--blood-bright, #ff4d4d);
+                        border-radius: 6px; font-family: 'Cinzel', serif;
+                        font-size: 1.15rem; font-weight: 900;
+                        white-space: nowrap; box-shadow: 0 4px 8px rgba(0,0,0,0.9);
+                        display: flex; align-items: center; justify-content: center;
+                        pointer-events: none;
+                    `;
+                    floatingBadge.textContent = badgeText;
+                    document.body.appendChild(floatingBadge);
+
+                    if (ghostBadge) {
+                        ghostBadge.style.visibility = 'hidden';
+                    }
+                }
+
+                card._attackedThisRound = true;
+                delete card._returnedToStaging;
+                delete card._drawing;
+                delete card._flyingToDeck;
+                delete card._flipping;
+                delete card._isAnimatingTravel;
+
+                if (callback) callback();
+
+                // Lock again right after callback in case callback ran delete window.cardPositions[card._uid]
+                if (window.cardPositions) window.cardPositions[card._uid] = { x: targetX, y: targetY };
+                if (engine && engine.window && engine.window.cardPositions) engine.window.cardPositions[card._uid] = { x: targetX, y: targetY };
+
+                if (engine && engine.render) engine.render();
+                else if (window.render) window.render();
+
+                // Ghost is removed after real card is rendered at the exact identical coordinates
+                requestAnimationFrame(() => {
+                    ghost.remove();
+
+                    // Now that enemy has been placed into the Staging Area, disintegrate the Player # badge above it!
+                    if (floatingBadge) {
+                        const originX = bRect.left + bRect.width / 2;
+                        const originY = bRect.top + bRect.height / 2;
+                        window.disintegratePlayerBadge(floatingBadge, originX, originY);
+                    }
+                });
+            }, isChieftain ? 1020 : 600);
         };
+        if (window.LotrEngine && window.LotrEngine.window) {
+            window.LotrEngine.window.animateReturnToStaging = window.animateReturnToStaging;
+        }
     }
 
     document.addEventListener('click', (e) => {
@@ -1155,6 +8045,10 @@ if (typeof window !== 'undefined') {
                 if (idx >= 0) game[pile].splice(idx, 1);
             }
         });
+        if (game.stagingArea) {
+            const idx = game.stagingArea.findIndex(c => c.id === 'nibin_cave_torch' && c._removedFromGame);
+            if (idx >= 0) game.stagingArea.splice(idx, 1);
+        }
         if (game.playerDiscards) {
             game.playerDiscards.forEach(pd => {
                 const idx = pd.findIndex(c => c.id === 'nibin_cave_torch');
@@ -1183,138 +8077,147 @@ if (typeof window !== 'undefined') {
                 
                 const handleConfirm = () => {
                     const proceed = () => {
-                        torch.exhausted = true;
-                        
-                        if (window.setActionBar) window.setActionBar([]);
-                    if (window.setActionInfo) window.setActionInfo("Cavern Warg's attack was cancelled. Resolving Cave Torch...");
-                    
-                    attacker._activeAttacker = false;
-                    game.currentEnemyAttacking = null;
-                    game.pendingAction = null;
-                    attacker._attackedThisRound = true;
-                    
-                    const ghost = window._activeEncounterGhost || (engine.window && engine.window._activeEncounterGhost);
-                    if (ghost) {
-                        ghost.remove();
-                        if (engine.window) engine.window._activeEncounterGhost = null;
-                        window._activeEncounterGhost = null;
-                    }
-                    attacker._isAnimatingTravel = true;
-                    if (engine && engine.render) engine.render();
-
-                    const resumeCombat = () => {
-                        setTimeout(() => {
-                            const remaining = game.engagedEnemies.filter(e => {
-                                const isSnared = e.attached && e.attached.some(a => a.id === 'forest_snare');
-                                return !e._attackedThisRound && !e._doesNotAttack && !isSnared;
-                            });
-                            if (remaining.length > 0 && engine.window && engine.window.resolveEnemyAttacks) {
-                                engine.window.resolveEnemyAttacks();
-                            } else if (engine.window && engine.window.playerAttacks) {
-                                engine.window.playerAttacks();
+                        const afterChomp = () => {
+                            torch.exhausted = true;
+                            
+                            if (window.setActionBar) window.setActionBar([]);
+                            if (window.setActionInfo) window.setActionInfo("Cavern Warg's attack was cancelled. Resolving Cave Torch...");
+                            
+                            attacker._activeAttacker = false;
+                            game.currentEnemyAttacking = null;
+                            game.pendingAction = null;
+                            attacker._attackedThisRound = true;
+                            attacker._skipReturnWhoosh = true;
+                            
+                            const ghost = window._activeEncounterGhost || (engine.window && engine.window._activeEncounterGhost);
+                            if (ghost) {
+                                ghost.remove();
+                                if (engine.window) engine.window._activeEncounterGhost = null;
+                                window._activeEncounterGhost = null;
                             }
-                        }, 600);
-                    };
+                            attacker._isAnimatingTravel = true;
+                            if (engine && engine.render) engine.render();
 
-                    const triggerForcedTorch = () => {
-                        const doDiscard = () => {
-                            if (!game.encounterDeck || game.encounterDeck.length === 0) {
-                                if (game.encounterDiscard && game.encounterDiscard.length > 0) {
-                                    game.encounterDeck = engine.shuffle(game.encounterDiscard);
-                                    game.encounterDiscard = [];
-                                }
-                            }
-                            if (game.encounterDeck && game.encounterDeck.length > 0) {
-                                const top = game.encounterDeck.pop();
-                                if (top.type === 'enemy') {
-                                    engine.toast("Cave Torch", `Forced: Discarded ${top.name} — it is an enemy! Added to staging.`, "danger");
-                                    if (engine.window && engine.window.animateDrawDirectToStaging) {
-                                        engine.window.animateDrawDirectToStaging(top, () => {
-                                            game.stagingArea.push(top);
-                                            engine.render();
-                                            resumeCombat();
-                                        });
+                            const resumeCombat = () => {
+                                setTimeout(() => {
+                                    const remaining = game.engagedEnemies.filter(e => {
+                                        const isSnared = e.attached && e.attached.some(a => a.id === 'forest_snare');
+                                        return !e._attackedThisRound && !e._doesNotAttack && !isSnared;
+                                    });
+                                    if (remaining.length > 0 && engine.window && engine.window.resolveEnemyAttacks) {
+                                        engine.window.resolveEnemyAttacks();
+                                    } else if (engine.window && engine.window.playerAttacks) {
+                                        engine.window.playerAttacks();
+                                    }
+                                }, 600);
+                            };
+
+                            const triggerForcedTorch = () => {
+                                const doDiscard = () => {
+                                    if (!game.encounterDeck || game.encounterDeck.length === 0) {
+                                        if (game.encounterDiscard && game.encounterDiscard.length > 0) {
+                                            game.encounterDeck = engine.shuffle(game.encounterDiscard);
+                                            game.encounterDiscard = [];
+                                        }
+                                    }
+                                    if (game.encounterDeck && game.encounterDeck.length > 0) {
+                                        const top = game.encounterDeck.pop();
+                                        if (top.type === 'enemy') {
+                                            engine.toast("Cave Torch", `Forced: Discarded ${top.name} — it is an enemy! Added to staging.`, "danger");
+                                            if (engine.window && engine.window.animateDrawDirectToStaging) {
+                                                engine.window.animateDrawDirectToStaging(top, () => {
+                                                    game.stagingArea.push(top);
+                                                    engine.render();
+                                                    resumeCombat();
+                                                });
+                                            } else {
+                                                game.stagingArea.push(top);
+                                                engine.render();
+                                                resumeCombat();
+                                            }
+                                        } else {
+                                            engine.toast("Cave Torch", `Forced: Discarded ${top.name}.`, "info");
+                                            const deckEl = document.getElementById('encounter-deck-pile');
+                                            const discardEl = document.getElementById('encounter-discard-pile');
+                                            if (deckEl && discardEl) {
+                                                const dRect = deckEl.getBoundingClientRect();
+                                                const discRect = discardEl.getBoundingClientRect();
+                                                const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
+                                                const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
+                                                
+                                                const ghost = document.createElement('div');
+                                                ghost.style.cssText = `
+                                                    position: fixed; z-index: 1000;
+                                                    width: ${cardW}px; height: ${cardH}px;
+                                                    left: ${dRect.left}px; top: ${dRect.top}px;
+                                                    transform: scale(${dRect.width / cardW});
+                                                    transform-origin: top left;
+                                                    transition: all 0.5s cubic-bezier(0.25, 0.8, 0.25, 1);
+                                                    pointer-events: none;
+                                                    box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+                                                    border-radius: 6px; overflow: hidden;
+                                                `;
+                                                const topImg = top.img || 'cards/dark_of_mirkwood/caves_of_nibin/cave_torch.jpg';
+                                                ghost.innerHTML = `<img src="${topImg}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
+                                                ghost.className = 'card encounter-location';
+                                                document.body.appendChild(ghost);
+                                                
+                                                void ghost.offsetWidth;
+
+                                                ghost.style.left = `${discRect.left}px`;
+                                                ghost.style.top = `${discRect.top}px`;
+                                                ghost.style.transform = `scale(${discRect.width / cardW})`;
+
+                                                setTimeout(() => {
+                                                    ghost.remove();
+                                                    game.encounterDiscard.push(top);
+                                                    engine.render();
+                                                    resumeCombat();
+                                                }, 500);
+                                            } else {
+                                                game.encounterDiscard.push(top);
+                                                engine.render();
+                                                resumeCombat();
+                                            }
+                                        }
                                     } else {
-                                        game.stagingArea.push(top);
-                                        engine.render();
                                         resumeCombat();
                                     }
+                                };
+                                if (engine.window && engine.window.checkEmptyEncounterDeck) {
+                                    engine.window.checkEmptyEncounterDeck(doDiscard);
                                 } else {
-                                    engine.toast("Cave Torch", `Forced: Discarded ${top.name}.`, "info");
-                                    const deckEl = document.getElementById('encounter-deck-pile');
-                                    const discardEl = document.getElementById('encounter-discard-pile');
-                                    if (deckEl && discardEl) {
-                                        const dRect = deckEl.getBoundingClientRect();
-                                        const discRect = discardEl.getBoundingClientRect();
-                                        const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
-                                        const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
-                                        
-                                        const ghost = document.createElement('div');
-                                        ghost.style.cssText = `
-                                            position: fixed; z-index: 1000;
-                                            width: ${cardW}px; height: ${cardH}px;
-                                            left: ${dRect.left}px; top: ${dRect.top}px;
-                                            transform: scale(${dRect.width / cardW});
-                                            transform-origin: top left;
-                                            transition: all 0.5s cubic-bezier(0.25, 0.8, 0.25, 1);
-                                            pointer-events: none;
-                                            box-shadow: 0 8px 24px rgba(0,0,0,0.6);
-                                            border-radius: 6px; overflow: hidden;
-                                        `;
-                                        const topImg = top.img || 'cards/dark_of_mirkwood/caves_of_nibin/cave_torch.jpg';
-                                        ghost.innerHTML = `<img src="${topImg}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
-                                        ghost.className = 'card encounter-location';
-                                        document.body.appendChild(ghost);
-                                        
-                                        void ghost.offsetWidth;
-
-                                        ghost.style.left = `${discRect.left}px`;
-                                        ghost.style.top = `${discRect.top}px`;
-                                        ghost.style.transform = `scale(${discRect.width / cardW})`;
-                                        
-                                        if (window.SoundFX) window.SoundFX.playWhoosh();
-
-                                        setTimeout(() => {
-                                            ghost.remove();
-                                            game.encounterDiscard.push(top);
-                                            engine.render();
-                                            resumeCombat();
-                                        }, 500);
-                                    } else {
-                                        game.encounterDiscard.push(top);
-                                        engine.render();
-                                        resumeCombat();
-                                    }
+                                    doDiscard();
                                 }
+                            };
+                            
+                            const animateFn = window.animateReturnToStaging || (engine.window && engine.window.animateReturnToStaging);
+                            if (animateFn) {
+                                animateFn(attacker, () => {
+                                    delete attacker._isAnimatingTravel;
+                                    delete attacker._skipReturnWhoosh;
+                                    if (window.cardPositions) delete window.cardPositions[attacker._uid];
+                                    delete attacker._engagedWithPlayerIdx;
+                                    game.engagedEnemies = game.engagedEnemies.filter(e => e._uid !== attacker._uid);
+                                    if (!game.stagingArea.some(e => e._uid === attacker._uid)) {
+                                        game.stagingArea.push(attacker);
+                                    }
+                                    attacker._attackedThisRound = false;
+                                    engine.toast("Cavern Warg", "Exhausted Cave Torch to cancel Cavern Warg's attack!", "success");
+                                    engine.render();
+                                    triggerForcedTorch();
+                                });
                             } else {
-                                resumeCombat();
+                                delete attacker._isAnimatingTravel;
+                                delete attacker._skipReturnWhoosh;
+                                triggerForcedTorch();
                             }
                         };
-                        if (engine.window && engine.window.checkEmptyEncounterDeck) {
-                            engine.window.checkEmptyEncounterDeck(doDiscard);
+
+                        if (window.triggerWargChompOnTorch) {
+                            window.triggerWargChompOnTorch(torch._uid, afterChomp);
                         } else {
-                            doDiscard();
-                        }
-                    };
-                    
-                    const animateFn = window.animateReturnToStaging || (engine.window && engine.window.animateReturnToStaging);
-                    if (animateFn) {
-                            animateFn(attacker, () => {
-                                delete attacker._isAnimatingTravel;
-                                if (window.cardPositions) delete window.cardPositions[attacker._uid];
-                                delete attacker._engagedWithPlayerIdx;
-                                game.engagedEnemies = game.engagedEnemies.filter(e => e._uid !== attacker._uid);
-                                if (!game.stagingArea.some(e => e._uid === attacker._uid)) {
-                                    game.stagingArea.push(attacker);
-                                }
-                                attacker._attackedThisRound = false;
-                                engine.toast("Cavern Warg", "Exhausted Cave Torch to cancel Cavern Warg's attack!", "success");
-                                engine.render();
-                                triggerForcedTorch();
-                            });
-                        } else {
-                            delete attacker._isAnimatingTravel;
-                            triggerForcedTorch();
+                            afterChomp();
                         }
                     };
 
@@ -1349,6 +8252,1940 @@ if (typeof window !== 'undefined') {
         }
     }, 100);
 }
+
+window.triggerFlameTokenMaterialize = function(tokenEl) {
+    if (!tokenEl) return;
+
+    if (!document.getElementById('token-flame-reveal-styles')) {
+        const st = document.createElement('style');
+        st.id = 'token-flame-reveal-styles';
+        st.textContent = `
+            @keyframes tokenFlameShake {
+                0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+                15% { transform: translate3d(-7px, -1px, 0) scale(1.22); }
+                30% { transform: translate3d(7px, 1px, 0) scale(1.26); }
+                45% { transform: translate3d(-5px, -1px, 0) scale(1.18); }
+                60% { transform: translate3d(5px, 1px, 0) scale(1.12); }
+                75% { transform: translate3d(-3px, 0, 0) scale(1.06); }
+                90% { transform: translate3d(3px, 0, 0) scale(1.02); }
+            }
+            @keyframes flameAuraBurnAway {
+                0% { filter: brightness(3.8) contrast(1.6) drop-shadow(0 0 16px #ffffff) drop-shadow(0 0 28px #ff4500); opacity: 0.25; }
+                25% { opacity: 1; filter: brightness(3.0) drop-shadow(0 0 20px #ffaa00) drop-shadow(0 0 36px #ff2200); }
+                65% { filter: brightness(1.8) drop-shadow(0 0 12px #ff7700) drop-shadow(0 0 20px #ff0000); }
+                100% { filter: none; opacity: 1; }
+            }
+        `;
+        document.head.appendChild(st);
+    }
+
+    // 1. Rapid left/right horizontal shake & fiery burn-away filter
+    tokenEl.style.animation = 'tokenFlameShake 0.44s ease-in-out, flameAuraBurnAway 0.48s ease-out';
+    setTimeout(() => {
+        if (tokenEl) tokenEl.style.animation = '';
+    }, 480);
+
+    // 2. Licking flame tongues & ember sparks rising around the token
+    const rect = tokenEl.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+
+    const pad = 36;
+    const canvas = document.createElement('canvas');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = (rect.width + pad * 2) * dpr;
+    canvas.height = (rect.height + pad * 2) * dpr;
+    canvas.style.cssText = `
+        position: fixed; pointer-events: none; z-index: 10025;
+        left: ${rect.left - pad}px; top: ${rect.top - pad}px;
+        width: ${rect.width + pad * 2}px; height: ${rect.height + pad * 2}px;
+    `;
+    document.body.appendChild(canvas);
+
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    const flameTongues = [];
+    for (let i = 0; i < 22; i++) {
+        flameTongues.push({
+            x: pad + rect.width / 2 + (Math.random() - 0.5) * (rect.width * 0.9),
+            y: pad + rect.height * 0.6 + Math.random() * (rect.height * 0.4),
+            vx: (Math.random() - 0.5) * 1.8,
+            vy: -2.2 - Math.random() * 3.4,
+            size: 4 + Math.random() * 5.5,
+            alpha: 1.0,
+            decay: 0.038 + Math.random() * 0.03,
+            color: Math.random() > 0.45 ? '#fffbeb' : (Math.random() > 0.4 ? '#f59e0b' : '#ef4444')
+        });
+    }
+
+    const flameStart = performance.now();
+    let flameAnimId = null;
+
+    const renderFlames = (now) => {
+        const elapsed = now - flameStart;
+        ctx.clearRect(0, 0, rect.width + pad * 2, rect.height + pad * 2);
+
+        for (let i = flameTongues.length - 1; i >= 0; i--) {
+            const f = flameTongues[i];
+            f.x += f.vx;
+            f.y += f.vy;
+            f.vx += (Math.random() - 0.5) * 0.4;
+            f.alpha -= f.decay;
+
+            if (f.alpha <= 0) {
+                flameTongues.splice(i, 1);
+                continue;
+            }
+
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            ctx.globalAlpha = Math.max(0, f.alpha);
+            const rGrad = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, f.size * f.alpha);
+            rGrad.addColorStop(0, '#ffffff');
+            rGrad.addColorStop(0.35, f.color);
+            rGrad.addColorStop(0.8, '#dc2626');
+            rGrad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = rGrad;
+            ctx.beginPath();
+            ctx.arc(f.x, f.y, f.size * f.alpha, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+
+        if (elapsed < 460 || flameTongues.length > 0) {
+            flameAnimId = requestAnimationFrame(renderFlames);
+        } else {
+            if (flameAnimId) cancelAnimationFrame(flameAnimId);
+            canvas.remove();
+        }
+    };
+
+    flameAnimId = requestAnimationFrame(renderFlames);
+};
+
+window.triggerEncounterDeckFlames = function(torchUid, onComplete) {
+    if (typeof torchUid === 'function') {
+        onComplete = torchUid;
+        torchUid = null;
+    }
+
+    const deckEl = document.getElementById('encounter-deck-pile');
+    if (!deckEl) {
+        if (onComplete) onComplete();
+        return;
+    }
+
+    const dRect = deckEl.getBoundingClientRect();
+    if (dRect.width === 0 || dRect.height === 0) {
+        if (onComplete) onComplete();
+        return;
+    }
+
+    const torchEl = (torchUid ? document.querySelector(`[data-uid="${torchUid}"]`) : null) ||
+                    document.querySelector('.is-attachment[data-id="nibin_cave_torch"]') ||
+                    document.querySelector('[data-id="nibin_cave_torch"]');
+
+    const tRect = torchEl ? torchEl.getBoundingClientRect() : null;
+    const x1 = tRect && tRect.width > 0 ? (tRect.left + tRect.width / 2) : (window.innerWidth / 2);
+    const y1 = tRect && tRect.height > 0 ? (tRect.top + tRect.height / 2) : (window.innerHeight - 150);
+    const x2 = dRect.left + dRect.width / 2;
+    const y2 = dRect.top + dRect.height / 2;
+
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const dist = Math.hypot(dx, dy) || 1;
+    const nx = -dy / dist;
+    const ny = dx / dist;
+
+    const canvas = document.createElement('canvas');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = window.innerWidth * dpr;
+    canvas.height = window.innerHeight * dpr;
+    canvas.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:10025;';
+    document.body.appendChild(canvas);
+
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    const flightTime = 540;
+    const flameDuration = 600;
+    const totalDuration = flightTime + flameDuration;
+    const startTime = performance.now();
+    let animId = null;
+
+    const trail = [];
+    const flames = [];
+    const particles = [];
+    const shockwaves = [];
+    let fireballImpacted = false;
+
+    // Curved Bezier trajectory toward encounter deck
+    const lateral = dist * 0.12 + 15;
+    const lift = dist * 0.13 + 20;
+    const p0 = { x: x1, y: y1 };
+    const p1 = { x: x1 + dx * 0.30 + nx * lateral, y: y1 + dy * 0.30 + ny * lateral - lift };
+    const p2 = { x: x1 + dx * 0.70 + nx * (lateral * 0.6), y: y1 + dy * 0.70 + ny * (lateral * 0.6) - lift * 0.6 };
+    const p3 = { x: x2, y: y2 };
+
+    if (window.SoundFX && window.SoundFX.playWhoosh) {
+        window.SoundFX.playWhoosh();
+    }
+
+    const bezierPoint = (t, a, b, c, d) => {
+        const u = 1 - t, tt = t * t, uu = u * u, uuu = uu * u, ttt = tt * t;
+        return {
+            x: uuu * a.x + 3 * uu * t * b.x + 3 * u * tt * c.x + ttt * d.x,
+            y: uuu * a.y + 3 * uu * t * b.y + 3 * u * tt * c.y + ttt * d.y
+        };
+    };
+
+    const loop = (now) => {
+        const elapsed = now - startTime;
+        ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+        // --- 1. FIREBALL FLIGHT TOWARD ENCOUNTER DECK ---
+        if (elapsed < flightTime) {
+            const tRaw = elapsed / flightTime;
+            const tEase = tRaw < 0.5 ? 2 * tRaw * tRaw : 1 - Math.pow(-2 * tRaw + 2, 2) / 2;
+            const pos = bezierPoint(tEase, p0, p1, p2, p3);
+
+            trail.push({ x: pos.x, y: pos.y, alpha: 1.0, size: 28 });
+
+            // Fireball head
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            ctx.beginPath();
+            ctx.arc(pos.x, pos.y, 34, 0, Math.PI * 2);
+            const headGrad = ctx.createRadialGradient(pos.x, pos.y, 3, pos.x, pos.y, 34);
+            headGrad.addColorStop(0, '#ffffff');
+            headGrad.addColorStop(0.25, '#fef08a');
+            headGrad.addColorStop(0.55, '#f97316');
+            headGrad.addColorStop(0.85, '#dc2626');
+            headGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = headGrad;
+            ctx.fill();
+
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath();
+            ctx.arc(pos.x, pos.y, 8.5, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+
+            // Shed cinders in flight
+            for (let k = 0; k < 2; k++) {
+                particles.push({
+                    x: pos.x + (Math.random() - 0.5) * 12,
+                    y: pos.y + (Math.random() - 0.5) * 12,
+                    vx: (Math.random() - 0.5) * 2.2 - (dx / dist) * 0.9,
+                    vy: (Math.random() - 0.5) * 2.2 + 0.6,
+                    size: 2.2 + Math.random() * 3.4,
+                    alpha: 0.95,
+                    decay: 0.022 + Math.random() * 0.02,
+                    color: Math.random() > 0.4 ? '#fffbeb' : (Math.random() > 0.5 ? '#f59e0b' : '#dc2626')
+                });
+            }
+        } else if (!fireballImpacted) {
+            fireballImpacted = true;
+
+            // Audio impact punch
+            try {
+                const hitSnd = new Audio('./sound_effects/enemy_move.mp3');
+                const vol = document.getElementById('volume-slider');
+                hitSnd.volume = vol ? parseFloat(vol.value) : 0.25;
+                hitSnd.playbackRate = 1.75;
+                hitSnd.play().catch(() => {});
+            } catch (e) {}
+
+            // Encounter Deck glow & ignition with brighter outer edge glow
+            deckEl.style.transition = 'filter 0.18s ease-out, transform 0.18s ease-out';
+            deckEl.style.filter = 'brightness(1.35) drop-shadow(0 0 8px rgba(255, 255, 255, 0.7)) drop-shadow(0 0 22px rgba(245, 158, 11, 0.95)) drop-shadow(0 0 42px rgba(220, 38, 38, 0.75))';
+            deckEl.style.transform = 'scale(1.035) translate(0px, -2px)';
+
+            shockwaves.push({ x: x2, y: y2, radius: 10, maxRadius: 65, alpha: 0.9 });
+
+            if (window.LotrEngine && window.LotrEngine.window && window.LotrEngine.window.screenShake) {
+                window.LotrEngine.window.screenShake(5, 180);
+            }
+
+            // Impact sparks
+            for (let k = 0; k < 34; k++) {
+                const ang = Math.random() * Math.PI * 2;
+                const spd = 2.4 + Math.random() * 8.5;
+                particles.push({
+                    x: x2 + (Math.random() - 0.5) * 20,
+                    y: y2 + (Math.random() - 0.5) * 20,
+                    vx: Math.cos(ang) * spd,
+                    vy: Math.sin(ang) * spd - 1.2,
+                    size: 2.4 + Math.random() * 4.2,
+                    alpha: 1.0,
+                    decay: 0.02 + Math.random() * 0.025,
+                    color: Math.random() > 0.35 ? '#fffbeb' : (Math.random() > 0.4 ? '#f59e0b' : '#dc2626')
+                });
+            }
+        }
+
+        // --- 2. TRAILING FIRE RIBBON ---
+        for (let i = trail.length - 1; i >= 0; i--) {
+            const tr = trail[i];
+            tr.alpha -= 0.038;
+            if (tr.alpha <= 0) {
+                trail.splice(i, 1);
+                continue;
+            }
+
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            ctx.globalAlpha = tr.alpha * 0.8;
+
+            const outerR = tr.size * tr.alpha * 1.45;
+            ctx.beginPath();
+            ctx.arc(tr.x, tr.y, outerR, 0, Math.PI * 2);
+            const outGrad = ctx.createRadialGradient(tr.x, tr.y, 2, tr.x, tr.y, outerR);
+            outGrad.addColorStop(0, 'rgba(254, 215, 170, 0.85)');
+            outGrad.addColorStop(0.4, 'rgba(249, 115, 22, 0.55)');
+            outGrad.addColorStop(0.8, 'rgba(220, 38, 38, 0.25)');
+            outGrad.addColorStop(1, 'rgba(185, 28, 28, 0)');
+            ctx.fillStyle = outGrad;
+            ctx.fill();
+
+            const innerR = tr.size * tr.alpha * 0.72;
+            ctx.beginPath();
+            ctx.arc(tr.x, tr.y, innerR, 0, Math.PI * 2);
+            const inGrad = ctx.createRadialGradient(tr.x, tr.y, 0, tr.x, tr.y, innerR);
+            inGrad.addColorStop(0, 'rgba(255, 255, 255, 0.95)');
+            inGrad.addColorStop(0.55, 'rgba(251, 191, 36, 0.75)');
+            inGrad.addColorStop(1, 'rgba(234, 88, 12, 0)');
+            ctx.fillStyle = inGrad;
+            ctx.fill();
+            ctx.restore();
+        }
+
+        // --- 3. FLAMES BURNING ON THE ENCOUNTER DECK UPON IMPACT ---
+        if (fireballImpacted && elapsed < totalDuration - 140) {
+            if (flames.length < 22) {
+                for (let i = 0; i < 2; i++) {
+                    const fw = 14 + Math.random() * 12;
+                    flames.push({
+                        x: dRect.left + 8 + Math.random() * (dRect.width - 16),
+                        y: dRect.top + dRect.height * 0.35 + Math.random() * (dRect.height * 0.55),
+                        vx: (Math.random() - 0.5) * 0.8,
+                        vy: -1.8 - Math.random() * 2.2,
+                        w: fw,
+                        h: fw * (2.2 + Math.random() * 1.0),
+                        alpha: 1.0,
+                        decay: 0.024 + Math.random() * 0.016,
+                        phase: Math.random() * Math.PI * 2,
+                        wiggleSpeed: 0.12 + Math.random() * 0.08
+                    });
+                }
+            }
+        }
+
+        // Render realistic flickering flame tongues
+        for (let i = flames.length - 1; i >= 0; i--) {
+            const f = flames[i];
+            f.x += f.vx;
+            f.y += f.vy;
+            f.phase += f.wiggleSpeed;
+            f.alpha -= f.decay;
+
+            if (f.alpha <= 0) {
+                flames.splice(i, 1);
+                continue;
+            }
+
+            const scale = Math.max(0.2, f.alpha);
+            const curW = f.w * scale;
+            const curH = f.h * scale;
+            const wiggle = Math.sin(f.phase) * (curW * 0.38);
+
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            ctx.translate(f.x, f.y);
+
+            // Outer ambient flame tongue
+            ctx.globalAlpha = Math.max(0, f.alpha * 0.82);
+            ctx.shadowColor = '#ea580c';
+            ctx.shadowBlur = 10;
+
+            ctx.beginPath();
+            ctx.moveTo(0, curH * 0.45);
+            ctx.bezierCurveTo(
+                curW * 0.65, curH * 0.3,
+                curW * 0.55 + wiggle, -curH * 0.25,
+                wiggle * 1.6, -curH * 0.6
+            );
+            ctx.bezierCurveTo(
+                -curW * 0.55 + wiggle, -curH * 0.25,
+                -curW * 0.65, curH * 0.3,
+                0, curH * 0.45
+            );
+            ctx.closePath();
+
+            const outGrad = ctx.createLinearGradient(0, curH * 0.45, 0, -curH * 0.6);
+            outGrad.addColorStop(0, 'rgba(255, 240, 180, 0.95)');
+            outGrad.addColorStop(0.22, 'rgba(251, 191, 36, 0.88)');
+            outGrad.addColorStop(0.55, 'rgba(249, 115, 22, 0.65)');
+            outGrad.addColorStop(0.85, 'rgba(220, 38, 38, 0.3)');
+            outGrad.addColorStop(1, 'rgba(127, 29, 29, 0)');
+            ctx.fillStyle = outGrad;
+            ctx.fill();
+
+            // Inner hot core tongue
+            ctx.globalAlpha = Math.max(0, f.alpha * 0.95);
+            ctx.shadowColor = '#ffffff';
+            ctx.shadowBlur = 6;
+
+            ctx.beginPath();
+            ctx.moveTo(0, curH * 0.38);
+            ctx.bezierCurveTo(
+                curW * 0.32, curH * 0.22,
+                curW * 0.28 + wiggle * 0.6, -curH * 0.15,
+                wiggle * 0.8, -curH * 0.45
+            );
+            ctx.bezierCurveTo(
+                -curW * 0.28 + wiggle * 0.6, -curH * 0.15,
+                -curW * 0.32, curH * 0.22,
+                0, curH * 0.38
+            );
+            ctx.closePath();
+
+            const inGrad = ctx.createLinearGradient(0, curH * 0.38, 0, -curH * 0.45);
+            inGrad.addColorStop(0, '#ffffff');
+            inGrad.addColorStop(0.45, 'rgba(254, 240, 138, 0.95)');
+            inGrad.addColorStop(0.85, 'rgba(249, 115, 22, 0.6)');
+            inGrad.addColorStop(1, 'rgba(234, 88, 12, 0)');
+            ctx.fillStyle = inGrad;
+            ctx.fill();
+
+            ctx.restore();
+        }
+
+        // Render shockwaves
+        for (let i = shockwaves.length - 1; i >= 0; i--) {
+            const sw = shockwaves[i];
+            sw.radius += (sw.maxRadius - sw.radius) * 0.20;
+            sw.alpha -= 0.055;
+            if (sw.alpha <= 0) {
+                shockwaves.splice(i, 1);
+                continue;
+            }
+
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            ctx.globalAlpha = Math.max(0, sw.alpha);
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = '#f59e0b';
+            ctx.shadowColor = '#ea580c';
+            ctx.shadowBlur = 14;
+            ctx.beginPath();
+            ctx.arc(sw.x, sw.y, sw.radius, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        // Render sparks & cinders
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const s = particles[i];
+            s.x += s.vx;
+            s.y += s.vy;
+            s.vy += 0.07;
+            s.alpha -= s.decay;
+
+            if (s.alpha <= 0) {
+                particles.splice(i, 1);
+                continue;
+            }
+
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            ctx.globalAlpha = Math.max(0, s.alpha);
+            ctx.fillStyle = s.color;
+            ctx.shadowColor = s.color;
+            ctx.shadowBlur = 7;
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, s.size * Math.max(0.3, s.alpha), 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+
+        const anyTrails = trail.length > 0;
+        if (elapsed < totalDuration || particles.length > 0 || anyTrails || flames.length > 0 || shockwaves.length > 0) {
+            animId = requestAnimationFrame(loop);
+        } else {
+            if (animId) cancelAnimationFrame(animId);
+            canvas.remove();
+            deckEl.style.transition = 'filter 0.35s ease-out, transform 0.35s ease-out';
+            deckEl.style.filter = '';
+            deckEl.style.transform = '';
+            if (onComplete) onComplete();
+        }
+    };
+
+    animId = requestAnimationFrame(loop);
+};
+
+window.triggerCaveTorchPiercingBeam = function(torchUid, locUid, onHit, onComplete) {
+    if (typeof onHit !== 'function' && typeof onComplete !== 'function') {
+        onComplete = onHit;
+        onHit = null;
+    }
+
+    const torchEl = document.querySelector(`.is-attachment[data-uid="${torchUid}"]`) || document.querySelector(`[data-uid="${torchUid}"]`);
+    const locEl = document.querySelector(`[data-uid="${locUid}"]`);
+    if (!torchEl || !locEl) {
+        if (onComplete) onComplete();
+        return;
+    }
+
+    const tRect = torchEl.getBoundingClientRect();
+    const lRect = locEl.getBoundingClientRect();
+    if (tRect.width === 0 || lRect.width === 0) {
+        if (onComplete) onComplete();
+        return;
+    }
+
+    try {
+        const snd = new Audio('./sound_effects/dark_of_mirkwood/cave_torch.mp3');
+        const vol = document.getElementById('volume-slider');
+        snd.volume = vol ? parseFloat(vol.value) : 0.25;
+        snd.play().catch(() => {});
+    } catch (e) {}
+
+    const canvas = document.createElement('canvas');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = window.innerWidth * dpr;
+    canvas.height = window.innerHeight * dpr;
+    canvas.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:10020;';
+    document.body.appendChild(canvas);
+
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    const x1 = tRect.left + tRect.width / 2;
+    const y1 = tRect.top + tRect.height / 2;
+    const x2 = lRect.left + lRect.width / 2;
+    const y2 = lRect.top + lRect.height / 2;
+
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const dist = Math.hypot(dx, dy) || 1;
+    const nx = -dy / dist;
+    const ny = dx / dist;
+
+    // Snappier, cinematic launch timing: 540ms flight, 580ms stagger
+    const flightTime = 540;
+    const intervalDelay = 580;
+
+    // Gentler, less drastic arc trajectories
+    const comets = [
+        {
+            side: 1, // Slight flank curve to the right
+            lateral: dist * (0.13 + Math.random() * 0.05) + 16,
+            lift: dist * (0.12 + Math.random() * 0.05) + 20,
+            launchTime: 0,
+            trail: [],
+            launched: false,
+            impacted: false
+        },
+        {
+            side: Math.random() < 0.5 ? 1 : -1, // Near-direct center line
+            lateral: (Math.random() - 0.5) * 16,
+            lift: dist * (0.07 + Math.random() * 0.04) + 12,
+            launchTime: intervalDelay,
+            trail: [],
+            launched: false,
+            impacted: false
+        },
+        {
+            side: -1, // Gentle counter-curve to the left
+            lateral: dist * (0.13 + Math.random() * 0.05) + 16,
+            lift: dist * (0.14 + Math.random() * 0.05) + 22,
+            launchTime: intervalDelay * 2,
+            trail: [],
+            launched: false,
+            impacted: false
+        }
+    ];
+
+    comets.forEach(c => {
+        c.p0 = { x: x1, y: y1 };
+        c.p1 = {
+            x: x1 + dx * 0.30 + nx * (c.side * c.lateral),
+            y: y1 + dy * 0.30 + ny * (c.side * c.lateral) - c.lift
+        };
+        c.p2 = {
+            x: x1 + dx * 0.70 + nx * (c.side * c.lateral * 0.6),
+            y: y1 + dy * 0.70 + ny * (c.side * c.lateral * 0.6) - c.lift * 0.6
+        };
+        c.p3 = { x: x2, y: y2 };
+    });
+
+    const totalDuration = (intervalDelay * 2) + flightTime + 400;
+    const startTime = performance.now();
+    let animId = null;
+    const particles = [];
+    const shockwaves = [];
+
+    const spawnTorchSparks = () => {
+        for (let i = 0; i < 24; i++) {
+            const ang = Math.random() * Math.PI * 2;
+            const spd = 2.0 + Math.random() * 5.0;
+            particles.push({
+                x: x1,
+                y: y1,
+                vx: Math.cos(ang) * spd + (dx / dist) * 1.5,
+                vy: Math.sin(ang) * spd - 1.8,
+                size: 2.2 + Math.random() * 3.2,
+                alpha: 1,
+                decay: 0.022 + Math.random() * 0.025,
+                color: Math.random() > 0.4 ? '#fffbeb' : (Math.random() > 0.5 ? '#f59e0b' : '#ef4444')
+            });
+        }
+    };
+
+    const bezierPoint = (t, p0, p1, p2, p3) => {
+        const u = 1 - t, tt = t * t, uu = u * u, uuu = uu * u, ttt = tt * t;
+        return {
+            x: uuu * p0.x + 3 * uu * t * p1.x + 3 * u * tt * p2.x + ttt * p3.x,
+            y: uuu * p0.y + 3 * uu * t * p1.y + 3 * u * tt * p2.y + ttt * p3.y
+        };
+    };
+
+    const loop = (now) => {
+        const elapsed = now - startTime;
+        ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+        // Torch flare pulses at each launch
+        const activeLaunch = comets.find(c => elapsed >= c.launchTime && elapsed < c.launchTime + 240);
+        if (activeLaunch) {
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            const fAlpha = Math.max(0, 1 - (elapsed - activeLaunch.launchTime) / 240);
+            ctx.globalAlpha = fAlpha;
+            ctx.beginPath();
+            ctx.arc(x1, y1, 36 * fAlpha, 0, Math.PI * 2);
+            const fGrad = ctx.createRadialGradient(x1, y1, 2, x1, y1, 36 * fAlpha);
+            fGrad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+            fGrad.addColorStop(0.35, 'rgba(251, 191, 36, 0.85)');
+            fGrad.addColorStop(0.7, 'rgba(234, 88, 12, 0.4)');
+            fGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = fGrad;
+            ctx.fill();
+            ctx.restore();
+        }
+
+        // --- UPDATE & RENDER EACH COMET IN QUICK STAGGERED SUCCESSION ---
+        comets.forEach((c, idx) => {
+            if (elapsed < c.launchTime) return;
+
+            if (!c.launched) {
+                c.launched = true;
+                spawnTorchSparks();
+            }
+
+            const cElapsed = elapsed - c.launchTime;
+            const tRaw = Math.min(1, cElapsed / flightTime);
+
+            if (tRaw > 0 && tRaw < 1) {
+                const tEase = tRaw < 0.5 ? 2 * tRaw * tRaw : 1 - Math.pow(-2 * tRaw + 2, 2) / 2;
+                const pos = bezierPoint(tEase, c.p0, c.p1, c.p2, c.p3);
+
+                // Increased trail size for much chunkier, impressive flame body
+                c.trail.push({ x: pos.x, y: pos.y, alpha: 1.0, size: 28 });
+
+                // Shed larger fire sparks and embers along the flight path
+                for (let k = 0; k < 2; k++) {
+                    particles.push({
+                        x: pos.x + (Math.random() - 0.5) * 12,
+                        y: pos.y + (Math.random() - 0.5) * 12,
+                        vx: (Math.random() - 0.5) * 2.2 - (dx / dist) * 0.9,
+                        vy: (Math.random() - 0.5) * 2.2 + 0.6,
+                        size: 2.2 + Math.random() * 3.4,
+                        alpha: 0.95,
+                        decay: 0.022 + Math.random() * 0.02,
+                        color: Math.random() > 0.4 ? '#fffbeb' : (Math.random() > 0.5 ? '#f59e0b' : '#dc2626')
+                    });
+                }
+
+                // Render Substantially Larger Glowing Fireball Comet Head
+                ctx.save();
+                ctx.globalCompositeOperation = 'screen';
+                ctx.beginPath();
+                ctx.arc(pos.x, pos.y, 34, 0, Math.PI * 2);
+                const cHeadGrad = ctx.createRadialGradient(pos.x, pos.y, 3, pos.x, pos.y, 34);
+                cHeadGrad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+                cHeadGrad.addColorStop(0.25, 'rgba(254, 240, 138, 0.95)');
+                cHeadGrad.addColorStop(0.55, 'rgba(249, 115, 22, 0.85)');
+                cHeadGrad.addColorStop(0.85, 'rgba(220, 38, 38, 0.45)');
+                cHeadGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+                ctx.fillStyle = cHeadGrad;
+                ctx.fill();
+
+                // Bright core glint
+                ctx.fillStyle = '#ffffff';
+                ctx.beginPath();
+                ctx.arc(pos.x, pos.y, 8.5, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+
+            } else if (tRaw >= 1 && !c.impacted) {
+                c.impacted = true;
+
+                // Play escalating impact audio per hit
+                try {
+                    const hitSnd = new Audio('./sound_effects/enemy_move.mp3');
+                    const vol = document.getElementById('volume-slider');
+                    hitSnd.volume = vol ? parseFloat(vol.value) : 0.25;
+                    hitSnd.playbackRate = 1.35 + (idx * 0.15); // Ascending punchy tone (1.35, 1.50, 1.65)
+                    hitSnd.play().catch(() => {});
+                } catch (e) {}
+
+                // Expanding Fiery Impact Shockwave
+                shockwaves.push({ x: x2, y: y2, radius: 10, maxRadius: 65, alpha: 0.9 });
+
+                // Card Illumination Flash on Hit
+                locEl.style.transition = 'filter 0.12s ease-out, transform 0.12s ease-out';
+                locEl.style.filter = 'brightness(1.68) contrast(1.15) drop-shadow(0 0 28px #f59e0b) drop-shadow(0 0 55px #ea580c)';
+                locEl.style.transform = 'scale(1.045)';
+                setTimeout(() => {
+                    locEl.style.transition = 'filter 0.35s ease-out, transform 0.35s ease-out';
+                    locEl.style.filter = '';
+                    locEl.style.transform = '';
+                }, 200);
+
+                if (window.LotrEngine && window.LotrEngine.window && window.LotrEngine.window.screenShake) {
+                    window.LotrEngine.window.screenShake(5, 180);
+                }
+
+                // 32+ Radiant Impact Sparks per hit
+                for (let k = 0; k < 32; k++) {
+                    const ang = Math.random() * Math.PI * 2;
+                    const spd = 2.4 + Math.random() * 8.5;
+                    particles.push({
+                        x: x2 + (Math.random() - 0.5) * 20,
+                        y: y2 + (Math.random() - 0.5) * 20,
+                        vx: Math.cos(ang) * spd,
+                        vy: Math.sin(ang) * spd - 1.2,
+                        size: 2.4 + Math.random() * 4.2,
+                        alpha: 1.0,
+                        decay: 0.02 + Math.random() * 0.025,
+                        color: Math.random() > 0.35 ? '#fffbeb' : (Math.random() > 0.4 ? '#f59e0b' : '#dc2626')
+                    });
+                }
+
+                // Increase progress token on location card for this comet
+                if (onHit) onHit(idx);
+            }
+
+            // --- RENDER WIDER, DETAILED SOFT FLAME TAILS ---
+            for (let i = c.trail.length - 1; i >= 0; i--) {
+                const tr = c.trail[i];
+                tr.alpha -= 0.035;
+                if (tr.alpha <= 0) {
+                    c.trail.splice(i, 1);
+                    continue;
+                }
+
+                ctx.save();
+                ctx.globalCompositeOperation = 'screen';
+                ctx.globalAlpha = tr.alpha * 0.8;
+
+                // Outer warm halo (widened)
+                const outerR = tr.size * tr.alpha * 1.45;
+                ctx.beginPath();
+                ctx.arc(tr.x, tr.y, outerR, 0, Math.PI * 2);
+                const outGrad = ctx.createRadialGradient(tr.x, tr.y, 2, tr.x, tr.y, outerR);
+                outGrad.addColorStop(0, 'rgba(254, 215, 170, 0.85)');
+                outGrad.addColorStop(0.4, 'rgba(249, 115, 22, 0.55)');
+                outGrad.addColorStop(0.8, 'rgba(220, 38, 38, 0.25)');
+                outGrad.addColorStop(1, 'rgba(185, 28, 28, 0)');
+                ctx.fillStyle = outGrad;
+                ctx.fill();
+
+                // Inner hot core (widened)
+                const innerR = tr.size * tr.alpha * 0.72;
+                ctx.beginPath();
+                ctx.arc(tr.x, tr.y, innerR, 0, Math.PI * 2);
+                const inGrad = ctx.createRadialGradient(tr.x, tr.y, 0, tr.x, tr.y, innerR);
+                inGrad.addColorStop(0, 'rgba(255, 255, 255, 0.95)');
+                inGrad.addColorStop(0.55, 'rgba(251, 191, 36, 0.75)');
+                inGrad.addColorStop(1, 'rgba(234, 88, 12, 0)');
+                ctx.fillStyle = inGrad;
+                ctx.fill();
+                ctx.restore();
+            }
+        });
+
+        // --- RENDER EXPANDING IMPACT SHOCKWAVES ---
+        for (let i = shockwaves.length - 1; i >= 0; i--) {
+            const sw = shockwaves[i];
+            sw.radius += (sw.maxRadius - sw.radius) * 0.20;
+            sw.alpha -= 0.055;
+            if (sw.alpha <= 0) {
+                shockwaves.splice(i, 1);
+                continue;
+            }
+
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            ctx.globalAlpha = Math.max(0, sw.alpha);
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = '#f59e0b';
+            ctx.shadowColor = '#ea580c';
+            ctx.shadowBlur = 14;
+            ctx.beginPath();
+            ctx.arc(sw.x, sw.y, sw.radius, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        // --- RENDER FLYING SPARKS & EMBERS ---
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const s = particles[i];
+            s.x += s.vx;
+            s.y += s.vy;
+            s.vy += 0.07;
+            s.alpha -= s.decay;
+
+            if (s.alpha <= 0) {
+                particles.splice(i, 1);
+                continue;
+            }
+
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            ctx.globalAlpha = Math.max(0, s.alpha);
+            ctx.fillStyle = s.color;
+            ctx.shadowColor = s.color;
+            ctx.shadowBlur = 8;
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, s.size * Math.max(0.3, s.alpha), 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+
+        const anyTrails = comets.some(c => c.trail.length > 0);
+        if (elapsed < totalDuration || particles.length > 0 || anyTrails || shockwaves.length > 0) {
+            animId = requestAnimationFrame(loop);
+        } else {
+            if (animId) cancelAnimationFrame(animId);
+            canvas.remove();
+            locEl.style.transition = 'filter 0.4s ease-out, transform 0.4s ease-out';
+            locEl.style.filter = '';
+            locEl.style.transform = '';
+            if (onComplete) onComplete();
+        }
+    };
+
+    animId = requestAnimationFrame(loop);
+};
+
+window.triggerTrollFistSmash = function(excessAmount, questEl, trollUid) {
+    const rect = questEl ? questEl.getBoundingClientRect() : { left: window.innerWidth/2 - 100, top: window.innerHeight/2 - 140, width: 200, height: 280 };
+    const qCx = rect.left + rect.width / 2;
+    const qCy = rect.top + rect.height / 2;
+    
+    const trollEl = trollUid ? document.querySelector(`[data-uid="${trollUid}"]`) : null;
+    const tRect = trollEl ? trollEl.getBoundingClientRect() : { left: window.innerWidth/2, top: -200, width: 0, height: 0 };
+    const tCx = tRect.left + tRect.width / 2;
+    const tCy = tRect.top + tRect.height / 2;
+
+    const count = Math.min(excessAmount, 15);
+    const numTokens = Math.max(1, Math.min(4, excessAmount));
+    const tokenTargetEl = questEl ? (questEl.querySelector('.token.progress') || questEl) : null;
+    const tokRect = tokenTargetEl ? tokenTargetEl.getBoundingClientRect() : { left: qCx - 30, top: qCy - 30, width: 60, height: 60 };
+
+    // Inject shared styles with rumble keyframes if not present
+    if (!document.getElementById('troll-smash-anim-styles')) {
+        const st = document.createElement('style');
+        st.id = 'troll-smash-anim-styles';
+        st.textContent = `
+            @keyframes trollTokenViolentRumble {
+                0%, 100% { transform: scale(1) rotate(0deg); }
+                20% { transform: translate(-4px, 2px) scale(1.08) rotate(-5deg); }
+                40% { transform: translate(4px, -2px) scale(0.94) rotate(5deg); }
+                60% { transform: translate(-3px, -2px) scale(1.06) rotate(-3deg); }
+                80% { transform: translate(3px, 2px) scale(0.96) rotate(3deg); }
+            }
+            @keyframes trollSpiderwebCrack {
+                to { stroke-dashoffset: 0; }
+            }
+        `;
+        document.head.appendChild(st);
+    }
+
+    // Spiderweb Fissure overlay: Starts unrendered and only triggers upon impact
+    const fissureW = Math.min(rect.width * 0.88, 250);
+    const fissureH = Math.min(rect.height * 0.88, 250);
+    const fissures = document.createElement('div');
+    fissures.style.cssText = `position:fixed; left:${qCx - fissureW/2}px; top:${qCy - fissureH/2}px; width:${fissureW}px; height:${fissureH}px; z-index:90000; pointer-events:none; border-radius:6px; display:none;`;
+    
+    // Spines and concentric web rings radiating from center (150, 150)
+    const spokePaths = [
+        { d: "M 150 150 L 150 25", delay: 0 },
+        { d: "M 150 150 L 235 65", delay: 0.02 },
+        { d: "M 150 150 L 275 150", delay: 0.01 },
+        { d: "M 150 150 L 235 235", delay: 0.03 },
+        { d: "M 150 150 L 150 275", delay: 0 },
+        { d: "M 150 150 L 65 235", delay: 0.02 },
+        { d: "M 150 150 L 25 150", delay: 0.01 },
+        { d: "M 150 150 L 65 65", delay: 0.03 }
+    ];
+
+    const ringPaths = [
+        { d: "M 150 115 L 175 125 L 185 150 L 175 175 L 150 185 L 125 175 L 115 150 L 125 125 Z", delay: 0.04 },
+        { d: "M 150 80 L 200 100 L 220 150 L 200 200 L 150 220 L 100 200 L 80 150 L 100 100 Z", delay: 0.09 },
+        { d: "M 150 40 L 225 70 L 260 150 L 225 230 L 150 260 L 75 230 L 40 150 L 75 70 Z", delay: 0.15 }
+    ];
+
+    const allCracks = [...spokePaths, ...ringPaths];
+
+    const makeWebLayer = (strokeColor, width) => allCracks.map(item => 
+        `<path d="${item.d}" fill="none" stroke="${strokeColor}" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" pathLength="100" stroke-dasharray="100" stroke-dashoffset="100" style="animation: trollSpiderwebCrack 0.28s cubic-bezier(0.1, 0.8, 0.2, 1) ${item.delay}s forwards;" />`
+    ).join('');
+
+    fissures.innerHTML = `
+        <svg width="100%" height="100%" viewBox="0 0 300 300" preserveAspectRatio="none" style="filter: drop-shadow(0 0 8px #ff0000) drop-shadow(0 0 3px #ffaa00);">
+            <defs>
+                <filter id="trollSoftFissure" x="-20%" y="-20%" width="140%" height="140%">
+                    <feTurbulence type="fractalNoise" baseFrequency="0.04" numOctaves="3" result="noise" />
+                    <feDisplacementMap in="SourceGraphic" in2="noise" scale="5" xChannelSelector="R" yChannelSelector="G" result="displaced" />
+                    <feGaussianBlur in="displaced" stdDeviation="1.6" result="softEdge" />
+                    <feMerge>
+                        <feMergeNode in="softEdge" />
+                        <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                </filter>
+            </defs>
+            <g filter="url(#trollSoftFissure)">
+                ${makeWebLayer('#330000', 4.5)}
+                ${makeWebLayer('#ff2200', 2.0)}
+                ${makeWebLayer('#ffeeaa', 0.8)}
+            </g>
+        </svg>
+    `;
+    document.body.appendChild(fissures);
+
+    // Particle Canvas: kept permanently active until full sequence finish
+    const canvas = document.createElement('canvas');animId = requestAnimationFrame(loop);
+};
+
+window.triggerTrollFistSmash = function(excessAmount, questEl, trollUid, onProgressRemove) {
+    const rect = questEl ? questEl.getBoundingClientRect() : { left: window.innerWidth/2 - 100, top: window.innerHeight/2 - 140, width: 200, height: 280 };
+    const qCx = rect.left + rect.width / 2;
+    const qCy = rect.top + rect.height / 2;
+    
+    const trollEl = trollUid ? document.querySelector(`[data-uid="${trollUid}"]`) : null;
+    const tRect = trollEl ? trollEl.getBoundingClientRect() : { left: window.innerWidth/2, top: -200, width: 0, height: 0 };
+    const tCx = tRect.left + tRect.width / 2;
+    const tCy = tRect.top + tRect.height / 2;
+
+    const count = Math.min(excessAmount, 15);
+    const numTokens = Math.max(1, Math.min(4, excessAmount));
+    const tokenTargetEl = questEl ? (questEl.querySelector('.token.progress') || questEl) : null;
+    const tokRect = tokenTargetEl ? tokenTargetEl.getBoundingClientRect() : { left: qCx - 30, top: qCy - 30, width: 60, height: 60 };
+
+    if (!document.getElementById('troll-smash-anim-styles')) {
+        const st = document.createElement('style');
+        st.id = 'troll-smash-anim-styles';
+        st.textContent = `
+            @keyframes trollTokenViolentRumble {
+                0%, 100% { transform: scale(1) rotate(0deg); }
+                20% { transform: translate(-4px, 2px) scale(1.08) rotate(-5deg); }
+                40% { transform: translate(4px, -2px) scale(0.94) rotate(5deg); }
+                60% { transform: translate(-3px, -2px) scale(1.06) rotate(-3deg); }
+                80% { transform: translate(3px, 2px) scale(0.96) rotate(3deg); }
+            }
+            @keyframes trollCrackTear {
+                to { stroke-dashoffset: 0; }
+            }
+        `;
+        document.head.appendChild(st);
+    }
+
+    // Natural Branching Seismic Fissure (Organic lightning/earthquake fault lines from center out)
+    const fissureW = Math.min(rect.width * 0.9, 260);
+    const fissureH = Math.min(rect.height * 0.9, 260);
+    const fissures = document.createElement('div');
+    fissures.style.cssText = `position:fixed; left:${qCx - fissureW/2}px; top:${qCy - fissureH/2}px; width:${fissureW}px; height:${fissureH}px; z-index:90000; pointer-events:none; border-radius:6px; display:none;`;
+    
+    const crackBranches = [
+        // Primary trunks (radiating outwards from 150, 150)
+        { d: "M 150 150 L 165 125 L 185 110 L 210 95 L 245 70 L 270 50", delay: 0, dur: 0.45 },
+        { d: "M 150 150 L 130 170 L 115 195 L 90 220 L 60 250 L 35 270", delay: 0.02, dur: 0.45 },
+        { d: "M 150 150 L 135 130 L 110 115 L 85 95 L 50 85 L 25 70", delay: 0.03, dur: 0.48 },
+        { d: "M 150 150 L 170 165 L 195 190 L 225 210 L 255 240 L 280 265", delay: 0.01, dur: 0.45 },
+        { d: "M 150 150 L 155 180 L 145 215 L 155 250 L 148 285", delay: 0.04, dur: 0.46 },
+        { d: "M 150 150 L 145 120 L 155 85 L 145 50 L 152 20", delay: 0.02, dur: 0.44 },
+        // Secondary forks
+        { d: "M 185 110 L 195 85 L 220 70", delay: 0.16, dur: 0.35 },
+        { d: "M 210 95 L 235 115 L 260 120", delay: 0.22, dur: 0.32 },
+        { d: "M 115 195 L 85 190 L 55 195", delay: 0.15, dur: 0.36 },
+        { d: "M 90 220 L 95 250 L 80 280", delay: 0.20, dur: 0.34 },
+        { d: "M 110 115 L 115 85 L 105 55", delay: 0.17, dur: 0.34 },
+        { d: "M 85 95 L 75 125 L 50 140", delay: 0.21, dur: 0.32 },
+        { d: "M 195 190 L 225 180 L 255 175", delay: 0.16, dur: 0.35 },
+        { d: "M 225 210 L 230 240 L 245 270", delay: 0.22, dur: 0.32 },
+        { d: "M 145 215 L 130 240 L 120 270", delay: 0.18, dur: 0.33 }
+    ];
+
+    const makeLayer = (strokeColor, width) => crackBranches.map(b => 
+        `<path d="${b.d}" fill="none" stroke="${strokeColor}" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" pathLength="100" stroke-dasharray="100" stroke-dashoffset="100" style="animation: trollCrackTear ${b.dur}s cubic-bezier(0.18, 0.9, 0.3, 1) ${b.delay}s forwards;" />`
+    ).join('');
+
+    fissures.innerHTML = `
+        <svg width="100%" height="100%" viewBox="0 0 300 300" preserveAspectRatio="none" style="filter: drop-shadow(0 0 8px #ff0000) drop-shadow(0 0 3px #ffaa00);">
+            <defs>
+                <filter id="magmaFissureGlow" x="-20%" y="-20%" width="140%" height="140%">
+                    <feTurbulence type="fractalNoise" baseFrequency="0.04" numOctaves="4" result="noise" />
+                    <feDisplacementMap in="SourceGraphic" in2="noise" scale="5" xChannelSelector="R" yChannelSelector="G" result="displaced" />
+                    <feGaussianBlur in="displaced" stdDeviation="2.8" result="softGlow" />
+                    <feMerge>
+                        <feMergeNode in="softGlow" />
+                        <feMergeNode in="displaced" />
+                    </feMerge>
+                </filter>
+            </defs>
+            <g filter="url(#magmaFissureGlow)">
+                ${makeLayer('#200000', 5.5)}
+                ${makeLayer('#ff2200', 2.6)}
+                ${makeLayer('#fff2b2', 1.0)}
+            </g>
+        </svg>
+    `;
+    document.body.appendChild(fissures);
+
+    // Particle Canvas: kept active throughout the full sequence
+    const canvas = document.createElement('canvas');
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    canvas.style.cssText = 'position:fixed; inset:0; z-index:99998; pointer-events:none;';
+    document.body.appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+    const particles = [];
+    const allGemPalette = ['#e63946', '#ff4d4d', '#ff758f', '#b7094c', '#f5d76e', '#e9c46a', '#ee9b00'];
+    const rockColors = ['#404040', '#5a5a5a', '#2c2c2c', '#1a1a1a', '#33272a'];
+
+    // Slower, graceful, drifting disintegration particles for the tokens
+    const spawnTokenShatterBurst = (originX, originY) => {
+        // Shards (slower and floating)
+        for (let i = 0; i < 35; i++) {
+            particles.push({
+                type: 'shard',
+                x: originX + (Math.random() - 0.5) * 14,
+                y: originY + (Math.random() - 0.5) * 14,
+                vx: (Math.random() - 0.5) * 4.8,
+                vy: - (Math.random() * 4.2 + 2.0),
+                size: Math.random() * 3.4 + 2.2,
+                rot: Math.random() * Math.PI * 2,
+                vrot: (Math.random() - 0.5) * 0.06,
+                aspect: 0.55 + Math.random() * 0.35,
+                color: allGemPalette[Math.floor(Math.random() * allGemPalette.length)],
+                alpha: 1,
+                decay: 0.0035 + Math.random() * 0.0025,
+                phase: Math.random() * Math.PI * 2
+            });
+        }
+        // Sparks (gently ascending)
+        for (let i = 0; i < 22; i++) {
+            particles.push({
+                type: 'spark',
+                x: originX + (Math.random() - 0.5) * 18,
+                y: originY + (Math.random() - 0.5) * 18,
+                vx: (Math.random() - 0.5) * 3.5,
+                vy: - (Math.random() * 3.8 + 1.8),
+                size: Math.random() * 2.8 + 2.0,
+                rot: Math.random() * Math.PI * 2,
+                vrot: (Math.random() - 0.5) * 0.05,
+                color: Math.random() > 0.4 ? '#ffffff' : '#f5d76e',
+                alpha: 1,
+                decay: 0.0042 + Math.random() * 0.0025,
+                phase: Math.random() * Math.PI * 2
+            });
+        }
+        // Token Stone Fragments (slower tumble)
+        for (let i = 0; i < 20; i++) {
+            particles.push({
+                type: 'rock',
+                x: originX + (Math.random() - 0.5) * 16,
+                y: originY + (Math.random() - 0.5) * 16,
+                vx: (Math.random() - 0.5) * 4.2,
+                vy: - (Math.random() * 3.5 + 1.5),
+                size: 3.5 + Math.random() * 8,
+                color: rockColors[Math.floor(Math.random() * rockColors.length)],
+                rot: Math.random() * Math.PI * 2,
+                vrot: (Math.random() - 0.5) * 0.05,
+                alpha: 1,
+                decay: 0.0045 + Math.random() * 0.0025,
+                phase: Math.random() * Math.PI * 2
+            });
+        }
+    };
+
+    let isSequenceRunning = true;
+    const renderLoop = () => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        let livingCount = 0;
+
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const p = particles[i];
+            
+            // Slower floating air physics for token pieces vs snappy physics for boulders
+            if (p.isBoulderDebris) {
+                p.vy += 1.0;
+                p.x += p.vx;
+                p.y += p.vy;
+                p.rot += p.vrot;
+                p.alpha -= p.decay;
+
+                if (p.y >= window.innerHeight - p.size * 2) {
+                    p.y = window.innerHeight - p.size * 2;
+                    p.vy *= -0.52;
+                    p.vx *= 0.82;
+                }
+            } else {
+                p.vx *= 0.985;
+                p.vy += 0.09; // Light gravity
+                p.x += p.vx + Math.sin(p.y * 0.02 + p.phase) * 0.28;
+                p.y += p.vy;
+                p.rot += p.vrot;
+                p.alpha -= p.decay;
+            }
+
+            if (p.alpha <= 0) {
+                particles.splice(i, 1);
+                continue;
+            }
+            livingCount++;
+
+            ctx.save();
+            ctx.globalAlpha = Math.max(0, p.alpha);
+            ctx.translate(p.x, p.y);
+            ctx.rotate(p.rot);
+
+            if (p.type === 'shard') {
+                const sz = p.size;
+                const asp = p.aspect;
+                ctx.fillStyle = p.color;
+                ctx.beginPath();
+                ctx.moveTo(0, -sz * 1.4);
+                ctx.lineTo(sz * asp, 0);
+                ctx.lineTo(0, sz * 1.2);
+                ctx.lineTo(-sz * asp, 0);
+                ctx.closePath();
+                ctx.fill();
+
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
+                ctx.lineWidth = 0.5;
+                ctx.beginPath();
+                ctx.moveTo(0, -sz * 1.4);
+                ctx.lineTo(0, sz * 1.2);
+                ctx.stroke();
+            } else if (p.type === 'spark') {
+                const sp = p.size;
+                ctx.fillStyle = p.color;
+                ctx.beginPath();
+                ctx.moveTo(0, -sp * 1.8);
+                ctx.quadraticCurveTo(0, 0, sp * 1.8, 0);
+                ctx.quadraticCurveTo(0, 0, 0, sp * 1.8);
+                ctx.quadraticCurveTo(0, 0, -sp * 1.8, 0);
+                ctx.quadraticCurveTo(0, 0, 0, -sp * 1.8);
+                ctx.closePath();
+                ctx.fill();
+            } else {
+                ctx.fillStyle = p.color;
+                ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size);
+            }
+            ctx.restore();
+        }
+
+        if (isSequenceRunning || livingCount > 0) {
+            requestAnimationFrame(renderLoop);
+        } else {
+            canvas.remove();
+        }
+    };
+    requestAnimationFrame(renderLoop);
+
+    // Throw boulders directly to the center of quest card and shatter
+    const throwDuration = 260;
+    const dropBoulder = (index) => {
+        const size = 34 + Math.random() * 22;
+        const boulder = document.createElement('div');
+        const startX = tCx - size / 2 + (Math.random() - 0.5) * 30;
+        const startY = tCy - size / 2 + (Math.random() - 0.5) * 30;
+        const targetX = qCx - size / 2;
+        const targetY = qCy - size / 2;
+
+        boulder.style.cssText = `
+            position: fixed; z-index: 99999;
+            left: ${startX}px; top: ${startY}px;
+            width: ${size}px; height: ${size}px;
+            border-radius: ${40 + Math.random() * 20}% ${40 + Math.random() * 20}% ${40 + Math.random() * 20}% ${40 + Math.random() * 20}% / ${40 + Math.random() * 20}% ${40 + Math.random() * 20}% ${40 + Math.random() * 20}% ${40 + Math.random() * 20}%;
+            background: radial-gradient(circle at 30% 30%, #8c8c8c 0%, #4a4a4a 40%, #1f1f1f 80%, #000 100%);
+            box-shadow: inset -5px -8px 15px rgba(0,0,0,0.95), inset 3px 5px 10px rgba(255,255,255,0.4), 0 10px 20px rgba(0,0,0,0.8);
+            pointer-events: none;
+            transform: rotate(${Math.random() * 360}deg);
+            transition: left ${throwDuration}ms cubic-bezier(0.2, 0.8, 0.4, 1), top ${throwDuration}ms cubic-bezier(0.4, 0, 1, 1), transform ${throwDuration}ms linear;
+        `;
+        document.body.appendChild(boulder);
+
+        void boulder.offsetWidth;
+        boulder.style.left = `${targetX}px`;
+        boulder.style.top = `${targetY}px`;
+        boulder.style.transform = `rotate(${Math.random() * 360 + 540}deg) scale(0.9)`;
+
+        setTimeout(() => {
+            boulder.remove();
+
+            if (window.LotrEngine && window.LotrEngine.window && window.LotrEngine.window.screenShake) {
+                window.LotrEngine.window.screenShake(35, 450);
+            }
+
+            try {
+                const vol = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                const snd = new Audio('./sound_effects/dark_of_mirkwood/troll_smash.mp3');
+                snd.volume = vol;
+                snd.playbackRate = 0.95 + Math.random() * 0.3;
+                snd.play().catch(() => {
+                    const fb = new Audio('./sound_effects/dark_of_mirkwood/cracked_pillar.mp3');
+                    fb.volume = vol; fb.play().catch(() => {});
+                });
+            } catch (e) {}
+
+            // Snappy boulder impact debris
+            for (let k = 0; k < 12; k++) {
+                particles.push({
+                    type: 'rock',
+                    isBoulderDebris: true,
+                    x: qCx, y: qCy,
+                    vx: (Math.random() - 0.5) * 36,
+                    vy: -12 - Math.random() * 24,
+                    size: 4 + Math.random() * 12,
+                    color: rockColors[Math.floor(Math.random() * rockColors.length)],
+                    rot: Math.random() * Math.PI * 2,
+                    vrot: (Math.random() - 0.5) * 0.4,
+                    alpha: 1,
+                    decay: 0.012 + Math.random() * 0.008
+                });
+            }
+
+            // Reveal and tear the jagged fissure branches outward from center on impact
+            if (index === 0) {
+                fissures.style.display = 'block';
+                if (questEl) {
+                    questEl.style.transition = 'filter 0.1s ease-out';
+                    questEl.style.filter = 'brightness(1.4) contrast(1.2) drop-shadow(0 0 18px #ff3030)';
+                }
+            }
+        }, throwDuration);
+    };
+
+    for (let i = 0; i < count; i++) {
+        setTimeout(() => dropBoulder(i), i * 110);
+    }
+
+    // Progress tokens shake and explode into slower drifting particles
+    const tokenDelay = throwDuration + 100;
+    setTimeout(() => {
+        const wrapCenterX = tokRect.left + tokRect.width / 2;
+        const wrapCenterY = tokRect.top + tokRect.height / 2;
+        const tokensWrap = document.createElement('div');
+        tokensWrap.style.cssText = `
+            position: fixed; z-index: 100008; pointer-events: none;
+            left: ${wrapCenterX}px; top: ${wrapCenterY}px;
+            transform: translate(-50%, -50%);
+            display: flex; align-items: center; justify-content: center;
+            gap: 16px;
+        `;
+
+        let tokensHTML = '';
+        for (let i = 0; i < numTokens; i++) {
+            tokensHTML += `
+                <div class="troll-excess-token" style="
+                    position: relative; width: 50px; height: 50px;
+                    transform-origin: center center;
+                    animation: trollTokenViolentRumble 0.1s ease-in-out infinite;
+                    transition: opacity 0.25s ease-out, transform 0.25s ease-out, filter 0.25s ease-out;
+                ">
+                    <img src="tokens/travel.png" style="width: 100%; height: 100%; object-fit: contain; display: block; filter: drop-shadow(0 4px 10px rgba(0,0,0,0.95));" alt="Progress Token" />
+                </div>
+            `;
+        }
+        tokensWrap.innerHTML = tokensHTML;
+        document.body.appendChild(tokensWrap);
+
+        const tokenElements = tokensWrap.querySelectorAll('.troll-excess-token');
+
+        tokenElements.forEach((tEl, idx) => {
+            const shatterDelay = 220 + idx * 160;
+            setTimeout(() => {
+                const bRect = tEl.getBoundingClientRect();
+                const tokenX = bRect.left + bRect.width / 2;
+                const tokenY = bRect.top + bRect.height / 2;
+
+                try {
+                    const audio = new Audio('sound_effects/dark_of_mirkwood/goblin_chieftain_progress.mp3');
+                    const volSlider = document.getElementById('volume-slider');
+                    audio.volume = volSlider ? parseFloat(volSlider.value) : 0.45;
+                    audio.play().catch(() => {});
+                } catch (e) {}
+
+                tEl.style.filter = 'brightness(3.5) drop-shadow(0 0 20px #ffffff)';
+                tEl.style.transform = 'scale(1.25)';
+                tEl.style.opacity = '0';
+
+                // Spawn slow, floating shards and sparks
+                spawnTokenShatterBurst(tokenX, tokenY);
+
+                if (window.LotrEngine && window.LotrEngine.window && window.LotrEngine.window.screenShake) {
+                    window.LotrEngine.window.screenShake(16, 250);
+                }
+            }, shatterDelay);
+        });
+
+        const totalShatterTime = 220 + numTokens * 160;
+        setTimeout(() => {
+            tokensWrap.remove();
+
+            // Progress tokens are now officially removed at this exact moment
+            if (typeof onProgressRemove === 'function') {
+                onProgressRemove();
+            }
+
+            const bigText = document.createElement('div');
+            bigText.style.cssText = "position:fixed; top:50%; left:50%; transform:translate(-50%, -50%) scale(0.5); z-index:100000; font-family:'Cinzel Decorative', serif; font-size:5.5rem; font-weight:900; color:#ff3030; text-shadow:0 0 35px #ff0000, 0 6px 20px #000; opacity:0; transition:all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); text-align:center; pointer-events:none;";
+            bigText.innerHTML = `-${excessAmount} Progress!`;
+            document.body.appendChild(bigText);
+
+            setTimeout(() => {
+                bigText.style.transform = 'translate(-50%, -50%) scale(1)';
+                bigText.style.opacity = '1';
+            }, 30);
+
+            setTimeout(() => {
+                bigText.style.transform = 'translate(-50%, -100px) scale(1.2)';
+                bigText.style.opacity = '0';
+                setTimeout(() => bigText.remove(), 400);
+            }, 1400);
+
+            // Fade out fissures and wrap up particle canvas sooner
+            setTimeout(() => {
+                fissures.style.transition = 'opacity 0.45s ease-out';
+                fissures.style.opacity = '0';
+                if (questEl) {
+                    questEl.style.transition = 'filter 0.45s ease-out';
+                    questEl.style.filter = '';
+                }
+                setTimeout(() => {
+                    fissures.remove();
+                    isSequenceRunning = false;
+                }, 450);
+            }, 750);
+        }, totalShatterTime);
+    }, tokenDelay);
+};
+
+// ==========================================
+// FX Forge: Crumbling Ruin Outcome Effects
+// ==========================================
+function createCrumblingDestroyedEffect(canvas) {
+  const ctx = canvas.getContext("2d");
+
+  // ---- The effect ----
+  // layers: each is one group of particles. duration = how long it keeps
+  // emitting (0 = all at once); delay = when it starts, in seconds.
+  const EFFECT = {
+    shake: 0.25, flash: 0, flashColor: "#9a4cff",
+    layers: [
+      { shape: "ring", count: 1, speed: 0, drag: 1.345, life: 0.431, lifeVar: 0, size: 10, sizeEnd: 169.735, sizeVar: 0, colors: ["#ffffff", "#9a4cff", "#0a0014"] },
+      { shape: "glow", blend: "normal", duration: 1.373, count: 16, speed: 0, drag: 1.345, life: 0.446, size: 64.573, sizeEnd: 57.193, fade: "none", colors: ["#05000a", "#12002a"] },
+      { shape: "spark", emitter: "ring", radius: 64.573, duration: 1.373, count: 230, speed: 18.836, drag: 1.345, swirl: 3.97, attract: 0.272, life: 0.818, size: 6, stretch: 0.6, colors: ["#e0b0ff", "#9a4cff", "#0a0014"] },
+      { shape: "glow", emitter: "spiral", radius: 92.247, duration: 1.373, count: 115, speed: 13.454, speedVar: 0.6, angle: -59.36, drag: 1.345, swirl: 2.482, turbulence: 253.428, life: 0.892, lifeVar: 0.4, size: 25.091, sizeEnd: 56.455, sizeVar: 0.5, colors: ["#e0b0ff", "#9a4cff", "#4a0a8a", "#0a0014"] },
+      { shape: "ring", count: 1, speed: 0, drag: 1.345, life: 1.896, lifeVar: 0, size: 138.371, sizeEnd: 147.595, sizeVar: 0, fade: "inout", colors: ["#9a4cff", "#0a0014"] },
+      { shape: "skull", emitter: "ring", radius: 50.736, delay: 0.061, duration: 1.373, count: 9, speed: 0, angle: -59.36, gravity: -90.51, drag: 2.422, swirl: -1.884, turbulence: 72.408, life: 0.966, size: 18.265, sizeEnd: 8.302, fade: "inout", colors: ["#ffffff", "#9a4cff", "#0a0014"] },
+      { shape: "glow", delay: 1.373, count: 3, speed: 0, drag: 1.345, life: 0.238, lifeVar: 0, size: 110.697, sizeEnd: 30, colors: ["#ffffff", "#e0b0ff", "#9a4cff"] },
+      { shape: "ring", delay: 1.373, count: 1, speed: 0, drag: 1.345, life: 0.439, lifeVar: 0, size: 10, sizeEnd: 190.952, sizeVar: 0, colors: ["#ffffff", "#9a4cff", "#0a0014"] },
+      { shape: "spark", delay: 1.373, count: 57, speed: 702.653, speedVar: 0.7, angle: -59.36, gravity: -36.204, drag: 1.884, turbulence: 152.057, life: 0.806, lifeVar: 0.5, size: 4.612, sizeVar: 0.5, stretch: 1.2, fade: "flicker", colors: ["#e0b0ff", "#9a4cff", "#0a0014"] },
+    ],
+  };
+  const LAYER_DEFAULTS = { blend: "add", emitter: "point", radius: 0, delay: 0, duration: 0, speed: 200, speedVar: 0.5, angle: -90, spread: 360, gravity: 0, drag: 1, swirl: 0, attract: 0, turbulence: 0, bounce: 0, life: 0.8, lifeVar: 0.3, size: 16, sizeEnd: 0, sizeVar: 0.4, spin: 0, stretch: 0, fade: "out", ox: 0, oy: 0 };
+  const GLOW = 1; // bloom strength: 0 = off, 1 = normal, 2 = blazing
+
+  // ---- Particle images: each layer is pre-drawn in 16 tints along its colours ----
+  const STEPS = 16, SPR = 64;
+  const newCanvas = (w, h) => Object.assign(document.createElement("canvas"), { width: w, height: h });
+  const hex = (h) => { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
+  function tint(colors, t) {
+    const f = Math.min(0.9999, t) * (colors.length - 1), i = Math.floor(f), k = f - i;
+    const a = hex(colors[i]), b = hex(colors[Math.min(i + 1, colors.length - 1)]);
+    return a.map((c, j) => Math.round(c + (b[j] - c) * k));
+  }
+  const DRAW = {
+    ring(g, m, col) {
+      g.strokeStyle = col(1); g.lineWidth = m * 0.1; g.shadowColor = col(1); g.shadowBlur = 6;
+      g.beginPath(); g.arc(m, m, m - 5, 0, 7); g.stroke();
+      g.strokeStyle = "rgba(255,255,255,0.7)"; g.lineWidth = m * 0.03; g.stroke();
+    },
+    glow(g, m, col) {
+      const gr = g.createRadialGradient(m, m, 0, m, m, m);
+      gr.addColorStop(0, col(1)); gr.addColorStop(0.25, col(0.55)); gr.addColorStop(0.6, col(0.15)); gr.addColorStop(1, col(0));
+      g.fillStyle = gr; g.fillRect(0, 0, m * 2, m * 2);
+    },
+    spark(g, m, col) {
+      const gr = g.createRadialGradient(m, m, 0, m, m, m);
+      gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(0.18, col(1)); gr.addColorStop(0.45, col(0.25)); gr.addColorStop(1, col(0));
+      g.fillStyle = gr; g.fillRect(0, 0, m * 2, m * 2);
+    },
+    skull(g, m, col) {
+      g.translate(m, m); g.fillStyle = col(1); g.shadowColor = col(1); g.shadowBlur = 6;
+      g.beginPath(); g.arc(0, -m * 0.12, m * 0.66, Math.PI * 0.8, Math.PI * 2.2); g.lineTo(m * 0.36, m * 0.72); g.lineTo(-m * 0.36, m * 0.72); g.closePath(); g.fill();
+      g.shadowBlur = 0; g.globalCompositeOperation = "destination-out";
+      g.beginPath(); g.ellipse(-m * 0.26, -m * 0.06, m * 0.17, m * 0.2, 0.2, 0, 7); g.ellipse(m * 0.26, -m * 0.06, m * 0.17, m * 0.2, -0.2, 0, 7); g.fill();
+      g.beginPath(); g.moveTo(0, m * 0.16); g.lineTo(m * 0.09, m * 0.32); g.lineTo(-m * 0.09, m * 0.32); g.closePath(); g.fill();
+      g.lineWidth = m * 0.06; g.beginPath(); for (let k = -2; k <= 2; k++) { g.moveTo(k * m * 0.13, m * 0.5); g.lineTo(k * m * 0.13, m * 0.72); } g.stroke();
+      g.globalCompositeOperation = "source-over";
+    },
+  };
+  const SOFT = { ring: 1, skull: 1 }; // crisp shapes get a soft edge + glow halo
+  function blurInto(dst, src, px, alpha) {
+    const g = dst.getContext("2d");
+    g.globalAlpha = alpha;
+    if (typeof g.filter === "string") { g.filter = `blur(${px}px)`; g.drawImage(src, 0, 0); g.filter = "none"; }
+    else { const k = Math.max(1.5, px), t = newCanvas(Math.ceil(src.width / k), Math.ceil(src.height / k)); t.getContext("2d").drawImage(src, 0, 0, t.width, t.height); g.drawImage(t, 0, 0, dst.width, dst.height); }
+    g.globalAlpha = 1;
+  }
+  function makeSprite(shape, rgb, v) {
+    const col = (a) => `rgba(${rgb},${a})`;
+    const size = SOFT[shape] ? SPR * 1.5 : SPR, c = newCanvas(size, size), g = c.getContext("2d");
+    g.translate((size - SPR) / 2, (size - SPR) / 2);
+    DRAW[shape](g, SPR / 2, col, v);
+    if (!SOFT[shape]) return c;
+    const out = newCanvas(size, size);
+    blurInto(out, c, 5, 0.22); // halo
+    blurInto(out, c, 1.2, 1);  // soft-edged shape
+    return out;
+  }
+  const VARIANTS = {};
+  for (const l of EFFECT.layers) {
+    for (const k in LAYER_DEFAULTS) if (l[k] === undefined) l[k] = LAYER_DEFAULTS[k];
+    l.pad = SOFT[l.shape] ? 1.5 : 1;
+    l.css = []; l.sprites = [];
+    for (let v = 0; v < (VARIANTS[l.shape] || 1); v++) {
+      const row = [];
+      for (let i = 0; i < STEPS; i++) {
+        const rgb = tint(l.colors, i / (STEPS - 1));
+        row.push(makeSprite(l.shape, rgb, v));
+        if (!v) l.css.push(`rgb(${rgb})`);
+      }
+      l.sprites.push(row);
+    }
+  }
+
+  // ---- Simulation ----
+  let parts = [], bursts = [], shake = 0, flash = 0, flashX = 0, flashY = 0, flashColor = "#fff", time = 0, last = 0, running = false;
+  let view = { w: 1, h: 1 };
+  function measure() { const r = canvas.getBoundingClientRect(); view = { w: r.width || canvas.width, h: r.height || canvas.height }; }
+
+  function spawn(b, l, n) {
+    let x = b.x + l.ox, y = b.y + l.oy, ringAngle = null;
+    if (l.emitter === "ring") { const a = Math.random() * 6.283; ringAngle = a; x += Math.cos(a) * l.radius; y += Math.sin(a) * l.radius; }
+    if (l.emitter === "spiral") { // arms wind outward in emission order (3 turns)
+      const f = l.count > 1 ? n / (l.count - 1) : 0, a = f * 18.85 + l.angle * Math.PI / 180;
+      x += Math.cos(a) * l.radius * f; y += Math.sin(a) * l.radius * f; ringAngle = a + 1.2;
+    }
+    let ang = (l.angle + (Math.random() - 0.5) * l.spread) * Math.PI / 180;
+    if (ringAngle !== null && l.spread >= 359) ang = ringAngle; // rings spray outward
+    const sp = l.speed * (1 - l.speedVar * Math.random()), sv = 1 - l.sizeVar * Math.random() * 0.8;
+    parts.push({
+      b, l, x, y, sx: x, sy: y, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, age: 0,
+      life: l.life * (1 - l.lifeVar * Math.random() * 0.9), s0: l.size * sv, s1: l.sizeEnd * sv,
+      rot: Math.random() * 6.283, vr: l.spin * (Math.PI / 180) * (0.5 + Math.random()),
+      seed: Math.random(), v: Math.floor(Math.random() * l.sprites.length),
+    });
+  }
+
+  function update(dt) {
+    time += dt;
+    for (const b of bursts) {
+      const prev = b.t;
+      b.t += dt;
+      b.fx.layers.forEach((l, i) => {
+        if (b.t < l.delay || b.n[i] >= l.count) return;
+        if (l.duration <= 0) { while (b.n[i] < l.count) { spawn(b, l, b.n[i]); b.n[i]++; } return; }
+        b.acc[i] += Math.max(0, Math.min(b.t, l.delay + l.duration) - Math.max(prev, l.delay)) * (l.count / l.duration);
+        while (b.acc[i] >= 1 && b.n[i] < l.count) { spawn(b, l, b.n[i]); b.n[i]++; b.acc[i] -= 1; }
+        if (b.t >= l.delay + l.duration) b.n[i] = l.count;
+      });
+    }
+    bursts = bursts.filter((b) => b.n.some((n, i) => n < b.fx.layers[i].count));
+    parts = parts.filter((p) => {
+      const l = p.l;
+      p.age += dt;
+      if (p.age >= p.life) return false;
+      if (l.attract) { // pull toward (or push from) where it was fired
+        const dx = p.x - p.b.x, dy = p.y - p.b.y;
+        p.vx -= dx * l.attract * 4 * dt; p.vy -= dy * l.attract * 4 * dt;
+        if (l.attract > 0 && dx * dx + dy * dy < 30 && p.age > 0.1) return false;
+      }
+      if (l.turbulence) {
+        p.vx += Math.sin(p.y * 0.021 + time * 2.7 + p.seed * 9) * l.turbulence * dt * 3;
+        p.vy += Math.cos(p.x * 0.019 + time * 2.3 + p.seed * 7) * l.turbulence * dt * 3;
+      }
+      p.vy += l.gravity * dt;
+      if (l.drag) { const k = Math.exp(-l.drag * dt); p.vx *= k; p.vy *= k; }
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      if (l.swirl) { // orbit around where it was fired
+        const dx = p.x - p.b.x, dy = p.y - p.b.y, c = Math.cos(l.swirl * dt), s = Math.sin(l.swirl * dt);
+        p.x = p.b.x + dx * c - dy * s; p.y = p.b.y + dx * s + dy * c;
+      }
+      p.rot += p.vr * dt;
+      return true;
+    });
+    shake = Math.max(0, shake - dt * 2.2);
+    flash = Math.max(0, flash - dt * 3.5);
+  }
+
+  // ---- Drawing ----
+  function fadeAt(fade, t, seed) {
+    if (fade === "inout") return Math.sin(Math.PI * Math.min(1, t));
+    if (fade === "flicker") return (1 - t) * (Math.random() < 0.3 ? 0.25 : 1);
+    if (fade === "none") return t > 0.9 ? (1 - t) * 10 : 1;
+    return Math.min(1, t * 25) * (1 - t);
+  }
+  function drawParticles(g, glowPass) {
+    for (const p of parts) {
+      const l = p.l;
+      if (glowPass && l.blend !== "add") continue;
+      const t = p.age / p.life, a = fadeAt(l.fade, t, p.seed);
+      if (a <= 0.003) continue;
+      g.globalCompositeOperation = l.blend === "add" ? "lighter" : "source-over";
+      g.globalAlpha = Math.min(1, a);
+      const si = Math.min(STEPS - 1, Math.floor(t * STEPS));
+      const size = Math.max(0.5, p.s0 + (p.s1 - p.s0) * t) * (glowPass ? 1.2 : 1);
+      const img = l.sprites[p.v][si], s = size * l.pad;
+      g.save();
+      g.translate(p.x, p.y);
+      if (l.stretch > 0) { // streak along the direction of travel
+        const len = s * (1 + (Math.hypot(p.vx, p.vy) / 120) * l.stretch);
+        g.rotate(Math.atan2(p.vy, p.vx));
+        g.drawImage(img, -len / 2, -s / 2, len, s);
+        g.restore();
+        continue;
+      }
+      if (p.vr || [].includes(l.shape)) g.rotate(p.rot);
+      g.drawImage(img, -s / 2, -s / 2, s, s);
+      g.restore();
+    }
+  }
+
+  // Glow: glowing particles drawn small, stretched back up (= blur) and added
+  // on top. The small buffer fades instead of clearing, leaving light trails.
+  const glowBuf = newCanvas(8, 8), wideBuf = newCanvas(4, 4);
+  function bloom(w, h) {
+    const bw = Math.ceil(w / 4), bh = Math.ceil(h / 4);
+    if (glowBuf.width !== bw || glowBuf.height !== bh) { glowBuf.width = bw; glowBuf.height = bh; wideBuf.width = Math.ceil(bw / 3); wideBuf.height = Math.ceil(bh / 3); }
+    const g = glowBuf.getContext("2d"), wg = wideBuf.getContext("2d");
+    g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = "destination-out";
+    g.fillStyle = "rgba(0,0,0,0.62)"; g.fillRect(0, 0, bw, bh);
+    g.setTransform(0.25, 0, 0, 0.25, 0, 0);
+    drawParticles(g, true);
+    wg.clearRect(0, 0, wideBuf.width, wideBuf.height); wg.drawImage(glowBuf, 0, 0, wideBuf.width, wideBuf.height);
+    ctx.globalCompositeOperation = "lighter";
+    ctx.globalAlpha = Math.min(1, 0.16 * GLOW); ctx.drawImage(glowBuf, 0, 0, w, h);
+    ctx.globalAlpha = Math.min(1, 0.17 * GLOW); ctx.drawImage(wideBuf, -6, -6, w + 12, h + 12);
+  }
+
+  function render() {
+    const { w, h } = view, k = canvas.width / w;
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+    ctx.clearRect(0, 0, w, h);
+    const sh = shake * shake * 16;
+    ctx.translate((Math.random() * 2 - 1) * sh, (Math.random() * 2 - 1) * sh);
+    drawParticles(ctx, false);
+    if (GLOW > 0) bloom(w, h);
+    if (flash > 0) { // a burst of light from where it was fired
+      const f = Math.min(1, flash), gr = ctx.createRadialGradient(flashX, flashY, 0, flashX, flashY, Math.hypot(w, h) * (0.55 + (1 - f) * 0.5));
+      gr.addColorStop(0, flashColor); gr.addColorStop(0.35, flashColor); gr.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.globalCompositeOperation = "lighter"; ctx.globalAlpha = Math.min(0.62, f * 0.52); ctx.fillStyle = gr; ctx.fillRect(-20, -20, w + 40, h + 40);
+    }
+  }
+
+  function frame(now) {
+    update(Math.min(0.05, (now - last) / 1000));
+    last = now;
+    render();
+    if (parts.length || bursts.length || flash > 0) requestAnimationFrame(frame);
+    else { running = false; render(); }
+  }
+
+  function playDestroyedSound() {
+    try {
+      const snd = new Audio("./sound_effects/dark_of_mirkwood/crumbling_ruin_destroyed.mp3");
+      const volSlider = document.getElementById("volume-slider");
+      snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+      snd.play().catch(() => {});
+    } catch (e) {}
+  }
+
+  function start(fx, x, y) {
+    playDestroyedSound();
+    bursts.push({ fx, x, y, t: 0, n: fx.layers.map(() => 0), acc: fx.layers.map(() => 0) });
+    shake = Math.max(shake, fx.shake);
+    if (fx.flash > 0) { flash = Math.max(flash, fx.flash); flashColor = fx.flashColor; flashX = x; flashY = y; }
+    if (!running) { running = true; last = performance.now(); requestAnimationFrame(frame); }
+  }
+  function aim(x, y) {
+    measure();
+    return x == null || y == null ? [view.w / 2, view.h * 0.55] : [x, y];
+  }
+
+  function fire(x, y) {
+    [x, y] = aim(x, y);
+    start(EFFECT, x, y);
+  }
+
+  return { fire };
+}
+window.createCrumblingDestroyedEffect = createCrumblingDestroyedEffect;
+
+function createCrumblingSuccessEffect(canvas) {
+  const ctx = canvas.getContext("2d");
+
+  // ---- The effect ----
+  // layers: each is one group of particles. duration = how long it keeps
+  // emitting (0 = all at once); delay = when it starts, in seconds.
+  // sounds: each is one synthesized voice (waveform + pitch sweep + envelope).
+  const EFFECT = {
+    shake: 0.2, flash: 0, flashColor: "#fff4a0",
+    layers: [
+      { shape: "glow", count: 2, speed: 0, life: 0.5, lifeVar: 0, size: 220, sizeEnd: 60, colors: ["#ffffff", "#fff0a0", "#a05a00"] },
+      { shape: "glow", emitter: "line", radius: 26, duration: 0.9, count: 40, speed: 500, spread: 0, drag: 0, life: 0.6, size: 50, sizeEnd: 30, fade: "inout", colors: ["#fffbe0", "#ffd860", "#a06000"] },
+      { shape: "spark", emitter: "circle", radius: 40, duration: 0.9, count: 60, speed: 240, spread: 8, size: 5, sizeEnd: 1, stretch: 2, colors: ["#ffffff", "#fff0a0", "#ffc400"] },
+      { shape: "star", count: 30, speed: 260, gravity: -60, drag: 2, life: 1.1, size: 13, spin: 400, colors: ["#ffffff", "#fff0a0", "#ffc400", "#a05a00"] },
+      { shape: "star", emitter: "circle", radius: 50, duration: 0.9, count: 30, speed: 140, spread: 10, gravity: -120, life: 0.9, size: 8, fade: "flicker", colors: ["#ffffff", "#fff0a0"] },
+      { shape: "ring", duration: 0.3, count: 2, speed: 0, life: 0.6, size: 20, sizeEnd: 220, colors: ["#ffffff", "#ffd700"] },
+      { shape: "ring", delay: 0.38, count: 1, speed: 0, life: 0.5, lifeVar: 0, size: 20, sizeEnd: 300, sizeVar: 0, colors: ["#ffffff", "#ffd700", "#a05a00"] },
+      { shape: "square", blend: "normal", delay: 0.4, count: 40, speed: 480, spread: 90, gravity: 400, drag: 1.5, turbulence: 60, life: 1.8, size: 6, sizeEnd: 5, spin: 600, colors: ["#ffffff", "#ffd700", "#ffb547", "#ff5ac8"] },
+      { shape: "glow", emitter: "circle", radius: 100, delay: 0.5, duration: 0.8, count: 40, speed: 15, gravity: 40, size: 6, fade: "flicker", colors: ["#ffffff", "#fff0a0"] },
+    ],
+    sounds: [
+      { wave: "square", filter: "lowpass", volume: 0.3, freq: 523, freqEnd: 523, attack: 0.002, hold: 0.06, decay: 0.12, cutoff: 4000, cutoffEnd: 4000, repeat: 5, repeatGap: 0.075, repeatPitch: 3.5 },
+      { wave: "triangle", volume: 0.3, delay: 0.38, freq: 1046, freqEnd: 1046, attack: 0.01, hold: 0.3, decay: 0.8, vibRate: 6, vibDepth: 0.3 },
+      { wave: "sawtooth", filter: "lowpass", volume: 0.22, delay: 0.38, freq: 523, freqEnd: 523, attack: 0.01, hold: 0.3, decay: 0.9, cutoff: 1200, cutoffEnd: 3000, unison: 20 },
+      { wave: "noise", filter: "highpass", volume: 0.3, delay: 0.4, attack: 0.001, hold: 0.01, decay: 0.25, cutoff: 3000, cutoffEnd: 6000 },
+    ],
+    echo: 0.07, echoTime: 0.25, reverb: 0.82,
+  };
+  const LAYER_DEFAULTS = { blend: "add", emitter: "point", radius: 0, delay: 0, duration: 0, speed: 200, speedVar: 0.5, angle: -90, spread: 360, gravity: 0, drag: 1, swirl: 0, attract: 0, turbulence: 0, bounce: 0, life: 0.8, lifeVar: 0.3, size: 16, sizeEnd: 0, sizeVar: 0.4, spin: 0, stretch: 0, fade: "out", ox: 0, oy: 0 };
+  const SOUND_DEFAULTS = { filter: "none", delay: 0, freq: 440, freqEnd: 440, attack: 0.005, hold: 0.05, decay: 0.3, cutoff: 2000, cutoffEnd: 2000, q: 1, vibRate: 0, vibDepth: 0, repeat: 1, repeatGap: 0.1, repeatPitch: 0, drive: 0, unison: 0, loops: 1, loopEvery: 0 };
+  const GLOW = 1; // bloom strength: 0 = off, 1 = normal, 2 = blazing
+
+  // ---- Particle images: each layer is pre-drawn in 16 tints along its colours ----
+  const STEPS = 16, SPR = 64;
+  const newCanvas = (w, h) => Object.assign(document.createElement("canvas"), { width: w, height: h });
+  const hex = (h) => { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
+  function tint(colors, t) {
+    const f = Math.min(0.9999, t) * (colors.length - 1), i = Math.floor(f), k = f - i;
+    const a = hex(colors[i]), b = hex(colors[Math.min(i + 1, colors.length - 1)]);
+    return a.map((c, j) => Math.round(c + (b[j] - c) * k));
+  }
+  const DRAW = {
+    glow(g, m, col) {
+      const gr = g.createRadialGradient(m, m, 0, m, m, m);
+      gr.addColorStop(0, col(1)); gr.addColorStop(0.25, col(0.55)); gr.addColorStop(0.6, col(0.15)); gr.addColorStop(1, col(0));
+      g.fillStyle = gr; g.fillRect(0, 0, m * 2, m * 2);
+    },
+    spark(g, m, col) {
+      const gr = g.createRadialGradient(m, m, 0, m, m, m);
+      gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(0.18, col(1)); gr.addColorStop(0.45, col(0.25)); gr.addColorStop(1, col(0));
+      g.fillStyle = gr; g.fillRect(0, 0, m * 2, m * 2);
+    },
+    star(g, m, col) {
+      g.translate(m, m); g.fillStyle = col(1); g.shadowColor = col(1); g.shadowBlur = 8; g.beginPath();
+      for (let i = 0; i < 8; i++) { const a = (i / 8) * Math.PI * 2 - Math.PI / 2; const rr = i % 2 ? m * 0.22 : m * 0.85; g.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); }
+      g.closePath(); g.fill();
+      const gr = g.createRadialGradient(0, 0, 0, 0, 0, m * 0.35);
+      gr.addColorStop(0, "rgba(255,255,255,0.95)"); gr.addColorStop(1, "rgba(255,255,255,0)");
+      g.fillStyle = gr; g.fill();
+    },
+    ring(g, m, col) {
+      g.strokeStyle = col(1); g.lineWidth = m * 0.1; g.shadowColor = col(1); g.shadowBlur = 6;
+      g.beginPath(); g.arc(m, m, m - 5, 0, 7); g.stroke();
+      g.strokeStyle = "rgba(255,255,255,0.7)"; g.lineWidth = m * 0.03; g.stroke();
+    },
+    square(g, m, col) {
+      g.fillStyle = col(1); g.fillRect(m * 0.25, m * 0.4, m * 1.5, m * 1.2);
+      g.fillStyle = "rgba(255,255,255,0.35)"; g.fillRect(m * 0.25, m * 0.4, m * 1.5, m * 0.3);
+    },
+  };
+  const SOFT = { star: 1, ring: 1, square: 1 }; // crisp shapes get a soft edge + glow halo
+  function blurInto(dst, src, px, alpha) {
+    const g = dst.getContext("2d");
+    g.globalAlpha = alpha;
+    if (typeof g.filter === "string") { g.filter = `blur(${px}px)`; g.drawImage(src, 0, 0); g.filter = "none"; }
+    else { const k = Math.max(1.5, px), t = newCanvas(Math.ceil(src.width / k), Math.ceil(src.height / k)); t.getContext("2d").drawImage(src, 0, 0, t.width, t.height); g.drawImage(t, 0, 0, dst.width, dst.height); }
+    g.globalAlpha = 1;
+  }
+  function makeSprite(shape, rgb, v) {
+    const col = (a) => `rgba(${rgb},${a})`;
+    const size = SOFT[shape] ? SPR * 1.5 : SPR, c = newCanvas(size, size), g = c.getContext("2d");
+    g.translate((size - SPR) / 2, (size - SPR) / 2);
+    DRAW[shape](g, SPR / 2, col, v);
+    if (!SOFT[shape]) return c;
+    const out = newCanvas(size, size);
+    blurInto(out, c, 5, 0.22); // halo
+    blurInto(out, c, 1.2, 1);  // soft-edged shape
+    return out;
+  }
+  const VARIANTS = {};
+  for (const l of EFFECT.layers) {
+    for (const k in LAYER_DEFAULTS) if (l[k] === undefined) l[k] = LAYER_DEFAULTS[k];
+    l.pad = SOFT[l.shape] ? 1.5 : 1;
+    l.css = []; l.sprites = [];
+    for (let v = 0; v < (VARIANTS[l.shape] || 1); v++) {
+      const row = [];
+      for (let i = 0; i < STEPS; i++) {
+        const rgb = tint(l.colors, i / (STEPS - 1));
+        row.push(makeSprite(l.shape, rgb, v));
+        if (!v) l.css.push(`rgb(${rgb})`);
+      }
+      l.sprites.push(row);
+    }
+  }
+
+  // ---- Simulation ----
+  let parts = [], bursts = [], shake = 0, flash = 0, flashX = 0, flashY = 0, flashColor = "#fff", time = 0, last = 0, running = false;
+  let view = { w: 1, h: 1 };
+  function measure() { const r = canvas.getBoundingClientRect(); view = { w: r.width || canvas.width, h: r.height || canvas.height }; }
+
+  function spawn(b, l, n) {
+    let x = b.x + l.ox, y = b.y + l.oy;
+    if (l.emitter === "circle") { const a = Math.random() * 6.283, d = Math.sqrt(Math.random()) * l.radius; x += Math.cos(a) * d; y += Math.sin(a) * d; }
+    if (l.emitter === "line") x += (Math.random() * 2 - 1) * l.radius;
+    let ang = (l.angle + (Math.random() - 0.5) * l.spread) * Math.PI / 180;
+    const sp = l.speed * (1 - l.speedVar * Math.random()), sv = 1 - l.sizeVar * Math.random() * 0.8;
+    parts.push({
+      b, l, x, y, sx: x, sy: y, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, age: 0,
+      life: l.life * (1 - l.lifeVar * Math.random() * 0.9), s0: l.size * sv, s1: l.sizeEnd * sv,
+      rot: Math.random() * 6.283, vr: l.spin * (Math.PI / 180) * (0.5 + Math.random()),
+      seed: Math.random(), v: Math.floor(Math.random() * l.sprites.length),
+    });
+  }
+
+  function update(dt) {
+    time += dt;
+    for (const b of bursts) {
+      const prev = b.t;
+      b.t += dt;
+      b.fx.layers.forEach((l, i) => {
+        if (b.t < l.delay || b.n[i] >= l.count) return;
+        if (l.duration <= 0) { while (b.n[i] < l.count) { spawn(b, l, b.n[i]); b.n[i]++; } return; }
+        b.acc[i] += Math.max(0, Math.min(b.t, l.delay + l.duration) - Math.max(prev, l.delay)) * (l.count / l.duration);
+        while (b.acc[i] >= 1 && b.n[i] < l.count) { spawn(b, l, b.n[i]); b.n[i]++; b.acc[i] -= 1; }
+        if (b.t >= l.delay + l.duration) b.n[i] = l.count;
+      });
+    }
+    bursts = bursts.filter((b) => b.n.some((n, i) => n < b.fx.layers[i].count));
+    parts = parts.filter((p) => {
+      const l = p.l;
+      p.age += dt;
+      if (p.age >= p.life) return false;
+      if (l.turbulence) {
+        p.vx += Math.sin(p.y * 0.021 + time * 2.7 + p.seed * 9) * l.turbulence * dt * 3;
+        p.vy += Math.cos(p.x * 0.019 + time * 2.3 + p.seed * 7) * l.turbulence * dt * 3;
+      }
+      p.vy += l.gravity * dt;
+      if (l.drag) { const k = Math.exp(-l.drag * dt); p.vx *= k; p.vy *= k; }
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.rot += p.vr * dt;
+      return true;
+    });
+    shake = Math.max(0, shake - dt * 2.2);
+    flash = Math.max(0, flash - dt * 3.5);
+  }
+
+  // ---- Drawing ----
+  function fadeAt(fade, t, seed) {
+    if (fade === "inout") return Math.sin(Math.PI * Math.min(1, t));
+    if (fade === "flicker") return (1 - t) * (Math.random() < 0.25 ? 0.25 : 1);
+    return Math.min(1, t * 25) * (1 - t);
+  }
+  function drawParticles(g, glowPass) {
+    for (const p of parts) {
+      const l = p.l;
+      if (glowPass && l.blend !== "add") continue;
+      const t = p.age / p.life, a = fadeAt(l.fade, t, p.seed);
+      if (a <= 0.003) continue;
+      g.globalCompositeOperation = l.blend === "add" ? "lighter" : "source-over";
+      g.globalAlpha = Math.min(1, a);
+      const si = Math.min(STEPS - 1, Math.floor(t * STEPS));
+      const size = Math.max(0.5, p.s0 + (p.s1 - p.s0) * t) * (glowPass ? 1.2 : 1);
+      const img = l.sprites[p.v][si], s = size * l.pad;
+      g.save();
+      g.translate(p.x, p.y);
+      if (l.stretch > 0) { // streak along the direction of travel
+        const len = s * (1 + (Math.hypot(p.vx, p.vy) / 120) * l.stretch);
+        g.rotate(Math.atan2(p.vy, p.vx));
+        g.drawImage(img, -len / 2, -s / 2, len, s);
+        g.restore();
+        continue;
+      }
+      if (p.vr || ["square"].includes(l.shape)) g.rotate(p.rot);
+      g.drawImage(img, -s / 2, -s / 2, s, s);
+      g.restore();
+    }
+  }
+
+  // Glow: glowing particles drawn small, stretched back up (= blur) and added
+  // on top. The small buffer fades instead of clearing, leaving light trails.
+  const glowBuf = newCanvas(8, 8), wideBuf = newCanvas(4, 4);
+  function bloom(w, h) {
+    const bw = Math.ceil(w / 4), bh = Math.ceil(h / 4);
+    if (glowBuf.width !== bw || glowBuf.height !== bh) { glowBuf.width = bw; glowBuf.height = bh; wideBuf.width = Math.ceil(bw / 3); wideBuf.height = Math.ceil(bh / 3); }
+    const g = glowBuf.getContext("2d"), wg = wideBuf.getContext("2d");
+    g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = "destination-out";
+    g.fillStyle = "rgba(0,0,0,0.62)"; g.fillRect(0, 0, bw, bh);
+    g.setTransform(0.25, 0, 0, 0.25, 0, 0);
+    drawParticles(g, true);
+    wg.clearRect(0, 0, wideBuf.width, wideBuf.height); wg.drawImage(glowBuf, 0, 0, wideBuf.width, wideBuf.height);
+    ctx.globalCompositeOperation = "lighter";
+    ctx.globalAlpha = Math.min(1, 0.16 * GLOW); ctx.drawImage(glowBuf, 0, 0, w, h);
+    ctx.globalAlpha = Math.min(1, 0.17 * GLOW); ctx.drawImage(wideBuf, -6, -6, w + 12, h + 12);
+  }
+
+  function render() {
+    const { w, h } = view, k = canvas.width / w;
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+    ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+    ctx.clearRect(0, 0, w, h);
+    const sh = shake * shake * 16;
+    ctx.translate((Math.random() * 2 - 1) * sh, (Math.random() * 2 - 1) * sh);
+    drawParticles(ctx, false);
+    if (GLOW > 0) bloom(w, h);
+    if (flash > 0) { // a burst of light from where it was fired
+      const f = Math.min(1, flash), gr = ctx.createRadialGradient(flashX, flashY, 0, flashX, flashY, Math.hypot(w, h) * (0.55 + (1 - f) * 0.5));
+      gr.addColorStop(0, flashColor); gr.addColorStop(0.35, flashColor); gr.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.globalCompositeOperation = "lighter"; ctx.globalAlpha = Math.min(0.62, f * 0.52); ctx.fillStyle = gr; ctx.fillRect(-20, -20, w + 40, h + 40);
+    }
+  }
+
+  function frame(now) {
+    update(Math.min(0.05, (now - last) / 1000));
+    last = now;
+    render();
+    if (parts.length || bursts.length || flash > 0) requestAnimationFrame(frame);
+    else { running = false; render(); }
+  }
+
+  // ---- Sound: a tiny Web Audio synth ----
+  let audio = null, master = null;
+  let noiseBufs = null;
+  let roomTone = null;
+  const freq = (f) => Math.max(20, Math.min(20000, f));
+  function startAudio() { // works once the player has tapped or pressed a key
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    if (!audio) {
+      audio = new AC();
+      const comp = audio.createDynamicsCompressor();
+      comp.threshold.value = -10; comp.knee.value = 8; comp.ratio.value = 6; comp.attack.value = 0.003; comp.release.value = 0.2;
+      const volSlider = document.getElementById('volume-slider');
+      const baseVol = volSlider ? parseFloat(volSlider.value) / 0.25 : 1.0;
+      const out = audio.createGain(); out.gain.value = Math.min(1.0, 0.9 * baseVol);
+      master = audio.createGain();
+      master.connect(comp); comp.connect(out); out.connect(audio.destination);
+      for (const s of EFFECT.sounds) for (const k in SOUND_DEFAULTS) if (s[k] === undefined) s[k] = SOUND_DEFAULTS[k];
+      // 2 s of white noise (hiss) and brown noise (rumble)
+      const len = audio.sampleRate * 2, white = audio.createBuffer(1, len, audio.sampleRate), brown = audio.createBuffer(1, len, audio.sampleRate);
+      const wd = white.getChannelData(0), bd = brown.getChannelData(0);
+      for (let i = 0, lastB = 0; i < len; i++) { const r = Math.random() * 2 - 1; wd[i] = r; lastB = (lastB + 0.02 * r) / 1.02; bd[i] = lastB * 3.5; }
+      noiseBufs = { noise: white, rumble: brown };
+      // reverb: a fading burst of noise as the room's echo
+      roomTone = audio.createBuffer(2, Math.floor(audio.sampleRate * 2.2), audio.sampleRate);
+      for (let ch = 0; ch < 2; ch++) { const d = roomTone.getChannelData(ch); for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 3.2); }
+    }
+    if (audio.state !== "running") audio.resume();
+    return true;
+  }
+  function playSound(fx) {
+    try {
+      const snd = new Audio('./sound_effects/dark_of_mirkwood/crumbling_ruin_success.mp3');
+      const volSlider = document.getElementById('volume-slider');
+      snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+      snd.play().catch(() => {});
+    } catch (e) {}
+  }
+  function voice(out, s, t, mul) {
+    const end = t + s.attack + s.hold + s.decay;
+    const env = audio.createGain(); // volume envelope: attack → hold → decay
+    env.gain.setValueAtTime(0.0001, t);
+    env.gain.exponentialRampToValueAtTime(Math.max(0.0002, s.volume), t + s.attack);
+    env.gain.setValueAtTime(Math.max(0.0002, s.volume), t + s.attack + s.hold);
+    env.gain.exponentialRampToValueAtTime(0.0001, end);
+    env.connect(out);
+    let head = env;
+    if (s.filter !== "none" && s.filter !== "formant") { // filter with a sweep
+      const f = audio.createBiquadFilter();
+      f.type = s.filter; f.Q.value = s.q;
+      f.frequency.setValueAtTime(freq(s.cutoff), t); f.frequency.exponentialRampToValueAtTime(freq(s.cutoffEnd), end);
+      f.connect(head); head = f;
+    }
+    if (s.drive > 0) { // distortion
+      const ws = audio.createWaveShaper(), trim = audio.createGain(), n = 1024, curve = new Float32Array(n), K = Math.round(s.drive * 40) / 40 * 120 + 1;
+      for (let i = 0; i < n; i++) { const x = (i / (n - 1)) * 2 - 1; curve[i] = ((1 + K) * x) / (1 + K * Math.abs(x)); }
+      ws.curve = curve; ws.oversample = "2x"; trim.gain.value = 1 / (1 + s.drive * 1.5);
+      ws.connect(trim); trim.connect(head); head = ws;
+    }
+    const f0 = freq(s.freq * mul), f1 = freq(s.freqEnd * mul), sources = [];
+    if (s.wave === "noise" || s.wave === "rumble" || s.wave === "crackle") {
+      const src = audio.createBufferSource();
+      src.buffer = noiseBufs[s.wave]; src.loop = true;
+      src.playbackRate.setValueAtTime(Math.sqrt(Math.min(4, Math.max(0.1, f0 / 440))), t);
+      src.playbackRate.exponentialRampToValueAtTime(Math.sqrt(Math.min(4, Math.max(0.1, f1 / 440))), end);
+      src.connect(head); src.start(t, Math.random()); src.stop(end + 0.05);
+      sources.push(src);
+    } else {
+    const detunes = s.unison > 0 ? [-s.unison, 0, s.unison] : [0]; // detuned copies = thicker sound
+    const mix = audio.createGain(); mix.gain.value = 1 / Math.sqrt(detunes.length); mix.connect(head);
+    for (const d of detunes) {
+      const o = audio.createOscillator();
+      o.type = s.wave; o.detune.value = d;
+      o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, end);
+      o.connect(mix); o.start(t); o.stop(end + 0.05);
+      sources.push(o);
+    }
+    }
+    if (s.vibRate > 0 && s.vibDepth > 0) { // vibrato
+      const lfo = audio.createOscillator(), depth = audio.createGain();
+      lfo.frequency.value = s.vibRate; depth.gain.value = s.vibDepth * 100; lfo.connect(depth);
+      for (const src of sources) if (src.detune) depth.connect(src.detune);
+      lfo.start(t); lfo.stop(end + 0.05);
+    }
+  }
+
+  function start(fx, x, y) {
+    bursts.push({ fx, x, y, t: 0, n: fx.layers.map(() => 0), acc: fx.layers.map(() => 0) });
+    shake = Math.max(shake, fx.shake);
+    if (fx.flash > 0) { flash = Math.max(flash, fx.flash); flashColor = fx.flashColor; flashX = x; flashY = y; }
+    playSound(fx);
+    if (!running) { running = true; last = performance.now(); requestAnimationFrame(frame); }
+  }
+  function aim(x, y) {
+    measure();
+    return x == null || y == null ? [view.w / 2, view.h * 0.55] : [x, y];
+  }
+
+  function fire(x, y) {
+    [x, y] = aim(x, y);
+    start(EFFECT, x, y);
+  }
+
+  return { fire };
+}
+window.createCrumblingSuccessEffect = createCrumblingSuccessEffect;
 
 window.LotrExpansions['dark_of_nibin'] = {
     questStages: [
@@ -1538,6 +10375,63 @@ window.LotrExpansions['dark_of_nibin'] = {
 										});
 								};
 
+								window.triggerChieftainEpicTokens = function(uid, engine, onComplete) {
+										const el = document.querySelector(`#staging-content [data-uid="${uid}"]`) || document.querySelector(`[data-uid="${uid}"]`);
+										if (!el) {
+												if (onComplete) onComplete();
+												return;
+										}
+										const tokens = el.querySelectorAll('.status-buff-tokens .buff-token');
+										if (tokens.length === 0) {
+												if (onComplete) onComplete();
+												return;
+										}
+										
+										tokens.forEach(t => {
+												t.style.transition = 'none';
+												t.style.opacity = '0';
+												t.style.transform = `scale(6.5) translateY(-50px) rotate(${(Math.random() * 30) - 15}deg)`;
+										});
+
+										void el.offsetWidth;
+
+										tokens.forEach((token, idx) => {
+												setTimeout(() => {
+														token.style.transition = 'opacity 0.15s ease-in, transform 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275)';
+														token.style.opacity = '1';
+														token.style.transform = 'scale(1) translateY(0) rotate(0deg)';
+														
+														const origBoxShadow = token.style.boxShadow || '';
+														token.style.boxShadow = '0 0 50px #ffb74d, 0 0 30px #ffffff';
+														token.style.filter = 'brightness(2.5) contrast(1.5)';
+														
+														setTimeout(() => {
+																token.style.transition = 'box-shadow 0.8s ease-out, filter 0.8s ease-out';
+																token.style.boxShadow = origBoxShadow;
+																token.style.filter = 'none';
+														}, 100);
+														
+														if (engine && engine.window && engine.window.screenShake) engine.window.screenShake(16, 400);
+														if (engine && engine.window && engine.window.spawnBurstAtElement) {
+																engine.window.spawnBurstAtElement(token, '#ffb74d', 35);
+																engine.window.spawnBurstAtElement(token, '#ffffff', 25);
+																engine.window.spawnBurstAtElement(token, '#ff3030', 15);
+														}
+														try {
+																const snd = new Audio('./sound_effects/threat_increase.mp3');
+																snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+																snd.playbackRate = 1.1;
+																snd.play().catch(()=>{});
+														} catch(e) {}
+												}, 150 + (idx * 300));
+										});
+
+										const totalTime = 150 + ((tokens.length - 1) * 300) + 350;
+										setTimeout(() => {
+												if (onComplete) onComplete();
+										}, totalTime);
+								};
+
 								window.updateChieftainAura = function() {
 										if (!game) return;
 										const currentStage = window.QUEST_STAGES ? window.QUEST_STAGES[game.questStageIdx] : null;
@@ -1645,6 +10539,8 @@ window.LotrExpansions['dark_of_nibin'] = {
                         const optObserver = new MutationObserver(() => {
                             optObserver.disconnect();
                             window.updateChieftainAura();
+                            if (typeof window.updateCrumblingStairsAura === 'function') window.updateCrumblingStairsAura();
+                            if (typeof window.updateCollapsedMineAura === 'function') window.updateCollapsedMineAura();
                             optObserver.observe(document.body, { childList: true, subtree: true });
                         });
                         if (document.body) {
@@ -1659,6 +10555,8 @@ window.LotrExpansions['dark_of_nibin'] = {
                         setInterval(() => {
                             if (!game) return;
                             window.updateChieftainAura();
+                            if (typeof window.updateCrumblingStairsAura === 'function') window.updateCrumblingStairsAura();
+                            if (typeof window.updateCollapsedMineAura === 'function') window.updateCollapsedMineAura();
                             
                             const allEnemies = [...(game.stagingArea || []), ...(game.engagedEnemies || []), ...(game.outOfPlay || [])];
                             const currentStage = window.QUEST_STAGES ? window.QUEST_STAGES[game.questStageIdx] : null;
@@ -1723,10 +10621,698 @@ window.LotrExpansions['dark_of_nibin'] = {
                         });
                         originalDescriptors.clear();
 
+                        window.triggerChieftainLostPathWaystones = function(attacker, progressCount, onComplete) {
+                            const engine = window.LotrEngine;
+                            const game = engine ? engine.game : null;
+                            if (!game) {
+                                if (onComplete) onComplete();
+                                return;
+                            }
+
+                            const chiefEl = attacker ? document.querySelector(`[data-uid="${attacker._uid}"]`) : null;
+                            const questEl = document.querySelector('#quest-content .quest-card') || document.querySelector('.card.quest-card') || document.getElementById('quest-zone');
+                            
+                            if (!questEl) {
+                                game.questProgress = Math.max(0, game.questProgress - progressCount);
+                                if (engine.toast) engine.toast("Goblin Chieftain", `Removed ${progressCount} progress from the quest.`, "danger");
+                                if (engine.render) engine.render();
+                                if (onComplete) onComplete();
+                                return;
+                            }
+
+                            const cRect = chiefEl ? chiefEl.getBoundingClientRect() : {
+                                left: window.innerWidth * 0.7, top: window.innerHeight * 0.5, width: 144, height: 202
+                            };
+                            const qRect = questEl.getBoundingClientRect();
+                            const tokenEl = questEl.querySelector('.token.progress') || questEl.querySelector('.quest-progress-bar');
+                            const tRect = tokenEl ? tokenEl.getBoundingClientRect() : {
+                                left: qRect.left + qRect.width * 0.5,
+                                top: qRect.top + qRect.height * 0.7,
+                                width: 60,
+                                height: 60
+                            };
+
+                            // Inject styles if needed
+                            if (!document.getElementById('chieftain-lost-path-styles')) {
+                                const st = document.createElement('style');
+                                st.id = 'chieftain-lost-path-styles';
+                                st.textContent = `
+                                    @keyframes travelTokenEmerge {
+                                        0% { opacity: 0; transform: translateY(24px) scale(0.4) rotate(var(--t-rot, 0deg)); filter: brightness(2) drop-shadow(0 0 16px #52b788); }
+                                        60% { opacity: 1; transform: translateY(-16px) scale(1.18) rotate(var(--t-rot, 0deg)); filter: brightness(1.3) drop-shadow(0 0 22px #74c69d); }
+                                        100% { opacity: 1; transform: translateY(-10px) scale(1) rotate(var(--t-rot, 0deg)); filter: brightness(1) drop-shadow(0 4px 14px rgba(0,0,0,0.85)); }
+                                    }
+                                    @keyframes travelTokenViolentRumble {
+                                        0%, 100% { transform: translateY(-10px) scale(1) rotate(var(--t-rot, 0deg)); }
+                                        20% { transform: translateY(-10px) translate(-5px, 2px) scale(1.05) rotate(calc(var(--t-rot, 0deg) - 3deg)); }
+                                        40% { transform: translateY(-10px) translate(5px, -2px) scale(0.96) rotate(calc(var(--t-rot, 0deg) + 3deg)); }
+                                        60% { transform: translateY(-10px) translate(-3px, -2px) scale(1.04) rotate(calc(var(--t-rot, 0deg) - 2deg)); }
+                                        80% { transform: translateY(-10px) translate(3px, 2px) scale(0.97) rotate(calc(var(--t-rot, 0deg) + 2deg)); }
+                                    }
+                                    @keyframes tokenFissureSpread {
+                                        0% { stroke-dashoffset: 100; opacity: 0; }
+                                        30% { opacity: 1; filter: drop-shadow(0 0 4px #ff3300); }
+                                        80% { stroke-dashoffset: 0; opacity: 1; filter: drop-shadow(0 0 8px #ff7700) drop-shadow(0 0 14px #ff0000); }
+                                        100% { stroke-dashoffset: 0; opacity: 1; filter: drop-shadow(0 0 12px #ffff55); }
+                                    }
+                                    @keyframes tokenCorruptGlow {
+                                        0% { filter: drop-shadow(0 0 12px #52b788); }
+                                        40% { filter: hue-rotate(-60deg) saturate(2) drop-shadow(0 0 16px #f39c12); }
+                                        70% { filter: hue-rotate(-120deg) saturate(3) drop-shadow(0 0 20px #e74c3c); }
+                                        100% { filter: grayscale(0.8) brightness(0.6) drop-shadow(0 0 8px #ff2200); }
+                                    }
+                                    @keyframes questDustWindTremor {
+                                        0%, 100% { transform: translate3d(0, 0, 0); }
+                                        25% { transform: translate3d(-10px, 3px, 0) rotate(-0.8deg); }
+                                        50% { transform: translate3d(12px, -2px, 0) rotate(0.8deg); }
+                                        75% { transform: translate3d(-6px, 1px, 0) rotate(-0.4deg); }
+                                    }
+                                `;
+                                document.head.appendChild(st);
+                            }
+
+                            // Audio 1: Blowing Mountain Wind (No low-frequency oscillators/boops)
+                            const playWindGustAudio = () => {
+                                try {
+                                    const AudioContext = window.AudioContext || window.webkitAudioContext;
+                                    if (!AudioContext) return;
+                                    const ctx = new AudioContext();
+                                    const volSlider = document.getElementById('volume-slider');
+                                    const masterVol = volSlider ? parseFloat(volSlider.value) : 0.25;
+
+                                    const bufLen = Math.floor(ctx.sampleRate * 2.8);
+                                    const noiseBuf = ctx.createBuffer(1, bufLen, ctx.sampleRate);
+                                    const data = noiseBuf.getChannelData(0);
+                                    for (let i = 0; i < bufLen; i++) {
+                                        data[i] = (Math.random() * 2 - 1) * 0.85;
+                                    }
+
+                                    const noiseSrc = ctx.createBufferSource();
+                                    noiseSrc.buffer = noiseBuf;
+
+                                    const bandpass = ctx.createBiquadFilter();
+                                    bandpass.type = 'bandpass';
+                                    bandpass.frequency.setValueAtTime(300, ctx.currentTime);
+                                    bandpass.frequency.exponentialRampToValueAtTime(720, ctx.currentTime + 0.8);
+                                    bandpass.frequency.exponentialRampToValueAtTime(320, ctx.currentTime + 2.2);
+                                    bandpass.Q.setValueAtTime(2.8, ctx.currentTime);
+
+                                    const windGain = ctx.createGain();
+                                    windGain.gain.setValueAtTime(0.01, ctx.currentTime);
+                                    windGain.gain.linearRampToValueAtTime(0.32 * masterVol, ctx.currentTime + 0.6);
+                                    windGain.gain.linearRampToValueAtTime(0.48 * masterVol, ctx.currentTime + 1.2);
+                                    windGain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 2.7);
+
+                                    noiseSrc.connect(bandpass);
+                                    bandpass.connect(windGain);
+                                    windGain.connect(ctx.destination);
+                                    noiseSrc.start();
+
+                                    setTimeout(() => {
+                                        try { ctx.close(); } catch(e) {}
+                                    }, 2900);
+                                } catch(e) {}
+                            };
+
+                            // Audio 2: Disintegration Sound - Goblin Chieftain Progress Audio
+                            const playGoblinChieftainProgressAudio = () => {
+                                try {
+                                    const audio = new Audio('sound_effects/dark_of_mirkwood/goblin_chieftain_progress.mp3');
+                                    const volSlider = document.getElementById('volume-slider');
+                                    const masterVol = volSlider ? parseFloat(volSlider.value) : 0.45;
+                                    audio.volume = Math.min(1.0, Math.max(0.05, masterVol * 1.25));
+                                    const playPromise = audio.play();
+                                    if (playPromise !== undefined) {
+                                        playPromise.catch(() => {
+                                            try {
+                                                const fallback = new Audio('sound_effects/dark_of_mirkwood/goblin_chieftain.mp3');
+                                                fallback.volume = Math.min(1.0, Math.max(0.05, masterVol * 1.25));
+                                                fallback.play().catch(() => {});
+                                            } catch(e) {}
+                                        });
+                                    }
+                                } catch(e) {}
+                            };
+
+                            playWindGustAudio();
+
+                            // 1. Chieftain Dark Lunge / Wind Inception
+                            if (chiefEl) {
+                                chiefEl.style.transition = 'transform 0.28s cubic-bezier(0.18, 0.89, 0.32, 1.28), filter 0.28s';
+                                chiefEl.style.transform = 'scale(1.1) translate(-6px, -8px)';
+                                chiefEl.style.filter = 'drop-shadow(0 0 20px rgba(220, 80, 20, 0.95)) brightness(1.2)';
+                                setTimeout(() => {
+                                    chiefEl.style.transform = '';
+                                    chiefEl.style.filter = '';
+                                }, 360);
+                            }
+
+                            // Swirling dark gust projectile from Chieftain to Quest Card
+                            const sX = cRect.left + cRect.width / 2;
+                            const sY = cRect.top + cRect.height / 2;
+                            const tX = qRect.left + qRect.width / 2;
+                            const tY = qRect.top + qRect.height / 2;
+
+                            const windWave = document.createElement('div');
+                            windWave.style.cssText = `
+                                position: fixed; z-index: 10006; pointer-events: none;
+                                left: ${sX}px; top: ${sY}px; width: 140px; height: 70px;
+                                transform: translate(-50%, -50%) rotate(${Math.atan2(tY - sY, tX - sX) * 180 / Math.PI}deg);
+                                transition: left 0.42s cubic-bezier(0.25, 0.8, 0.25, 1), top 0.42s cubic-bezier(0.25, 0.8, 0.25, 1), transform 0.42s cubic-bezier(0.25, 0.8, 0.25, 1), opacity 0.42s ease-out;
+                                opacity: 0.95;
+                            `;
+                            windWave.innerHTML = `
+                                <svg viewBox="0 0 140 70" style="width:100%;height:100%;overflow:visible;">
+                                    <defs>
+                                        <linearGradient id="windGaleGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                                            <stop offset="0%" stop-color="rgba(194, 150, 100, 0)" />
+                                            <stop offset="40%" stop-color="rgba(235, 180, 110, 0.8)" />
+                                            <stop offset="70%" stop-color="rgba(140, 80, 40, 0.9)" />
+                                            <stop offset="100%" stop-color="rgba(255, 230, 180, 1)" />
+                                        </linearGradient>
+                                    </defs>
+                                    <path d="M 10 35 Q 50 15, 90 32 T 135 35" fill="none" stroke="url(#windGaleGrad)" stroke-width="6" stroke-linecap="round" filter="drop-shadow(0 0 10px #d4af37)" />
+                                    <path d="M 25 22 Q 65 5, 105 20 T 130 25" fill="none" stroke="rgba(245, 215, 110, 0.75)" stroke-width="3" stroke-linecap="round" />
+                                    <path d="M 20 48 Q 60 62, 100 48 T 132 45" fill="none" stroke="rgba(180, 100, 40, 0.65)" stroke-width="3" stroke-linecap="round" />
+                                </svg>
+                            `;
+                            document.body.appendChild(windWave);
+
+                            requestAnimationFrame(() => {
+                                requestAnimationFrame(() => {
+                                    windWave.style.left = `${tX}px`;
+                                    windWave.style.top = `${tY}px`;
+                                    windWave.style.transform = `translate(-50%, -50%) rotate(${Math.atan2(tY - sY, tX - sX) * 180 / Math.PI}deg) scale(1.4)`;
+                                    windWave.style.opacity = '0';
+                                });
+                            });
+                            setTimeout(() => windWave.remove(), 450);
+
+                            // 2. Desecrated Travel Tokens Manifestation using tokens/travel.png
+                            const numTokens = Math.max(1, Math.min(3, progressCount));
+                            const tokensWrap = document.createElement('div');
+                            const wrapCenterX = tRect.left + tRect.width / 2;
+                            const wrapCenterY = tRect.top + tRect.height / 2;
+                            tokensWrap.style.cssText = `
+                                position: fixed; z-index: 10008; pointer-events: none;
+                                left: ${wrapCenterX}px; top: ${wrapCenterY}px;
+                                transform: translate(-50%, -50%);
+                                display: flex; align-items: center; justify-content: center;
+                                gap: 20px;
+                            `;
+
+                            const makeTravelTokenHTML = (idx, total) => {
+                                const tilt = (idx === 0 && total > 1) ? -5 : (idx === total - 1 && total > 1) ? 5 : 0;
+                                const emergeDelay = idx * 0.12;
+                                return `
+                                    <div class="desecrated-travel-token token-${idx}" style="
+                                        position: relative; width: 62px; height: 62px;
+                                        --t-rot: ${tilt}deg;
+                                        animation: travelTokenEmerge 0.55s cubic-bezier(0.18, 0.89, 0.32, 1.28) ${emergeDelay}s forwards;
+                                        transform-origin: center center;
+                                        transition: opacity 0.22s ease-out, transform 0.22s ease-out, filter 0.22s ease-out;
+                                    ">
+                                        <!-- Travel.png Progress Token Base Image -->
+                                        <img src="tokens/travel.png" style="
+                                            width: 100%; height: 100%; object-fit: contain; display: block;
+                                            filter: drop-shadow(0 4px 14px rgba(0,0,0,0.95));
+                                            animation: tokenCorruptGlow 0.9s ease-out ${0.6 + idx * 0.3}s forwards;
+                                        " alt="Progress Token" />
+
+                                        <!-- Jagged Fissure Crack Overlay across the Travel Token Diamond -->
+                                        <svg viewBox="0 0 62 62" class="token-fissures" style="
+                                            position: absolute; inset: 0; width: 100%; height: 100%;
+                                            overflow: visible; pointer-events: none; opacity: 0;
+                                        ">
+                                            <path d="M 31 6 L 26 22 L 35 32 L 24 45 L 31 56" fill="none" stroke="#ff3b00" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"
+                                                  pathLength="100" stroke-dasharray="100" stroke-dashoffset="100" class="crack-path-1" />
+                                            <path d="M 9 31 L 24 28 L 37 36 L 53 29" fill="none" stroke="#ff8800" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"
+                                                  pathLength="100" stroke-dasharray="100" stroke-dashoffset="100" class="crack-path-2" />
+                                            <path d="M 20 18 L 29 25 L 42 20" fill="none" stroke="#ffff44" stroke-width="1.8" stroke-linecap="round"
+                                                  pathLength="100" stroke-dasharray="100" stroke-dashoffset="100" class="crack-path-3" />
+                                        </svg>
+                                    </div>
+                                `;
+                            };
+
+                            let tokensHTML = '';
+                            for (let i = 0; i < numTokens; i++) {
+                                tokensHTML += makeTravelTokenHTML(i, numTokens);
+                            }
+                            tokensWrap.innerHTML = tokensHTML;
+                            document.body.appendChild(tokensWrap);
+
+                            // 3. Canvas Setup for Slower, Graceful Wind-Blown Particles
+                            const canvas = document.createElement('canvas');
+                            canvas.width = window.innerWidth;
+                            canvas.height = window.innerHeight;
+                            canvas.style.cssText = `
+                                position: fixed; inset: 0; width: 100vw; height: 100vh;
+                                pointer-events: none; z-index: 10012;
+                            `;
+                            document.body.appendChild(canvas);
+
+                            const ctx = canvas.getContext('2d');
+                            const particles = [];
+                            const gemEmeraldPalette = ['#2d6a4f', '#40916c', '#52b788', '#74c69d', '#95d5b2', '#b7e4c7'];
+                            const gemGoldPalette = ['#f5d76e', '#e9c46a', '#f4a261', '#ee9b00', '#d4a373'];
+                            const stonePalette = ['#1b4332', '#264653', '#2a2f35', '#3d3a45', '#4a3e33'];
+                            const allPalette = [...gemEmeraldPalette, ...gemGoldPalette];
+                            const windDirX = (sX > wrapCenterX) ? 1.0 : -1.0;
+
+                            // Helper function to spawn slower-drifting, highly detailed particle burst
+                            const spawnTokenShatterBurst = (originX, originY) => {
+                                // 1. Detailed Faceted Diamond Gem Shards (modeled after travel.png)
+                                for (let i = 0; i < 42; i++) {
+                                    const baseCol = allPalette[Math.floor(Math.random() * allPalette.length)];
+                                    particles.push({
+                                        type: 'shard',
+                                        x: originX + (Math.random() - 0.5) * 32,
+                                        y: originY + (Math.random() - 0.5) * 32,
+                                        vx: (Math.random() * 1.5 + 0.6) * windDirX + (Math.random() - 0.5) * 1.5,
+                                        vy: (Math.random() - 0.5) * 1.8 - 0.4,
+                                        ax: 0.045 * windDirX,
+                                        ay: 0.025,
+                                        size: Math.random() * 3.5 + 2.5,
+                                        rot: Math.random() * Math.PI * 2,
+                                        vrot: (Math.random() - 0.5) * 0.09,
+                                        aspect: 0.55 + Math.random() * 0.35,
+                                        color: baseCol,
+                                        alpha: 1,
+                                        decay: 0.0048 + Math.random() * 0.0035,
+                                        phase: Math.random() * Math.PI * 2
+                                    });
+                                }
+
+                                // 2. Detailed Multi-Faceted Crystal Grains (irregular polygons with micro-bevels)
+                                for (let i = 0; i < 42; i++) {
+                                    const numVerts = 5 + Math.floor(Math.random() * 2);
+                                    const verts = [];
+                                    const baseRadius = Math.random() * 2.2 + 1.4;
+                                    for (let v = 0; v < numVerts; v++) {
+                                        const angle = (v / numVerts) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
+                                        const r = baseRadius * (0.7 + Math.random() * 0.55);
+                                        verts.push({ x: Math.cos(angle) * r, y: Math.sin(angle) * r });
+                                    }
+                                    particles.push({
+                                        type: 'grain',
+                                        x: originX + (Math.random() - 0.5) * 36,
+                                        y: originY + (Math.random() - 0.5) * 36,
+                                        vx: (Math.random() * 1.3 + 0.5) * windDirX + (Math.random() - 0.5) * 1.4,
+                                        vy: (Math.random() - 0.5) * 1.6 - 0.3,
+                                        ax: 0.04 * windDirX,
+                                        ay: 0.02,
+                                        size: baseRadius,
+                                        rot: Math.random() * Math.PI * 2,
+                                        vrot: (Math.random() - 0.5) * 0.08,
+                                        verts: verts,
+                                        color: allPalette[Math.floor(Math.random() * allPalette.length)],
+                                        alpha: 1,
+                                        decay: 0.005 + Math.random() * 0.0035,
+                                        phase: Math.random() * Math.PI * 2
+                                    });
+                                }
+
+                                // 3. Sparkling 4-point Star Glints
+                                for (let i = 0; i < 18; i++) {
+                                    particles.push({
+                                        type: 'spark',
+                                        x: originX + (Math.random() - 0.5) * 38,
+                                        y: originY + (Math.random() - 0.5) * 38,
+                                        vx: (Math.random() * 1.6 + 0.7) * windDirX + (Math.random() - 0.5) * 1.3,
+                                        vy: (Math.random() - 0.5) * 1.5 - 0.3,
+                                        ax: 0.05 * windDirX,
+                                        ay: 0.015,
+                                        size: Math.random() * 2.8 + 2.0,
+                                        rot: Math.random() * Math.PI * 2,
+                                        vrot: (Math.random() - 0.5) * 0.06,
+                                        color: Math.random() > 0.4 ? '#b7e4c7' : '#fff3b0',
+                                        pulsePhase: Math.random() * Math.PI * 2,
+                                        pulseSpeed: 0.08 + Math.random() * 0.08,
+                                        alpha: 1,
+                                        decay: 0.0055 + Math.random() * 0.003,
+                                        phase: Math.random() * Math.PI * 2
+                                    });
+                                }
+
+                                // 4. Chunky Shattered Token Fragments (with beveled edges & fractured surface)
+                                for (let i = 0; i < 20; i++) {
+                                    const numV = 5 + Math.floor(Math.random() * 2);
+                                    const fVerts = [];
+                                    const bR = Math.random() * 3.5 + 3.0;
+                                    for (let v = 0; v < numV; v++) {
+                                        const angle = (v / numV) * Math.PI * 2 + (Math.random() - 0.5) * 0.4;
+                                        const r = bR * (0.65 + Math.random() * 0.65);
+                                        fVerts.push({ x: Math.cos(angle) * r, y: Math.sin(angle) * r });
+                                    }
+                                    particles.push({
+                                        type: 'rock',
+                                        x: originX + (Math.random() - 0.5) * 28,
+                                        y: originY + (Math.random() - 0.5) * 28,
+                                        vx: (Math.random() * 1.8 + 0.7) * windDirX + (Math.random() - 0.5) * 1.7,
+                                        vy: (Math.random() - 0.5) * 2.2 - 0.7,
+                                        ax: 0.038 * windDirX,
+                                        ay: 0.09,
+                                        size: bR,
+                                        verts: fVerts,
+                                        rot: Math.random() * Math.PI * 2,
+                                        vrot: (Math.random() - 0.5) * 0.07,
+                                        color: stonePalette[Math.floor(Math.random() * stonePalette.length)],
+                                        alpha: 1,
+                                        decay: 0.0055 + Math.random() * 0.0035
+                                    });
+                                }
+
+                                // 5. Atmospheric Wind Streamlines
+                                for (let i = 0; i < 8; i++) {
+                                    particles.push({
+                                        type: 'windline',
+                                        x: originX - 50 * windDirX + (Math.random() - 0.5) * 40,
+                                        y: originY + (Math.random() - 0.5) * 60,
+                                        vx: (Math.random() * 4.2 + 3.0) * windDirX,
+                                        vy: (Math.random() - 0.5) * 1.2,
+                                        len: Math.random() * 42 + 28,
+                                        alpha: 0.65,
+                                        decay: 0.011 + Math.random() * 0.007
+                                    });
+                                }
+                            };
+
+                            // Continuous Particle Render Loop with gentle wind physics
+                            let animFrameId = null;
+                            const renderParticles = () => {
+                                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                                let activeCount = 0;
+
+                                for (let i = 0; i < particles.length; i++) {
+                                    const p = particles[i];
+                                    if (p.alpha <= 0) continue;
+                                    activeCount++;
+
+                                    p.x += p.vx;
+                                    p.y += p.vy;
+                                    if (p.ax) p.vx += p.ax;
+                                    if (p.ay) p.vy += p.ay;
+                                    p.alpha -= p.decay;
+
+                                    ctx.save();
+                                    ctx.globalAlpha = Math.max(0, p.alpha);
+
+                                    if (p.type === 'shard') {
+                                        // Faceted Diamond Shard with 3D tumble & specular facet
+                                        p.y += Math.sin(p.x * 0.025 + p.phase) * 0.65;
+                                        p.rot += p.vrot;
+                                        ctx.translate(p.x, p.y);
+                                        ctx.rotate(p.rot);
+                                        const scaleX = Math.cos(p.rot * 1.8);
+                                        ctx.scale(scaleX, 1);
+
+                                        const sz = p.size;
+                                        const asp = p.aspect;
+
+                                        // Left/main facet
+                                        ctx.fillStyle = p.color;
+                                        ctx.beginPath();
+                                        ctx.moveTo(0, -sz * 1.4);
+                                        ctx.lineTo(sz * asp, 0);
+                                        ctx.lineTo(0, sz * 1.2);
+                                        ctx.lineTo(-sz * asp, 0);
+                                        ctx.closePath();
+                                        ctx.fill();
+
+                                        // Top-right specular highlight facet
+                                        ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
+                                        ctx.beginPath();
+                                        ctx.moveTo(0, -sz * 1.4);
+                                        ctx.lineTo(sz * asp, 0);
+                                        ctx.lineTo(0, 0);
+                                        ctx.closePath();
+                                        ctx.fill();
+
+                                        // Bottom-left shadow facet
+                                        ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+                                        ctx.beginPath();
+                                        ctx.moveTo(0, sz * 1.2);
+                                        ctx.lineTo(-sz * asp, 0);
+                                        ctx.lineTo(0, 0);
+                                        ctx.closePath();
+                                        ctx.fill();
+
+                                        // Center ridge hairline
+                                        ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+                                        ctx.lineWidth = 0.5;
+                                        ctx.beginPath();
+                                        ctx.moveTo(0, -sz * 1.4);
+                                        ctx.lineTo(0, sz * 1.2);
+                                        ctx.stroke();
+
+                                    } else if (p.type === 'grain') {
+                                        // Detailed Multi-Faceted Crystal Grain
+                                        p.y += Math.sin(p.x * 0.028 + p.phase) * 0.6;
+                                        p.rot += p.vrot;
+                                        ctx.translate(p.x, p.y);
+                                        ctx.rotate(p.rot);
+
+                                        // Draw base faceted polygon
+                                        ctx.fillStyle = p.color;
+                                        ctx.beginPath();
+                                        for (let v = 0; v < p.verts.length; v++) {
+                                            const pt = p.verts[v];
+                                            if (v === 0) ctx.moveTo(pt.x, pt.y);
+                                            else ctx.lineTo(pt.x, pt.y);
+                                        }
+                                        ctx.closePath();
+                                        ctx.fill();
+
+                                        // Micro-facet highlight on first triangle
+                                        if (p.verts.length >= 2) {
+                                            ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+                                            ctx.beginPath();
+                                            ctx.moveTo(0, 0);
+                                            ctx.lineTo(p.verts[0].x, p.verts[0].y);
+                                            ctx.lineTo(p.verts[1].x, p.verts[1].y);
+                                            ctx.closePath();
+                                            ctx.fill();
+                                        }
+
+                                        // Subtle bevel border
+                                        ctx.strokeStyle = 'rgba(0, 0, 0, 0.2)';
+                                        ctx.lineWidth = 0.6;
+                                        ctx.stroke();
+
+                                    } else if (p.type === 'spark') {
+                                        // 4-Point Diamond Sparkle Star
+                                        p.y += Math.sin(p.x * 0.022 + p.phase) * 0.5;
+                                        p.pulsePhase += p.pulseSpeed;
+                                        p.rot += p.vrot;
+                                        ctx.translate(p.x, p.y);
+                                        ctx.rotate(p.rot);
+
+                                        const sp = p.size * (0.75 + 0.35 * Math.sin(p.pulsePhase));
+                                        
+                                        // Outer glowing star aura
+                                        ctx.fillStyle = p.color;
+                                        ctx.beginPath();
+                                        ctx.moveTo(0, -sp * 1.8);
+                                        ctx.quadraticCurveTo(0, 0, sp * 1.8, 0);
+                                        ctx.quadraticCurveTo(0, 0, 0, sp * 1.8);
+                                        ctx.quadraticCurveTo(0, 0, -sp * 1.8, 0);
+                                        ctx.quadraticCurveTo(0, 0, 0, -sp * 1.8);
+                                        ctx.closePath();
+                                        ctx.fill();
+
+                                        // Core white sparkle
+                                        ctx.fillStyle = '#ffffff';
+                                        ctx.beginPath();
+                                        ctx.moveTo(0, -sp * 0.9);
+                                        ctx.quadraticCurveTo(0, 0, sp * 0.9, 0);
+                                        ctx.quadraticCurveTo(0, 0, 0, sp * 0.9);
+                                        ctx.quadraticCurveTo(0, 0, -sp * 0.9, 0);
+                                        ctx.quadraticCurveTo(0, 0, 0, -sp * 0.9);
+                                        ctx.closePath();
+                                        ctx.fill();
+
+                                    } else if (p.type === 'rock') {
+                                        p.rot += p.vrot;
+                                        ctx.translate(p.x, p.y);
+                                        ctx.rotate(p.rot);
+
+                                        // Main rock polygon
+                                        ctx.fillStyle = p.color;
+                                        ctx.beginPath();
+                                        for (let v = 0; v < p.verts.length; v++) {
+                                            const pt = p.verts[v];
+                                            if (v === 0) ctx.moveTo(pt.x, pt.y);
+                                            else ctx.lineTo(pt.x, pt.y);
+                                        }
+                                        ctx.closePath();
+                                        ctx.fill();
+
+                                        // Chipped highlight edge
+                                        if (p.verts.length >= 3) {
+                                            ctx.fillStyle = 'rgba(255, 255, 255, 0.28)';
+                                            ctx.beginPath();
+                                            ctx.moveTo(0, 0);
+                                            ctx.lineTo(p.verts[0].x, p.verts[0].y);
+                                            ctx.lineTo(p.verts[1].x, p.verts[1].y);
+                                            ctx.closePath();
+                                            ctx.fill();
+                                        }
+
+                                        // Shaded fracture seam
+                                        ctx.strokeStyle = 'rgba(0, 0, 0, 0.45)';
+                                        ctx.lineWidth = 0.8;
+                                        ctx.stroke();
+
+                                    } else if (p.type === 'windline') {
+                                        ctx.strokeStyle = 'rgba(235, 205, 150, 0.65)';
+                                        ctx.lineWidth = 1.8;
+                                        ctx.lineCap = 'round';
+                                        ctx.beginPath();
+                                        ctx.moveTo(p.x, p.y);
+                                        ctx.lineTo(p.x - p.len * windDirX, p.y + p.vy * 1.5);
+                                        ctx.stroke();
+                                    }
+                                    ctx.restore();
+                                }
+
+                                if (activeCount > 0 || particles.length === 0) {
+                                    animFrameId = requestAnimationFrame(renderParticles);
+                                } else {
+                                    if (animFrameId) cancelAnimationFrame(animFrameId);
+                                    canvas.remove();
+                                }
+                            };
+                            animFrameId = requestAnimationFrame(renderParticles);
+
+                            // 4. Staggered Desecration & Shatter Intervals for Each Token
+                            const tokenEls = tokensWrap.querySelectorAll('.desecrated-travel-token');
+                            
+                            tokenEls.forEach((tokenEl, idx) => {
+                                const fissureStart = 550 + idx * 320;
+                                const shatterStart = 950 + idx * 400;
+
+                                // Step A: Fissure cracks spread across token
+                                setTimeout(() => {
+                                    tokenEl.style.animation = 'travelTokenViolentRumble 0.5s ease-in-out infinite';
+                                    const fissures = tokenEl.querySelector('.token-fissures');
+                                    if (fissures) {
+                                        fissures.style.opacity = '1';
+                                        const c1 = fissures.querySelector('.crack-path-1');
+                                        const c2 = fissures.querySelector('.crack-path-2');
+                                        const c3 = fissures.querySelector('.crack-path-3');
+                                        if (c1) c1.style.animation = 'tokenFissureSpread 0.35s ease-out forwards';
+                                        if (c2) c2.style.animation = 'tokenFissureSpread 0.4s ease-out 0.05s forwards';
+                                        if (c3) c3.style.animation = 'tokenFissureSpread 0.3s ease-out 0.1s forwards';
+                                    }
+
+                                    questEl.style.animation = 'questDustWindTremor 0.45s ease-in-out';
+                                    setTimeout(() => { questEl.style.animation = ''; }, 500);
+
+                                    if (engine.window && engine.window.screenShake) {
+                                        engine.window.screenShake(8, 250);
+                                    }
+                                }, fissureStart);
+
+                                // Step B: Token shatters at its own distinct interval!
+                                setTimeout(() => {
+                                    const bRect = tokenEl.getBoundingClientRect();
+                                    const tokenCenterX = bRect.left + bRect.width / 2;
+                                    const tokenCenterY = bRect.top + bRect.height / 2;
+
+                                    // Play goblin_chieftain_progress.mp3 when progress token disintegrates
+                                    playGoblinChieftainProgressAudio();
+
+                                    // White flash & disintegration of this token
+                                    tokenEl.style.filter = 'brightness(3.5) drop-shadow(0 0 20px #ffffff)';
+                                    tokenEl.style.transform = 'translateY(-10px) scale(1.18)';
+                                    tokenEl.style.opacity = '0';
+                                    setTimeout(() => { tokenEl.style.display = 'none'; }, 220);
+
+                                    // Spawn slower-drifting particle burst from this token's coordinates
+                                    spawnTokenShatterBurst(tokenCenterX, tokenCenterY);
+
+                                    if (engine.window && engine.window.screenShake) {
+                                        engine.window.screenShake(10, 280);
+                                    }
+                                }, shatterStart);
+                            });
+
+                            // 5. Update Game State, Floating Progress & Toast
+                            const finalShatterTime = 950 + (numTokens - 1) * 400;
+                            setTimeout(() => {
+                                const floatFn = window.floatText || (engine.window && engine.window.floatText);
+                                if (floatFn) {
+                                    floatFn(wrapCenterX, wrapCenterY - 30, `-${progressCount} Progress`, '#e9c46a');
+                                }
+
+                                game.questProgress = Math.max(0, game.questProgress - progressCount);
+                                if (engine.toast) {
+                                    engine.toast("Goblin Chieftain", `Progress tokens shattered into dust! Removed ${progressCount} progress from the quest.`, "danger");
+                                }
+                                if (engine.render) engine.render();
+                            }, finalShatterTime + 50);
+
+                            // Allow combat extra attack to resume after all tokens shatter and particles blow
+                            setTimeout(() => {
+                                tokensWrap.remove();
+                                if (onComplete) onComplete();
+                            }, finalShatterTime + 850);
+
+                            // Clean up canvas after the slower particles have drifted away and faded
+                            setTimeout(() => {
+                                if (animFrameId) cancelAnimationFrame(animFrameId);
+                                canvas.remove();
+                            }, 3200);
+                        };
+                        window.triggerChieftainSwordThrow = window.triggerChieftainLostPathWaystones;
+
                         // 2. Trigger extra attacks and Chieftain's Forced effect after its attack completes
                         if (!attackerUid && lastAttackerUid) {
                             const endedAttacker = [...(game.engagedEnemies || []), ...(game.stagingArea || [])].find(e => e._uid === lastAttackerUid);
                             
+                            // Delay Troll progress reduction until AFTER attack completes
+                            if (game._nibinTrollPendingExcess > 0) {
+                                const excess = game._nibinTrollPendingExcess;
+                                const trollUid = game._nibinTrollAttackerUid || lastAttackerUid;
+                                game._nibinTrollPendingExcess = 0;
+                                game._nibinTrollAttackerUid = null;
+                                game._nibinBlockCombatTransitions = true;
+
+                                const questEl = document.querySelector('#quest-content .card') || document.getElementById('quest-zone');
+                                const onRemoveProgress = () => {
+                                    game.questProgress = Math.max(0, game.questProgress - excess);
+                                    if (engine.toast) engine.toast("Great Cave-troll", `Excess damage removed ${excess} progress!`, "danger");
+                                    if (engine.render) engine.render();
+                                };
+
+                                const resumeCombat = () => {
+                                    game._nibinBlockCombatTransitions = false;
+                                    const remaining = (game.engagedEnemies || []).filter(e => {
+                                        const isSnared = e.attached && e.attached.some(a => a.id === 'forest_snare');
+                                        return !e._attackedThisRound && !e._doesNotAttack && !isSnared;
+                                    });
+                                    if (remaining.length > 0) {
+                                        if (engine.window && engine.window.resolveEnemyAttacks) engine.window.resolveEnemyAttacks();
+                                        else if (window.resolveEnemyAttacks) window.resolveEnemyAttacks();
+                                    } else {
+                                        if (engine.window && engine.window.playerAttacks) engine.window.playerAttacks();
+                                        else if (window.playerAttacks) window.playerAttacks();
+                                    }
+                                };
+
+                                if (window.triggerTrollFistSmash) {
+                                    window.triggerTrollFistSmash(excess, questEl, trollUid, () => {
+                                        onRemoveProgress();
+                                        resumeCombat();
+                                    });
+                                } else {
+                                    onRemoveProgress();
+                                    resumeCombat();
+                                }
+                                return;
+                            }
+
                             if (endedAttacker && (endedAttacker.damage || 0) < (endedAttacker.hp || 99)) {
                                 const doExtraAttack = () => {
                                     if (endedAttacker._extraAttackPending > 0) {
@@ -1820,17 +11406,16 @@ window.LotrExpansions['dark_of_nibin'] = {
                                 if (lastAttackerId === 'nibin_goblin_chieftain' || lastAttackerId === 'goblin_chieftain') {
                                     const currentStage = (window.QUEST_STAGES && game) ? window.QUEST_STAGES[game.questStageIdx] : null;
                                     const x = currentStage ? (currentStage.stage || 1) : 1;
-                                    const isInStaging = game.stagingArea.some(e => e._uid === endedAttacker._uid);
+                                    const isInStaging = game.stagingArea.some(e => e._uid === endedAttacker._uid) || endedAttacker._returnedToStaging || endedAttacker._cavernWargShadowReturn;
                                     
                                     game._nibinChieftainPromptActive = true;
                                     
                                     const options = [
                                         {label: `Remove ${x} progress from quest`, cb: () => {
-                                            game.questProgress = Math.max(0, game.questProgress - x);
-                                            engine.toast("Goblin Chieftain", `Removed ${x} progress.`, "danger");
                                             game._nibinChieftainPromptActive = false;
-                                            engine.render();
-                                            doExtraAttack();
+                                            window.triggerChieftainLostPathWaystones(endedAttacker, x, () => {
+                                                doExtraAttack();
+                                            });
                                         }}
                                     ];
                                     
@@ -1842,7 +11427,9 @@ window.LotrExpansions['dark_of_nibin'] = {
                                                     delete endedAttacker._engagedWithPlayerIdx;
                                                 }
                                                 game.engagedEnemies = game.engagedEnemies.filter(e => e._uid !== endedAttacker._uid);
-                                                game.stagingArea.push(endedAttacker);
+                                                if (!game.stagingArea.some(e => e._uid === endedAttacker._uid)) {
+                                                    game.stagingArea.push(endedAttacker);
+                                                }
                                                 endedAttacker._activeAttacker = false;
                                                 game._nibinChieftainPromptActive = false;
                                                 engine.render();
@@ -1889,6 +11476,7 @@ window.LotrExpansions['dark_of_nibin'] = {
                                     game.currentEnemyAttacking = null;
                                     game.pendingAction = null;
                                     warg._attackedThisRound = true;
+                                    warg._skipReturnWhoosh = true;
                                     if (engine.window._activeEncounterGhost) {
                                         engine.window._activeEncounterGhost.remove();
                                         engine.window._activeEncounterGhost = null;
@@ -2039,50 +11627,15 @@ window.LotrExpansions['dark_of_nibin'] = {
                                                 // Collapsed Mine Shadow Trigger
                                                 if (currentAttacker._collapsedMineActive) {
                                                     const pIdx = currentAttacker._engagedWithPlayerIdx !== undefined ? currentAttacker._engagedWithPlayerIdx : game.activeTabPlayerIdx;
-                                                    game.threats[pIdx] += diff;
-                                                    if (game.numPlayers === 1) game.threat += diff;
                                                     engine.toast("Shadow Effect", `Collapsed Mine raises threat by ${diff}!`, "danger");
 
-                                                    const overlay = document.createElement('div');
-                                                    overlay.style.cssText = 'position:fixed; inset:0; z-index:99999; display:flex; flex-direction:column; align-items:center; justify-content:center; background:rgba(200,0,0,0.45); pointer-events:none; transition: background 0.3s ease-out;';
-                                                    
-                                                    const bigText = document.createElement('div');
-                                                    bigText.style.cssText = "font-family:'Cinzel Decorative', serif; font-size:4.5rem; font-weight:900; color:#ff3030; text-shadow:0 0 35px #ff0000, 0 4px 15px #000; transform:scale(0.5); opacity:0; transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);";
-                                                    bigText.textContent = `+${diff} Threat!`;
-                                                    overlay.appendChild(bigText);
-                                                    document.body.appendChild(overlay);
-
-                                                    if (engine.window && engine.window.screenShake) {
-                                                        engine.window.screenShake(18, 500);
+                                                    if (typeof window.triggerCollapsedMineThreatBoulders === 'function') {
+                                                        window.triggerCollapsedMineThreatBoulders(diff, currentAttacker, pIdx);
+                                                    } else {
+                                                        game.threats[pIdx] += diff;
+                                                        if (game.numPlayers === 1) game.threat += diff;
+                                                        engine.render();
                                                     }
-                                                    const hudThreat = document.getElementById('hud-threat');
-                                                    if (hudThreat && engine.window && engine.window.spawnBurstAtElement) {
-                                                        engine.window.spawnBurstAtElement(hudThreat, '#c0392b', 15);
-                                                    }
-
-                                                    setTimeout(() => {
-                                                        bigText.style.transform = 'scale(1)';
-                                                        bigText.style.opacity = '1';
-                                                    }, 50);
-
-                                                    setTimeout(() => {
-                                                        overlay.style.background = 'rgba(200,0,0,0)';
-                                                        bigText.style.transform = 'scale(1.2) translateY(-100px)';
-                                                        bigText.style.opacity = '0';
-                                                        setTimeout(() => overlay.remove(), 400);
-
-                                                        const diffEl = document.getElementById('hud-threat-diff');
-                                                        if (diffEl) {
-                                                            diffEl.textContent = `+${diff}`;
-                                                            diffEl.classList.remove('threat-diff-active');
-                                                            void diffEl.offsetWidth;
-                                                            diffEl.classList.add('threat-diff-active');
-                                                            setTimeout(() => {
-                                                                diffEl.classList.remove('threat-diff-active');
-                                                                diffEl.textContent = '';
-                                                            }, 3500);
-                                                        }
-                                                    }, 1500);
                                                 }
 
                                                 // Great Cave-troll Trigger
@@ -2091,39 +11644,36 @@ window.LotrExpansions['dark_of_nibin'] = {
                                                     if (val > hp) {
                                                         const excess = val - Math.max(prev, hp);
                                                         if (excess > 0) {
-                                                            game.questProgress = Math.max(0, game.questProgress - excess);
-                                                            engine.toast("Great Cave-troll", `Excess damage removed ${excess} progress!`, "danger");
-                                                            
-                                                            const overlay = document.createElement('div');
-                                                            overlay.style.cssText = 'position:fixed; inset:0; z-index:99999; display:flex; flex-direction:column; align-items:center; justify-content:center; background:rgba(200,0,0,0.45); pointer-events:none; transition: background 0.3s ease-out;';
-                                                            
-                                                            const bigText = document.createElement('div');
-                                                            bigText.style.cssText = "font-family:'Cinzel Decorative', serif; font-size:4.5rem; font-weight:900; color:#ff3030; text-shadow:0 0 35px #ff0000, 0 4px 15px #000; transform:scale(0.5); opacity:0; transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); text-align:center;";
-                                                            bigText.innerHTML = `-${excess} Progress Tokens!`;
-                                                            overlay.appendChild(bigText);
-                                                            document.body.appendChild(overlay);
+                                                            game._nibinTrollPendingExcess = (game._nibinTrollPendingExcess || 0) + excess;
+                                                            game._nibinTrollAttackerUid = currentAttacker._uid;
 
-                                                            if (engine.window && engine.window.screenShake) {
-                                                                engine.window.screenShake(18, 500);
-                                                            }
-                                                            const questEl = document.querySelector('#quest-content .card') || document.getElementById('quest-zone');
-                                                            if (questEl && engine.window && engine.window.spawnBurstAtElement) {
-                                                                engine.window.spawnBurstAtElement(questEl, '#c0392b', 25);
-                                                            }
+                                                            // Launch boulders promptly during attack recoil without waiting for discard pile animations
+                                                            const trollUid = currentAttacker._uid;
+                                                            game._nibinBlockCombatTransitions = true;
 
                                                             setTimeout(() => {
-                                                                bigText.style.transform = 'scale(1)';
-                                                                bigText.style.opacity = '1';
-                                                            }, 50);
+                                                                if (!game._nibinTrollPendingExcess) return;
+                                                                const excessToResolve = game._nibinTrollPendingExcess;
+                                                                game._nibinTrollPendingExcess = 0;
+                                                                game._nibinTrollAttackerUid = null;
 
-                                                            setTimeout(() => {
-                                                                overlay.style.background = 'rgba(200,0,0,0)';
-                                                                bigText.style.transform = 'scale(1.2) translateY(-100px)';
-                                                                bigText.style.opacity = '0';
-                                                                setTimeout(() => overlay.remove(), 400);
-                                                            }, 1500);
+                                                                const questEl = document.querySelector('#quest-content .card') || document.getElementById('quest-zone');
+                                                                const onRemoveProgress = () => {
+                                                                    game.questProgress = Math.max(0, game.questProgress - excessToResolve);
+                                                                    if (engine.toast) engine.toast("Great Cave-troll", `Excess damage removed ${excessToResolve} progress!`, "danger");
+                                                                    if (engine.render) engine.render();
+                                                                };
 
-                                                            engine.render();
+                                                                if (window.triggerTrollFistSmash) {
+                                                                    window.triggerTrollFistSmash(excessToResolve, questEl, trollUid, () => {
+                                                                        onRemoveProgress();
+                                                                        game._nibinBlockCombatTransitions = false;
+                                                                    });
+                                                                } else {
+                                                                    onRemoveProgress();
+                                                                    game._nibinBlockCombatTransitions = false;
+                                                                }
+                                                            }, 380);
                                                         }
                                                     }
                                                 }
@@ -2171,34 +11721,8 @@ window.LotrExpansions['dark_of_nibin'] = {
 												arr.push = function(...items) {
                                                         const newItems = items.filter(c => !this.some(existing => existing && c && existing._uid === c._uid));
 														newItems.forEach(card => {
-																if (card && (card.trait || '').includes('Goblin') && !card._returnedToStaging) {
-																		const tunnelsCount = actualStagingArea.filter(c => c.id === 'nibin_goblin_tunnels').length;
-                                    for (let t = 0; t < tunnelsCount; t++) {
-                                        if (game.questProgress > 0) {
-                                            game.questProgress--;
-                                            if (engine && engine.toast) {
-                                                engine.toast("Goblin Tunnels", "A Goblin was revealed! Lost 1 quest progress.", "warning");
-                                            }
-                                            const questEl = document.querySelector('#quest-content .card') || document.getElementById('quest-zone');
-                                            if (questEl) {
-                                                if (engine && engine.window && engine.window.spawnBurstAtElement) {
-                                                    engine.window.spawnBurstAtElement(questEl, '#c0392b', 20);
-                                                }
-                                                const r = questEl.getBoundingClientRect();
-                                                const floatFn = window.floatText || (engine && engine.window && engine.window.floatText);
-                                                if (floatFn) {
-                                                    floatFn(r.left + r.width / 2, r.top + 30, '-1 Progress!', '#c0392b');
-                                                } else {
-                                                    const floatEl = document.createElement('div');
-                                                    floatEl.className = 'float-text';
-                                                    floatEl.style.cssText = `left:${r.left + r.width/2}px; top:${r.top + 30}px; color:#c0392b;`;
-                                                    floatEl.textContent = '-1 Progress!';
-                                                    document.body.appendChild(floatEl);
-                                                    setTimeout(() => floatEl.remove(), 1400);
-                                                }
-                                            }
-																				}
-																		}
+																if (typeof window.checkGoblinTunnelsReveal === 'function') {
+																		window.checkGoblinTunnelsReveal(card, actualStagingArea);
 																}
 																if (card) delete card._returnedToStaging;
 														});
@@ -2618,6 +12142,14 @@ window.LotrExpansions['dark_of_nibin'] = {
                             const promptHTML = `<span style="font-size:1.7rem; font-weight:700; color:var(--gold-bright); display:block; margin-bottom:12px; line-height:1.35; text-align:center;">Player 1: Choose a hero to attach Cave Torch:</span>`;
                             engine.showHeroPicker("Cave Torch", promptHTML, p1Heroes, (chosen) => {
                                 if (!chosen) chosen = p1Heroes[0];
+                                const playTorchAudio = () => {
+                                    const torchSnd = new Audio('./sound_effects/dark_of_mirkwood/cave_torch.mp3');
+                                    torchSnd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                                    torchSnd.play().catch(() => {});
+                                };
+                                // Play audio immediately upon choosing the hero (350ms earlier relative to card flight)
+                                playTorchAudio();
+
                                 const attachTorch = () => {
                                     chosen.attached = chosen.attached || [];
                                     chosen.attached.push(torch);
@@ -2655,16 +12187,19 @@ window.LotrExpansions['dark_of_nibin'] = {
                                     void ghost.offsetWidth;
                                     
                                     const targetScale = destRect.width / cardW;
-                                    ghost.style.left = `${destRect.left}px`;
-                                    ghost.style.top = `${destRect.top + destRect.height + 6}px`;
-                                    ghost.style.transform = `scale(${targetScale})`;
-                                    
-                                    if (window.SoundFX) window.SoundFX.playDraw();
-                                    
+
+                                    // Smoothly launch card 100ms after audio begins
+                                    setTimeout(() => {
+                                        ghost.style.left = `${destRect.left}px`;
+                                        ghost.style.top = `${destRect.top + destRect.height + 6}px`;
+                                        ghost.style.transform = `scale(${targetScale})`;
+                                        if (window.SoundFX) window.SoundFX.playDraw();
+                                    }, 100);
+
                                     setTimeout(() => {
                                         ghost.remove();
                                         attachTorch();
-                                    }, 600);
+                                    }, 700);
                                 } else {
                                     attachTorch();
                                 }
@@ -2760,24 +12295,34 @@ window.LotrExpansions['dark_of_nibin'] = {
                     configurable: true
                 });
 
-                // Enforce 0 engagement cost during encounter phase
+                // Enforce 0 engagement cost while Surprise Attack is active
                 setInterval(() => {
-                    if (game.questStageIdx === 1 && game.phase && game.phase.startsWith('encounter')) {
+                    const currentStage = window.QUEST_STAGES ? window.QUEST_STAGES[game.questStageIdx] : null;
+                    const isSurpriseAttack = currentStage && currentStage.name === 'Surprise Attack';
+                    if (isSurpriseAttack) {
                         game.stagingArea.forEach(c => {
-                            if (c.type === 'enemy') {
-                                c._origEngagement = c._origEngagement !== undefined ? c._origEngagement : c.engagement;
+                            if (c.type === 'enemy' || c.type === 'enemy-immune') {
+                                if (c._origEngagement === undefined) {
+                                    c._origEngagement = c.engagement !== undefined ? c.engagement : 0;
+                                }
                                 c.engagement = 0;
                             }
                         });
                     } else {
                         game.stagingArea.forEach(c => {
-                            if (c.type === 'enemy' && c._origEngagement !== undefined) {
+                            if (c._origEngagement !== undefined) {
+                                c.engagement = c._origEngagement;
+                                delete c._origEngagement;
+                            }
+                        });
+                        game.engagedEnemies.forEach(c => {
+                            if (c._origEngagement !== undefined) {
                                 c.engagement = c._origEngagement;
                                 delete c._origEngagement;
                             }
                         });
                     }
-                }, 500);
+                }, 100);
             },
             setupButtons: function(stage, game, engine) {
                 const flipNative = document.getElementById('flip-quest-btn');
@@ -2787,6 +12332,14 @@ window.LotrExpansions['dark_of_nibin'] = {
                     if (flipNative) flipNative.style.display = 'none';
                     if (beginNative) beginNative.style.display = 'none';
                 }, 0);
+
+                const onChieftainAnimationComplete = () => {
+                    const searchBtn = document.getElementById('nibin-search-btn');
+                    if (searchBtn) {
+                        searchBtn.style.pointerEvents = 'auto';
+                        searchBtn.style.opacity = '1';
+                    }
+                };
 
                 const questReveal = document.getElementById('quest-reveal');
                 let bgOverlay = document.getElementById('nibin-setup-bg-overlay');
@@ -2810,27 +12363,109 @@ window.LotrExpansions['dark_of_nibin'] = {
                         const chieftain = game.outOfPlay[chiefIdx];
                         const chiefEl = document.querySelector(`[data-uid="${chieftain._uid}"]`);
                         const startRect = chiefEl ? chiefEl.getBoundingClientRect() : null;
-                        
+                        const chiefElHtml = chiefEl ? chiefEl.innerHTML : null;
+                        const chiefElClass = chiefEl ? chiefEl.className : 'card encounter-enemy';
+                        const snd = new Audio('./sound_effects/dark_of_mirkwood/goblin_chieftain.mp3');
+                        snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                        snd.play().catch(() => {});
+												
                         game.outOfPlay.splice(chiefIdx, 1);
                         if (game.outOfPlay.length === 0) game._outOfPlayShowing = false;
                         engine.render();
 
-                        const finalizeChief = () => {
+                        if (startRect) {
+                            chieftain._drawing = true;
                             game.stagingArea.push(chieftain);
-                            engine.toast("Goblin Chieftain", "Goblin Chieftain enters the staging area!", "danger");
+                            if (window.cardPositions) delete window.cardPositions[chieftain._uid];
+                            if (engine.window.cardPositions) delete engine.window.cardPositions[chieftain._uid];
                             engine.render();
 
+                            const newChiefEl = document.querySelector(`#staging-content [data-uid="${chieftain._uid}"]`);
+                            if (newChiefEl) {
+                                const destRect = newChiefEl.getBoundingClientRect();
+                                const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
+                                const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
+                                
+                                const ghost = document.createElement('div');
+                                ghost.className = chiefElClass;
+                                ghost.style.cssText = `
+                                    position: fixed; z-index: 2000;
+                                    width: ${cardW}px; height: ${cardH}px;
+                                    left: ${startRect.left}px; top: ${startRect.top}px;
+                                    transform: scale(${startRect.width / cardW});
+                                    transform-origin: top left;
+                                    transition: all 0.8s cubic-bezier(0.25, 0.8, 0.25, 1);
+                                    pointer-events: none;
+                                    box-shadow: 0 10px 25px rgba(0,0,0,0.7);
+                                    border-radius: 6px; overflow: visible;
+                                `;
+                                if (chiefElHtml) {
+                                    ghost.innerHTML = chiefElHtml;
+                                } else {
+                                    const chiefImgUrl = chieftain.img || 'cards/dark_of_mirkwood/caves_of_nibin/goblin_chieftain.jpg';
+                                    ghost.innerHTML = `<img src="${chiefImgUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
+                                }
+                                document.body.appendChild(ghost);
+
+                                const ripples = ghost.querySelectorAll('.drop-ripple');
+                                if (ripples.length > 0) {
+                                    const elapsed = (Date.now() - (window._nibinAuraStartTime || Date.now())) / 1000;
+                                    if (ripples[0]) ripples[0].style.animationDelay = `-${elapsed % 6}s`;
+                                    if (ripples[1]) ripples[1].style.animationDelay = `-${(elapsed + 4) % 6}s`;
+                                    if (ripples[2]) ripples[2].style.animationDelay = `-${(elapsed + 2) % 6}s`;
+                                }
+
+                                void ghost.offsetWidth;
+
+                                ghost.style.left = `${destRect.left}px`;
+                                ghost.style.top = `${destRect.top}px`;
+                                ghost.style.transform = `scale(${destRect.width / cardW})`;
+
+                                if (window.SoundFX && window.SoundFX.playWhoosh) window.SoundFX.playWhoosh();
+
+                                setTimeout(() => {
+                                    ghost.remove();
+                                    delete chieftain._drawing;
+                                    engine.toast("Goblin Chieftain", "Goblin Chieftain enters the staging area!", "danger");
+                                    
+                                    const realEl = document.querySelector(`[data-uid="${chieftain._uid}"]`);
+                                    if (realEl) {
+                                        realEl.style.opacity = '1';
+                                        realEl.style.pointerEvents = 'auto';
+                                    } else {
+                                        engine.render();
+                                    }
+
+                                    if (window.triggerChieftainEpicTokens) window.triggerChieftainEpicTokens(chieftain._uid, engine, onChieftainAnimationComplete);
+                                    else onChieftainAnimationComplete();
+                                    setTimeout(() => {
+                                        if (bgOverlay) bgOverlay.style.opacity = '1';
+                                    }, 200);
+                                }, 800);
+                            } else {
+                                delete chieftain._drawing;
+                                engine.toast("Goblin Chieftain", "Goblin Chieftain enters the staging area!", "danger");
+                                engine.render();
+                                if (window.triggerChieftainEpicTokens) window.triggerChieftainEpicTokens(chieftain._uid, engine, onChieftainAnimationComplete);
+                                else onChieftainAnimationComplete();
+                                setTimeout(() => {
+                                    if (bgOverlay) bgOverlay.style.opacity = '1';
+                                }, 200);
+                            }
+                        } else {
+                            game.stagingArea.push(chieftain);
+                            if (window.cardPositions) delete window.cardPositions[chieftain._uid];
+                            if (engine.window.cardPositions) delete engine.window.cardPositions[chieftain._uid];
+                            engine.toast("Goblin Chieftain", "Goblin Chieftain enters the staging area!", "danger");
+                            engine.render();
+                            if (window.triggerChieftainEpicTokens) window.triggerChieftainEpicTokens(chieftain._uid, engine, onChieftainAnimationComplete);
+                            else onChieftainAnimationComplete();
                             setTimeout(() => {
                                 if (bgOverlay) bgOverlay.style.opacity = '1';
                             }, 200);
-                        };
-
-                        if (startRect && engine.window._animateCardToStaging) {
-                            engine.window._animateCardToStaging(chieftain, startRect, finalizeChief);
-                        } else {
-                            finalizeChief();
                         }
                     } else {
+                        onChieftainAnimationComplete();
                         if (bgOverlay) bgOverlay.style.opacity = '1';
                     }
                 };
@@ -2865,18 +12500,72 @@ window.LotrExpansions['dark_of_nibin'] = {
                                     }
 
                                     const startRect = engine.window._lastPickerRect;
-                                    const finalizeStaging = () => {
+                                    if (startRect) {
+                                        chosen._drawing = true;
                                         game.stagingArea.push(chosen);
+                                        if (window.cardPositions) delete window.cardPositions[chosen._uid];
+                                        if (engine.window.cardPositions) delete engine.window.cardPositions[chosen._uid];
+                                        engine.render();
+
+                                        const newLocEl = document.querySelector(`#staging-content [data-uid="${chosen._uid}"]`);
+                                        if (newLocEl) {
+                                            const destRect = newLocEl.getBoundingClientRect();
+                                            const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
+                                            const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
+                                            
+                                            const ghost = document.createElement('div');
+                                            ghost.className = `card ${chosen.sphere || 'encounter-enemy'}`;
+                                            ghost.style.cssText = `
+                                                position: fixed; z-index: 2000;
+                                                width: ${cardW}px; height: ${cardH}px;
+                                                left: ${startRect.left}px; top: ${startRect.top}px;
+                                                transform: scale(${startRect.width / cardW});
+                                                transform-origin: top left;
+                                                transition: all 0.8s cubic-bezier(0.25, 0.8, 0.25, 1);
+                                                pointer-events: none;
+                                                box-shadow: 0 10px 25px rgba(0,0,0,0.7);
+                                                border-radius: 6px; overflow: hidden;
+                                            `;
+                                            const locImgUrl = chosen.img || `https://hallofbeorn.com/Images/Cards/Core-Set/${chosen.name.replace(/ /g, '-').replace(/'/g, '')}.jpg`;
+                                            ghost.innerHTML = `<img src="${locImgUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
+                                            document.body.appendChild(ghost);
+
+                                            void ghost.offsetWidth;
+
+                                            ghost.style.left = `${destRect.left}px`;
+                                            ghost.style.top = `${destRect.top}px`;
+                                            ghost.style.transform = `scale(${destRect.width / cardW})`;
+
+                                            try {
+                                                const snd = new Audio('./sound_effects/enemy_move.mp3');
+                                                const vol = document.getElementById('volume-slider');
+                                                snd.volume = vol ? parseFloat(vol.value) : 0.25;
+                                                snd.play().catch(() => {});
+                                            } catch (e) {}
+
+                                            setTimeout(() => {
+                                                ghost.remove();
+                                                delete chosen._drawing;
+                                                engine.toast("Ambush!", `Added ${chosen.name} to staging.`, "danger");
+                                                engine.render();
+                                                pIdx++;
+                                                pickNext();
+                                            }, 800);
+                                        } else {
+                                            delete chosen._drawing;
+                                            engine.toast("Ambush!", `Added ${chosen.name} to staging.`, "danger");
+                                            engine.render();
+                                            pIdx++;
+                                            pickNext();
+                                        }
+                                    } else {
+                                        game.stagingArea.push(chosen);
+                                        if (window.cardPositions) delete window.cardPositions[chosen._uid];
+                                        if (engine.window.cardPositions) delete engine.window.cardPositions[chosen._uid];
                                         engine.toast("Ambush!", `Added ${chosen.name} to staging.`, "danger");
                                         engine.render();
                                         pIdx++;
                                         pickNext();
-                                    };
-
-                                    if (startRect && engine.window._animateCardToStaging) {
-                                        engine.window._animateCardToStaging(chosen, startRect, finalizeStaging);
-                                    } else {
-                                        finalizeStaging();
                                     }
                                 } else {
                                     pIdx++;
@@ -2894,8 +12583,9 @@ window.LotrExpansions['dark_of_nibin'] = {
                 const actionsDiv = document.getElementById('quest-reveal-actions');
                 if (actionsDiv) {
                     const searchBtn = document.createElement('button');
+                    searchBtn.id = 'nibin-search-btn';
                     searchBtn.className = 'btn';
-                    searchBtn.style.cssText = 'min-width:180px;font-size:1rem;padding:0.85rem 2rem;border-color:var(--gold-bright);color:var(--gold-bright);';
+                    searchBtn.style.cssText = 'min-width:180px;font-size:1rem;padding:0.85rem 2rem;border-color:var(--gold-bright);color:var(--gold-bright);opacity:0;pointer-events:none;transition:opacity 0.5s ease-in-out;';
                     searchBtn.textContent = 'Search the Encounter Deck and Discard Pile';
                     searchBtn.onclick = () => {
                         searchBtn.remove();
@@ -2958,9 +12648,15 @@ window.LotrExpansions['dark_of_nibin'] = {
                 let pillar = pilIdx >= 0 ? game.outOfPlay[pilIdx] : null;
 
                 let chiefStartRect = null;
+                let chiefElHtml = null;
+                let chiefElClass = 'card encounter-enemy';
                 if (chieftain) {
                     const el = document.querySelector(`[data-uid="${chieftain._uid}"]`);
-                    if (el) chiefStartRect = el.getBoundingClientRect();
+                    if (el) {
+                        chiefStartRect = el.getBoundingClientRect();
+                        chiefElHtml = el.innerHTML;
+                        chiefElClass = el.className;
+                    }
                 }
                 let pilStartRect = null;
                 if (pillar) {
@@ -3000,7 +12696,7 @@ window.LotrExpansions['dark_of_nibin'] = {
                             const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
                             const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
                             const ghost = document.createElement('div');
-                            ghost.className = 'card encounter-enemy';
+                            ghost.className = chiefElClass;
                             ghost.style.cssText = `
                                 position: fixed; z-index: 2000;
                                 width: ${cardW}px; height: ${cardH}px;
@@ -3010,11 +12706,23 @@ window.LotrExpansions['dark_of_nibin'] = {
                                 transition: all 0.8s cubic-bezier(0.25, 0.8, 0.25, 1);
                                 pointer-events: none;
                                 box-shadow: 0 10px 25px rgba(0,0,0,0.7);
-                                border-radius: 6px; overflow: hidden;
+                                border-radius: 6px; overflow: visible;
                             `;
-                            const chiefImgUrl = chieftain.img || 'cards/dark_of_mirkwood/caves_of_nibin/goblin_chieftain.jpg';
-                            ghost.innerHTML = `<img src="${chiefImgUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
+                            if (chiefElHtml) {
+                                ghost.innerHTML = chiefElHtml;
+                            } else {
+                                const chiefImgUrl = chieftain.img || 'cards/dark_of_mirkwood/caves_of_nibin/goblin_chieftain.jpg';
+                                ghost.innerHTML = `<img src="${chiefImgUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
+                            }
                             document.body.appendChild(ghost);
+
+                            const ripples = ghost.querySelectorAll('.drop-ripple');
+                            if (ripples.length > 0) {
+                                const elapsed = (Date.now() - (window._nibinAuraStartTime || Date.now())) / 1000;
+                                if (ripples[0]) ripples[0].style.animationDelay = `-${elapsed % 6}s`;
+                                if (ripples[1]) ripples[1].style.animationDelay = `-${(elapsed + 4) % 6}s`;
+                                if (ripples[2]) ripples[2].style.animationDelay = `-${(elapsed + 2) % 6}s`;
+                            }
 
                             void ghost.offsetWidth;
 
@@ -3039,10 +12747,67 @@ window.LotrExpansions['dark_of_nibin'] = {
                 }
                 if (pillar) {
                     anims.push(new Promise(resolve => {
-                        engine.window._animateCardToStaging(pillar, pilStartRect, () => {
+                        try {
+                            const snd = new Audio('./sound_effects/dark_of_mirkwood/cracked_pillar.mp3');
+                            const volSlider = document.getElementById('volume-slider');
+                            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                            snd.play().catch(() => {});
+                        } catch(e) {}
+
+                        if (pilStartRect) {
+                            pillar._drawing = true;
                             game.stagingArea.push(pillar);
+                            if (window.cardPositions) delete window.cardPositions[pillar._uid];
+                            if (engine.window.cardPositions) delete engine.window.cardPositions[pillar._uid];
+                            engine.render();
+
+                            const newPilEl = document.querySelector(`#staging-content [data-uid="${pillar._uid}"]`);
+                            if (newPilEl) {
+                                const destRect = newPilEl.getBoundingClientRect();
+                                const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
+                                const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
+                                
+                                const ghost = document.createElement('div');
+                                ghost.className = 'card encounter-location';
+                                ghost.style.cssText = `
+                                    position: fixed; z-index: 2000;
+                                    width: ${cardW}px; height: ${cardH}px;
+                                    left: ${pilStartRect.left}px; top: ${pilStartRect.top}px;
+                                    transform: scale(${pilStartRect.width / cardW});
+                                    transform-origin: top left;
+                                    transition: all 0.8s cubic-bezier(0.25, 0.8, 0.25, 1);
+                                    pointer-events: none;
+                                    box-shadow: 0 10px 25px rgba(0,0,0,0.7);
+                                    border-radius: 6px; overflow: hidden;
+                                `;
+                                const pilImgUrl = pillar.img || 'cards/dark_of_mirkwood/caves_of_nibin/cracked_pillar.jpg';
+                                ghost.innerHTML = `<img src="${pilImgUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
+                                document.body.appendChild(ghost);
+
+                                void ghost.offsetWidth;
+
+                                ghost.style.left = `${destRect.left}px`;
+                                ghost.style.top = `${destRect.top}px`;
+                                ghost.style.transform = `scale(${destRect.width / cardW})`;
+
+                                setTimeout(() => {
+                                    ghost.remove();
+                                    delete pillar._drawing;
+                                    engine.render();
+                                    resolve();
+                                }, 800);
+                            } else {
+                                delete pillar._drawing;
+                                engine.render();
+                                resolve();
+                            }
+                        } else {
+                            game.stagingArea.push(pillar);
+                            if (window.cardPositions) delete window.cardPositions[pillar._uid];
+                            if (engine.window.cardPositions) delete engine.window.cardPositions[pillar._uid];
+                            engine.render();
                             resolve();
-                        });
+                        }
                     }));
                 }
 
@@ -3070,6 +12835,8 @@ window.LotrExpansions['dark_of_nibin'] = {
                     const chieftain = game.outOfPlay[chiefIdx];
                     const chiefEl = document.querySelector(`[data-uid="${chieftain._uid}"]`);
                     const startRect = chiefEl ? chiefEl.getBoundingClientRect() : null;
+                    const chiefElHtml = chiefEl ? chiefEl.innerHTML : null;
+                    const chiefElClass = chiefEl ? chiefEl.className : 'card encounter-enemy';
                     
                     setTimeout(() => {
                         game.outOfPlay.splice(chiefIdx, 1);
@@ -3078,6 +12845,7 @@ window.LotrExpansions['dark_of_nibin'] = {
                         chieftain._drawing = true;
                         game.stagingArea.push(chieftain);
                         if (window.cardPositions) delete window.cardPositions[chieftain._uid];
+                        if (engine.window.cardPositions) delete engine.window.cardPositions[chieftain._uid];
                         
                         // Temporarily bypass slow collapse animation so we can calculate the exact final coordinates instantly
                         const oopZone = document.getElementById('out-of-play-zone');
@@ -3096,7 +12864,7 @@ window.LotrExpansions['dark_of_nibin'] = {
                             const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
                             
                             const ghost = document.createElement('div');
-                            ghost.className = 'card encounter-enemy';
+                            ghost.className = chiefElClass;
                             ghost.style.cssText = `
                                 position: fixed; z-index: 2000;
                                 width: ${cardW}px; height: ${cardH}px;
@@ -3106,11 +12874,23 @@ window.LotrExpansions['dark_of_nibin'] = {
                                 transition: all 0.8s cubic-bezier(0.25, 0.8, 0.25, 1);
                                 pointer-events: none;
                                 box-shadow: 0 10px 25px rgba(0,0,0,0.7);
-                                border-radius: 6px; overflow: hidden;
+                                border-radius: 6px; overflow: visible;
                             `;
-                            const chiefImgUrl = chieftain.img || 'cards/dark_of_mirkwood/caves_of_nibin/goblin_chieftain.jpg';
-                            ghost.innerHTML = `<img src="${chiefImgUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
+                            if (chiefElHtml) {
+                                ghost.innerHTML = chiefElHtml;
+                            } else {
+                                const chiefImgUrl = chieftain.img || 'cards/dark_of_mirkwood/caves_of_nibin/goblin_chieftain.jpg';
+                                ghost.innerHTML = `<img src="${chiefImgUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
+                            }
                             document.body.appendChild(ghost);
+
+                            const ripples = ghost.querySelectorAll('.drop-ripple');
+                            if (ripples.length > 0) {
+                                const elapsed = (Date.now() - (window._nibinAuraStartTime || Date.now())) / 1000;
+                                if (ripples[0]) ripples[0].style.animationDelay = `-${elapsed % 6}s`;
+                                if (ripples[1]) ripples[1].style.animationDelay = `-${(elapsed + 4) % 6}s`;
+                                if (ripples[2]) ripples[2].style.animationDelay = `-${(elapsed + 2) % 6}s`;
+                            }
 
                             void ghost.offsetWidth;
 
@@ -3128,13 +12908,23 @@ window.LotrExpansions['dark_of_nibin'] = {
                                 if (oopZone) {
                                     oopZone.style.transition = '';
                                 }
-                                engine.render();
+
+                                const realEl = document.querySelector(`[data-uid="${chieftain._uid}"]`);
+                                if (realEl) {
+                                    realEl.style.opacity = '1';
+                                    realEl.style.pointerEvents = 'auto';
+                                } else {
+                                    engine.render();
+                                }
+
+                                if (window.triggerChieftainEpicTokens) window.triggerChieftainEpicTokens(chieftain._uid, engine);
                             }, 800);
                         } else {
                             delete chieftain._drawing;
                             engine.toast("Goblin Chieftain", "Goblin Chieftain enters the staging area!", "danger");
                             if (oopZone) oopZone.style.transition = '';
                             engine.render();
+                            if (window.triggerChieftainEpicTokens) window.triggerChieftainEpicTokens(chieftain._uid, engine);
                         }
                     }, 600); // Small delay to let the quest reveal modal appear and settle first
                 }
@@ -3149,8 +12939,10 @@ window.LotrExpansions['dark_of_nibin'] = {
                 if (target && target._lightlessPassageActive) {
                     mod -= 999;
                 }
-                if (card.shadowCard && card.shadowCard.id === 'nibin_goblin_tunnels') {
-                    mod += (card.trait||'').includes('Goblin') ? 3 : 1;
+                if (card.shadowCard && (card.shadowCard.id === 'nibin_goblin_tunnels' || card.shadowCard.id === 'goblin_tunnels' || card.shadowCard.name === 'Goblin Tunnels')) {
+                    if (!card._goblinTunnelsShadowApplied) {
+                        mod += ((card.trait||'').toLowerCase().includes('goblin') || (card.name||'').toLowerCase().includes('goblin')) ? 3 : 1;
+                    }
                 }
                 if (card.shadowCard && card.shadowCard.id === 'nibin_goblins_are_upon_you') {
                     const targetPIdx = target ? (target._ownerIdx || 0) : (card._engagedWithPlayerIdx || 0);
@@ -3267,13 +13059,13 @@ window.LotrExpansions['dark_of_nibin'] = {
                         card.damage = (card.damage || 0) + dmg;
                         if (engine && engine.toast) engine.toast("Cracked Pillar", `Attacked Pillar for ${dmg} damage!`, "success");
                         
-                        if (isDunhereSpecial && engine && engine.window && engine.window.drawAttackArrow) {
-                            // Dunhere staging attack triggers bow animation without simple dotted arrow
+                        if (!isDunhereSpecial) {
+                            attackers.forEach(a => {
+                                if (engine.window && engine.window.animateLunge) engine.window.animateLunge(a._uid, card._uid);
+                            });
+                        } else {
+                            if (window.shakeCard) window.shakeCard(card._uid);
                         }
-                        
-                        attackers.forEach(a => {
-                            if (engine.window && engine.window.animateLunge) engine.window.animateLunge(a._uid, card._uid);
-                        });
                         setTimeout(() => {
                             attackers.forEach(a => {
                                 a.exhausted = true;
@@ -3283,7 +13075,7 @@ window.LotrExpansions['dark_of_nibin'] = {
                                 if (a._stagingAttackBonusActive) {
                                     setTimeout(() => {
                                         const freshEl = document.querySelector(`[data-uid="${a._uid}"]`);
-                                        if (freshEl && engine.window && engine.window.animateTokensAway) {
+                                        if (freshEl && engine.window.animateTokensAway) {
                                             const atkToken = freshEl.querySelector('img[alt="atk"]');
                                             if (atkToken) engine.window.animateTokensAway([atkToken.closest('.buff-token')]);
                                         }
@@ -3303,44 +13095,60 @@ window.LotrExpansions['dark_of_nibin'] = {
                         game.pendingAttackers = []; // Clear early to prevent double click glitch
                         const dunhere = attackers[0];
                         dunhere.exhausted = true;
-                        delete dunhere._justExhaustedTime;
+                        dunhere._justExhaustedTime = Date.now();
                         
-                        const snd = new Audio('./sound_effects/bow_and_arrow.mp3');
-                        snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
-                        snd.play().catch(e => {});
+                        dunhere.attackBonus = (dunhere.attackBonus || 0) + 1;
+                        dunhere._stagingAttackBonusActive = true;
+                        if (engine && engine.render) engine.render();
+                        
+                        const dunhereEl = document.querySelector(`[data-uid="${dunhere._uid}"]`);
+                        if (dunhereEl) {
+                            const tokenNode = dunhereEl.querySelector('.buff-token');
+                            if (tokenNode) {
+                                tokenNode.style.transition = 'none';
+                                tokenNode.style.transform = 'translateY(-55px) scale(1.4)';
+                                tokenNode.style.opacity = '0';
+                                void tokenNode.offsetWidth;
+                                requestAnimationFrame(() => {
+                                    tokenNode.style.transition = 'transform 0.65s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.55s ease-out';
+                                    tokenNode.style.transform = 'translateY(0) scale(1)';
+                                    tokenNode.style.opacity = '1';
+                                });
+                            }
+                        }
+                        if (engine.window && engine.window.floatTextAtElement) {
+                            engine.window.floatTextAtElement(dunhere._uid, "+1 Attack (Staging)", '#ff5252');
+                        }
 
-                        const dunhereElInit = document.querySelector(`[data-uid="${dunhere._uid}"]`);
-                        if (dunhereElInit) dunhereElInit.classList.add('exhausted');
-                        
                         setTimeout(() => {
-                            dunhere.attackBonus = (dunhere.attackBonus || 0) + 1;
-                            dunhere._stagingAttackBonusActive = true;
-                            if (engine && engine.render) engine.render();
-                            
-                            const dunhereEl = document.querySelector(`[data-uid="${dunhere._uid}"]`);
-                            if (dunhereEl) {
-                                const tokenNode = dunhereEl.querySelector('.buff-token.plus');
-                                if (tokenNode) {
-                                    const wrapper = tokenNode.closest('.buff-token');
-                                    if (wrapper) {
-                                        wrapper.style.transition = 'all 0.6s cubic-bezier(0.34, 1.56, 0.64, 1)';
-                                        wrapper.style.transform = 'translateY(-50px) scale(1.6)';
-                                        wrapper.style.opacity = '0';
-                                        void wrapper.offsetWidth;
-                                        wrapper.style.transform = 'translateY(0) scale(1)';
-                                        wrapper.style.opacity = '1';
-                                    }
-                                }
+                            const triggerBow = window.triggerRangedBowAttack || (engine.window && engine.window.triggerRangedBowAttack);
+                            if (triggerBow) {
+                                triggerBow(dunhere._uid, card._uid);
                             }
-                            if (engine.window && engine.window.floatTextAtElement) {
-                                engine.window.floatTextAtElement(dunhere._uid, "+1 Attack (Staging)", '#ff5252');
+                            if (window.SoundFX && typeof window.SoundFX.playBowAttack === 'function') {
+                                window.SoundFX.playBowAttack();
+                            } else {
+                                const snd = new Audio('./sound_effects/bow_and_arrow.mp3');
+                                snd.preservesPitch = false;
+                                snd.playbackRate = 0.82 + Math.random() * 0.36;
+                                snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                                snd.play().catch(e => {});
                             }
-                            
+
                             setTimeout(() => {
                                 executeLungeAndDamage(true);
-                            }, 650);
-                        }, 450);
+                            }, 1035);
+                        }, 350);
                     } else {
+                        attackers.forEach(a => {
+                            const isRanged = window.isRangedCharacter ? window.isRangedCharacter(a) : (a.id === 'dunhere' || (a.text && a.text.includes('Ranged')));
+                            if (isRanged) {
+                                const triggerBow = window.triggerRangedBowAttack || (engine.window && engine.window.triggerRangedBowAttack);
+                                if (triggerBow) {
+                                    triggerBow(a._uid, card._uid);
+                                }
+                            }
+                        });
                         executeLungeAndDamage(false);
                     }
                     return true;
@@ -3355,23 +13163,403 @@ window.LotrExpansions['dark_of_nibin'] = {
             },
             onTravel: function(loc, game, engine, proceedTravel) {
                 if ((loc.damage || 0) >= 4) {
+                    try {
+                        const snd = new Audio('./sound_effects/dark_of_mirkwood/cracked_pillar.mp3');
+                        const volSlider = document.getElementById('volume-slider');
+                        snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                        snd.play().catch(() => {});
+                    } catch(e) {}
+
                     const el = document.querySelector(`[data-uid="${loc._uid}"]`);
-                    const dmgToken = el ? el.querySelector('.token.damage') : null;
-                    if (dmgToken && engine.window && engine.window.animateTokensAway) {
-                        engine.window.animateTokensAway([dmgToken]);
+                    const locRect = el ? el.getBoundingClientRect() : { left: window.innerWidth / 2 - 72, top: 120, width: 144, height: 202 };
+                    const origDmgToken = el ? el.querySelector('.token.damage') : null;
+                    const tokenRect = origDmgToken ? origDmgToken.getBoundingClientRect() : null;
+
+                    const originX = tokenRect ? (tokenRect.left + tokenRect.width / 2) : (locRect.right - 26);
+                    const originY = tokenRect ? (tokenRect.top + tokenRect.height / 2) : (locRect.bottom - 26);
+
+                    const remainingDmg = (loc.damage || 0) - 4;
+                    if (remainingDmg > 0) {
+                        if (origDmgToken) origDmgToken.textContent = remainingDmg;
+                    } else {
+                        if (origDmgToken) origDmgToken.style.visibility = 'hidden';
                     }
-                    if (engine.window && engine.window.floatTextAtElement) {
-                        engine.window.floatTextAtElement(loc._uid, "-4 Damage", "#ff5252");
+
+                    if (!document.getElementById('cracked-pillar-shatter-styles')) {
+                        const st = document.createElement('style');
+                        st.id = 'cracked-pillar-shatter-styles';
+                        st.textContent = `
+                            @keyframes damageTokenViolentRumble {
+                                0%, 100% { transform: scale(1) rotate(var(--t-rot, 0deg)); }
+                                25% { transform: translate(-3px, 2px) scale(1.04) rotate(calc(var(--t-rot, 0deg) - 3deg)); }
+                                50% { transform: translate(3px, -2px) scale(0.96) rotate(calc(var(--t-rot, 0deg) + 3deg)); }
+                                75% { transform: translate(-2px, -1px) scale(1.03) rotate(calc(var(--t-rot, 0deg) - 2deg)); }
+                            }
+                            @keyframes damageTokenFissureSpread {
+                                0% { stroke-dashoffset: 100; opacity: 0; }
+                                30% { opacity: 1; filter: drop-shadow(0 0 4px #ffedd5); }
+                                80% { stroke-dashoffset: 0; opacity: 1; filter: drop-shadow(0 0 8px #ff4d6d); }
+                                100% { stroke-dashoffset: 0; opacity: 1; filter: drop-shadow(0 0 12px #ffffff); }
+                            }
+                        `;
+                        document.head.appendChild(st);
                     }
-                    loc.damage -= 4;
-                    if (engine.toast) {
-                        engine.toast("Cracked Pillar", "Removed 4 damage to travel to Cracked Pillar.", "success");
+
+                    const wrapCenterX = locRect.left + locRect.width / 2;
+                    const wrapCenterY = locRect.top + locRect.height / 2;
+
+                    const spawnedTokens = [];
+                    for (let i = 0; i < 4; i++) {
+                        const tilt = (i === 0 ? -7 : (i === 1 ? -2 : (i === 2 ? 3 : 8)));
+                        const targetX = wrapCenterX + (i - 1.5) * 38;
+                        const targetY = wrapCenterY - 14 + Math.abs(i - 1.5) * 6;
+
+                        const tokenEl = document.createElement('div');
+                        tokenEl.className = `desecrated-damage-token token-${i}`;
+                        tokenEl.style.cssText = `
+                            position: fixed; z-index: 10008; pointer-events: none;
+                            left: ${originX}px; top: ${originY}px;
+                            width: 44px; height: 44px; margin-left: -22px; margin-top: -22px;
+                            transform: scale(0.2) rotate(${tilt}deg);
+                            opacity: 0;
+                            transform-origin: center center;
+                            transition: left 0.38s cubic-bezier(0.18, 0.89, 0.32, 1.25), top 0.38s cubic-bezier(0.18, 0.89, 0.32, 1.25), transform 0.38s cubic-bezier(0.18, 0.89, 0.32, 1.25), opacity 0.2s ease-out;
+                        `;
+                        tokenEl.innerHTML = `
+                            <img src="tokens/damage.png" style="width: 100%; height: 100%; object-fit: contain; display: block; filter: drop-shadow(0 4px 12px rgba(0,0,0,0.95));" alt="Damage Token" />
+                            <svg viewBox="0 0 44 44" class="token-fissures" style="position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; opacity: 0;">
+                                <path d="M 22 4 L 17 17 L 27 25 L 16 35 L 22 41" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" pathLength="100" stroke-dasharray="100" stroke-dashoffset="100" class="crack-path-1" />
+                                <path d="M 5 22 L 18 19 L 29 27 L 40 21" fill="none" stroke="#ffcdd2" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" pathLength="100" stroke-dasharray="100" stroke-dashoffset="100" class="crack-path-2" />
+                            </svg>
+                        `;
+                        document.body.appendChild(tokenEl);
+                        spawnedTokens.push({ el: tokenEl, targetX, targetY, tilt, idx: i });
+
+                        requestAnimationFrame(() => {
+                            setTimeout(() => {
+                                tokenEl.style.left = `${targetX}px`;
+                                tokenEl.style.top = `${targetY}px`;
+                                tokenEl.style.transform = `scale(1) rotate(${tilt}deg)`;
+                                tokenEl.style.opacity = '1';
+                                if (engine.window && engine.window.SoundFX && engine.window.SoundFX.playWhoosh) {
+                                    engine.window.SoundFX.playWhoosh();
+                                }
+                            }, i * 65);
+                        });
                     }
-                    if (engine.render) engine.render();
+
+                    const canvas = document.createElement('canvas');
+                    canvas.width = window.innerWidth;
+                    canvas.height = window.innerHeight;
+                    canvas.style.cssText = `position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 10012;`;
+                    document.body.appendChild(canvas);
+
+                    const ctx = canvas.getContext('2d');
+                    const particles = [];
+                    const rubyPalette = ['#e63946', '#ff4d6d', '#ff758f', '#ff0033', '#c9184a', '#ff99a8', '#ffffff'];
+                    const stonePalette = ['#2b2b2b', '#403d39', '#1f1f1f', '#33272a'];
+                    const windDirX = Math.random() < 0.5 ? 1.0 : -1.0;
+
+                    const spawnTokenShatterBurst = (originX, originY) => {
+                        for (let i = 0; i < 35; i++) {
+                            const baseCol = rubyPalette[Math.floor(Math.random() * rubyPalette.length)];
+                            particles.push({
+                                type: 'shard',
+                                x: originX + (Math.random() - 0.5) * 26,
+                                y: originY + (Math.random() - 0.5) * 26,
+                                vx: (Math.random() * 1.6 + 0.6) * windDirX + (Math.random() - 0.5) * 1.5,
+                                vy: (Math.random() - 0.5) * 1.8 - 0.4,
+                                ax: 0.045 * windDirX,
+                                ay: 0.025,
+                                size: Math.random() * 3.4 + 2.2,
+                                rot: Math.random() * Math.PI * 2,
+                                vrot: (Math.random() - 0.5) * 0.09,
+                                aspect: 0.55 + Math.random() * 0.35,
+                                color: baseCol,
+                                alpha: 1,
+                                decay: 0.005 + Math.random() * 0.0035,
+                                phase: Math.random() * Math.PI * 2
+                            });
+                        }
+
+                        for (let i = 0; i < 35; i++) {
+                            const numVerts = 5 + Math.floor(Math.random() * 2);
+                            const verts = [];
+                            const baseRadius = Math.random() * 2.2 + 1.4;
+                            for (let v = 0; v < numVerts; v++) {
+                                const angle = (v / numVerts) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
+                                const r = baseRadius * (0.7 + Math.random() * 0.55);
+                                verts.push({ x: Math.cos(angle) * r, y: Math.sin(angle) * r });
+                            }
+                            particles.push({
+                                type: 'grain',
+                                x: originX + (Math.random() - 0.5) * 30,
+                                y: originY + (Math.random() - 0.5) * 30,
+                                vx: (Math.random() * 1.4 + 0.5) * windDirX + (Math.random() - 0.5) * 1.4,
+                                vy: (Math.random() - 0.5) * 1.6 - 0.3,
+                                ax: 0.04 * windDirX,
+                                ay: 0.02,
+                                size: baseRadius,
+                                rot: Math.random() * Math.PI * 2,
+                                vrot: (Math.random() - 0.5) * 0.08,
+                                verts: verts,
+                                color: rubyPalette[Math.floor(Math.random() * rubyPalette.length)],
+                                alpha: 1,
+                                decay: 0.0052 + Math.random() * 0.0035,
+                                phase: Math.random() * Math.PI * 2
+                            });
+                        }
+
+                        for (let i = 0; i < 16; i++) {
+                            particles.push({
+                                type: 'spark',
+                                x: originX + (Math.random() - 0.5) * 32,
+                                y: originY + (Math.random() - 0.5) * 32,
+                                vx: (Math.random() * 1.6 + 0.7) * windDirX + (Math.random() - 0.5) * 1.3,
+                                vy: (Math.random() - 0.5) * 1.5 - 0.3,
+                                ax: 0.05 * windDirX,
+                                ay: 0.015,
+                                size: Math.random() * 2.6 + 1.8,
+                                rot: Math.random() * Math.PI * 2,
+                                vrot: (Math.random() - 0.5) * 0.06,
+                                color: Math.random() > 0.4 ? '#ffffff' : '#ffccd5',
+                                pulsePhase: Math.random() * Math.PI * 2,
+                                pulseSpeed: 0.08 + Math.random() * 0.08,
+                                alpha: 1,
+                                decay: 0.0055 + Math.random() * 0.003,
+                                phase: Math.random() * Math.PI * 2
+                            });
+                        }
+
+                        for (let i = 0; i < 16; i++) {
+                            const numV = 5 + Math.floor(Math.random() * 2);
+                            const fVerts = [];
+                            const bR = Math.random() * 3.2 + 2.4;
+                            for (let v = 0; v < numV; v++) {
+                                const angle = (v / numV) * Math.PI * 2 + (Math.random() - 0.5) * 0.4;
+                                const r = bR * (0.65 + Math.random() * 0.65);
+                                fVerts.push({ x: Math.cos(angle) * r, y: Math.sin(angle) * r });
+                            }
+                            particles.push({
+                                type: 'rock',
+                                x: originX + (Math.random() - 0.5) * 24,
+                                y: originY + (Math.random() - 0.5) * 24,
+                                vx: (Math.random() * 1.7 + 0.7) * windDirX + (Math.random() - 0.5) * 1.6,
+                                vy: (Math.random() - 0.5) * 2.0 - 0.6,
+                                ax: 0.038 * windDirX,
+                                ay: 0.08,
+                                size: bR,
+                                verts: fVerts,
+                                rot: Math.random() * Math.PI * 2,
+                                vrot: (Math.random() - 0.5) * 0.07,
+                                color: stonePalette[Math.floor(Math.random() * stonePalette.length)],
+                                alpha: 1,
+                                decay: 0.0055 + Math.random() * 0.0035
+                            });
+                        }
+
+                        for (let i = 0; i < 6; i++) {
+                            particles.push({
+                                type: 'windline',
+                                x: originX - 45 * windDirX + (Math.random() - 0.5) * 35,
+                                y: originY + (Math.random() - 0.5) * 50,
+                                vx: (Math.random() * 4.0 + 2.8) * windDirX,
+                                vy: (Math.random() - 0.5) * 1.2,
+                                len: Math.random() * 38 + 24,
+                                alpha: 0.65,
+                                decay: 0.012 + Math.random() * 0.007
+                            });
+                        }
+                    };
+
+                    let animFrameId = null;
+                    const renderParticles = () => {
+                        ctx.clearRect(0, 0, canvas.width, canvas.height);
+                        let activeCount = 0;
+
+                        for (let i = 0; i < particles.length; i++) {
+                            const p = particles[i];
+                            if (p.alpha <= 0) continue;
+                            activeCount++;
+
+                            p.x += p.vx;
+                            p.y += p.vy;
+                            if (p.ax) p.vx += p.ax;
+                            if (p.ay) p.vy += p.ay;
+                            p.alpha -= p.decay;
+
+                            ctx.save();
+                            ctx.globalAlpha = Math.max(0, p.alpha);
+
+                            if (p.type === 'shard') {
+                                p.y += Math.sin(p.x * 0.025 + p.phase) * 0.65;
+                                p.rot += p.vrot;
+                                ctx.translate(p.x, p.y);
+                                ctx.rotate(p.rot);
+                                const scaleX = Math.cos(p.rot * 1.8);
+                                ctx.scale(scaleX, 1);
+
+                                const sz = p.size;
+                                const asp = p.aspect;
+
+                                ctx.fillStyle = p.color;
+                                ctx.beginPath();
+                                ctx.moveTo(0, -sz * 1.4);
+                                ctx.lineTo(sz * asp, 0);
+                                ctx.lineTo(0, sz * 1.2);
+                                ctx.lineTo(-sz * asp, 0);
+                                ctx.closePath();
+                                ctx.fill();
+
+                                ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
+                                ctx.beginPath();
+                                ctx.moveTo(0, -sz * 1.4);
+                                ctx.lineTo(sz * asp, 0);
+                                ctx.lineTo(0, 0);
+                                ctx.closePath();
+                                ctx.fill();
+
+                                ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+                                ctx.lineWidth = 0.5;
+                                ctx.beginPath();
+                                ctx.moveTo(0, -sz * 1.4);
+                                ctx.lineTo(0, sz * 1.2);
+                                ctx.stroke();
+                            } else if (p.type === 'grain') {
+                                p.y += Math.sin(p.x * 0.028 + p.phase) * 0.6;
+                                p.rot += p.vrot;
+                                ctx.translate(p.x, p.y);
+                                ctx.rotate(p.rot);
+
+                                ctx.fillStyle = p.color;
+                                ctx.beginPath();
+                                for (let v = 0; v < p.verts.length; v++) {
+                                    const pt = p.verts[v];
+                                    if (v === 0) ctx.moveTo(pt.x, pt.y);
+                                    else ctx.lineTo(pt.x, pt.y);
+                                }
+                                ctx.closePath();
+                                ctx.fill();
+
+                                if (p.verts.length >= 2) {
+                                    ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+                                    ctx.beginPath();
+                                    ctx.moveTo(0, 0);
+                                    ctx.lineTo(p.verts[0].x, p.verts[0].y);
+                                    ctx.lineTo(p.verts[1].x, p.verts[1].y);
+                                    ctx.closePath();
+                                    ctx.fill();
+                                }
+
+                                ctx.strokeStyle = 'rgba(0, 0, 0, 0.2)';
+                                ctx.lineWidth = 0.6;
+                                ctx.stroke();
+                            } else if (p.type === 'spark') {
+                                p.y += Math.sin(p.x * 0.022 + p.phase) * 0.5;
+                                p.pulsePhase += p.pulseSpeed;
+                                p.rot += p.vrot;
+                                ctx.translate(p.x, p.y);
+                                ctx.rotate(p.rot);
+
+                                const sp = p.size * (0.75 + 0.35 * Math.sin(p.pulsePhase));
+                                ctx.fillStyle = p.color;
+                                ctx.beginPath();
+                                ctx.moveTo(0, -sp * 1.8);
+                                ctx.quadraticCurveTo(0, 0, sp * 1.8, 0);
+                                ctx.quadraticCurveTo(0, 0, 0, sp * 1.8);
+                                ctx.quadraticCurveTo(0, 0, -sp * 1.8, 0);
+                                ctx.quadraticCurveTo(0, 0, 0, -sp * 1.8);
+                                ctx.closePath();
+                                ctx.fill();
+                            } else if (p.type === 'rock') {
+                                p.rot += p.vrot;
+                                ctx.translate(p.x, p.y);
+                                ctx.rotate(p.rot);
+
+                                ctx.fillStyle = p.color;
+                                ctx.beginPath();
+                                for (let v = 0; v < p.verts.length; v++) {
+                                    const pt = p.verts[v];
+                                    if (v === 0) ctx.moveTo(pt.x, pt.y);
+                                    else ctx.lineTo(pt.x, pt.y);
+                                }
+                                ctx.closePath();
+                                ctx.fill();
+                            } else if (p.type === 'windline') {
+                                ctx.strokeStyle = 'rgba(255, 120, 140, 0.65)';
+                                ctx.lineWidth = 1.6;
+                                ctx.lineCap = 'round';
+                                ctx.beginPath();
+                                ctx.moveTo(p.x, p.y);
+                                ctx.lineTo(p.x - p.len * windDirX, p.y + p.vy * 1.4);
+                                ctx.stroke();
+                            }
+                            ctx.restore();
+                        }
+
+                        if (activeCount > 0 || particles.length === 0) {
+                            animFrameId = requestAnimationFrame(renderParticles);
+                        } else {
+                            if (animFrameId) cancelAnimationFrame(animFrameId);
+                            canvas.remove();
+                        }
+                    };
+                    animFrameId = requestAnimationFrame(renderParticles);
+
+                    spawnedTokens.forEach(({ el: tokenEl, targetX, targetY, idx }) => {
+                        const arrivalDelay = 380 + idx * 65;
+                        const fissureStart = arrivalDelay + 80;
+                        const shatterStart = fissureStart + 220 + idx * 160;
+
+                        setTimeout(() => {
+                            tokenEl.style.animation = 'damageTokenViolentRumble 0.45s ease-in-out infinite';
+                            const fissures = tokenEl.querySelector('.token-fissures');
+                            if (fissures) {
+                                fissures.style.opacity = '1';
+                                const c1 = fissures.querySelector('.crack-path-1');
+                                const c2 = fissures.querySelector('.crack-path-2');
+                                if (c1) c1.style.animation = 'damageTokenFissureSpread 0.3s ease-out forwards';
+                                if (c2) c2.style.animation = 'damageTokenFissureSpread 0.35s ease-out 0.05s forwards';
+                            }
+                            if (engine.window && engine.window.screenShake) {
+                                engine.window.screenShake(3, 140);
+                            }
+                        }, fissureStart);
+
+                        setTimeout(() => {
+                            tokenEl.style.filter = 'brightness(3.5) drop-shadow(0 0 20px #ffffff)';
+                            tokenEl.style.transform = 'scale(1.15)';
+                            tokenEl.style.opacity = '0';
+                            setTimeout(() => { tokenEl.remove(); }, 200);
+
+                            spawnTokenShatterBurst(targetX, targetY);
+
+                            if (engine.window && engine.window.screenShake) {
+                                engine.window.screenShake(5, 180);
+                            }
+                        }, shatterStart);
+                    });
+
+                    const finalShatterTime = 380 + 3 * 65 + 80 + 220 + 3 * 160;
+                    setTimeout(() => {
+                        if (engine.window && engine.window.floatTextAtElement) {
+                            engine.window.floatTextAtElement(loc._uid, "-4 Damage", "#ff5252");
+                        }
+                        loc.damage = Math.max(0, (loc.damage || 0) - 4);
+                        if (engine.toast) {
+                            engine.toast("Cracked Pillar", "Removed 4 damage to travel to Cracked Pillar.", "success");
+                        }
+                        if (engine.render) engine.render();
+                    }, finalShatterTime + 40);
 
                     setTimeout(() => {
                         proceedTravel();
-                    }, 400);
+                    }, finalShatterTime + 480);
+
+                    setTimeout(() => {
+                        if (animFrameId) cancelAnimationFrame(animFrameId);
+                        canvas.remove();
+                    }, 3200);
                 } else {
                     if (engine.toast) {
                         engine.toast("Cracked Pillar", "You must remove 4 damage from Cracked Pillar to travel here (it only has " + (loc.damage || 0) + ").", "warning");
@@ -3486,11 +13674,20 @@ window.LotrExpansions['dark_of_nibin'] = {
                                     
                                     void ghost.offsetWidth;
 
+                                    if (window.SoundFX && typeof window.SoundFX.playCardPlay === 'function') {
+                                        window.SoundFX.playCardPlay();
+                                    } else {
+                                        try {
+                                            const cpSnd = new Audio('./sound_effects/card_play.wav');
+                                            const vol = document.getElementById('volume-slider');
+                                            cpSnd.volume = vol ? parseFloat(vol.value) : 0.25;
+                                            cpSnd.play().catch(() => {});
+                                        } catch (e) {}
+                                    }
+
                                     ghost.style.left = `${discRect.left}px`;
                                     ghost.style.top = `${discRect.top}px`;
                                     ghost.style.transform = `scale(${discRect.width / cardW})`;
-                                    
-                                    if (window.SoundFX) window.SoundFX.playWhoosh();
 
                                     setTimeout(() => {
                                         ghost.remove();
@@ -3499,6 +13696,16 @@ window.LotrExpansions['dark_of_nibin'] = {
                                         if (onDone) onDone();
                                     }, 500);
                                 } else {
+                                    if (window.SoundFX && typeof window.SoundFX.playCardPlay === 'function') {
+                                        window.SoundFX.playCardPlay();
+                                    } else {
+                                        try {
+                                            const cpSnd = new Audio('./sound_effects/card_play.wav');
+                                            const vol = document.getElementById('volume-slider');
+                                            cpSnd.volume = vol ? parseFloat(vol.value) : 0.25;
+                                            cpSnd.play().catch(() => {});
+                                        } catch (e) {}
+                                    }
                                     game.encounterDiscard.push(top);
                                     engine.render();
                                     if (onDone) onDone();
@@ -3581,17 +13788,53 @@ window.LotrExpansions['dark_of_nibin'] = {
                         }
                     };
 
-                    // Step 1: Animate progress tokens onto the Dark location
-                    animateTokens(() => {
-                        // Step 2: Execute Cave Torch's Forced response FIRST
-                        executeForcedDiscard(() => {
-                            // Step 3: AFTER Cave Torch's Forced action fully completes, check if location is explored & trigger its response
-                            const exploreFn = (engine.window && engine.window.checkLocationExplored) || engine.checkLocationExplored;
-                            if (loc.progress >= (loc.questPts || 0)) {
-                                if (exploreFn) exploreFn(loc);
+                    const onProgressHit = (hitIdx) => {
+                        loc.progress = (loc.progress || 0) + 1;
+                        if (engine.render) engine.render();
+
+                        const freshEl = document.querySelector(`[data-uid="${loc._uid}"]`);
+                        if (freshEl) {
+                            const tokenEl = freshEl.querySelector('.token.progress');
+                            if (tokenEl && window.triggerFlameTokenMaterialize) {
+                                window.triggerFlameTokenMaterialize(tokenEl);
+                            } else if (engine.window.spawnBurstAtElement) {
+                                engine.window.spawnBurstAtElement(freshEl, '#4caf50', 16);
                             }
-                        });
-                    });
+                        }
+                        if (engine.window.floatTextAtElement) {
+                            engine.window.floatTextAtElement(loc._uid, '+1 Progress', '#4caf50', 1200);
+                        }
+                    };
+
+                    const onAllFinished = () => {
+                        const startDiscardWithDeckFlames = () => {
+                            if (window.triggerEncounterDeckFlames) {
+                                window.triggerEncounterDeckFlames(card._uid, () => {
+                                    executeForcedDiscard(() => {
+                                        const exploreFn = (engine.window && engine.window.checkLocationExplored) || engine.checkLocationExplored;
+                                        if (loc.progress >= (loc.questPts || 0)) {
+                                            if (exploreFn) exploreFn(loc);
+                                        }
+                                    });
+                                });
+                            } else {
+                                executeForcedDiscard(() => {
+                                    const exploreFn = (engine.window && engine.window.checkLocationExplored) || engine.checkLocationExplored;
+                                    if (loc.progress >= (loc.questPts || 0)) {
+                                        if (exploreFn) exploreFn(loc);
+                                    }
+                                });
+                            }
+                        };
+
+                        startDiscardWithDeckFlames();
+                    };
+
+                    if (window.triggerCaveTorchPiercingBeam) {
+                        window.triggerCaveTorchPiercingBeam(card._uid, loc._uid, onProgressHit, onAllFinished);
+                    } else {
+                        animateTokens(onAllFinished);
+                    }
                 }, 'Cancel');
                 return true;
             }
@@ -3601,6 +13844,172 @@ window.LotrExpansions['dark_of_nibin'] = {
             img: 'cards/dark_of_mirkwood/caves_of_nibin/great_cave_troll.jpg',
             text: 'Cannot have attachments.\nFor each point of excess combat damage dealt by Great Cave-troll (damage that is dealt beyond the remaining hit points of the character damaged by its attack) remove 1 progress from the current quest.'
         },
+
+        /* Black Shadow Comet projectile (No SVG) */
+        ...(() => {
+            window.triggerBlackShadowComet = function(sourceEl, targetEl, onImpact) {
+                if (!sourceEl || !targetEl) { if (onImpact) onImpact(); return; }
+                const sRect = sourceEl.getBoundingClientRect();
+                const tRect = targetEl.getBoundingClientRect();
+                const x1 = sRect.left + sRect.width / 2;
+                const y1 = sRect.top + sRect.height / 2;
+                const x2 = tRect.left + tRect.width / 2;
+                const y2 = tRect.top + tRect.height / 2;
+
+                const canvas = document.createElement('canvas');
+                const dpr = window.devicePixelRatio || 1;
+                canvas.width = window.innerWidth * dpr;
+                canvas.height = window.innerHeight * dpr;
+                canvas.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:100050;';
+                document.body.appendChild(canvas);
+
+                const ctx = canvas.getContext('2d');
+                ctx.scale(dpr, dpr);
+
+                const dx = x2 - x1, dy = y2 - y1;
+                const dist = Math.hypot(dx, dy) || 1;
+                const nx = -dy / dist, ny = dx / dist;
+
+                // Elevated overhead parabolic arc
+                const arcLift = Math.max(90, dist * 0.32);
+                const arcLateral = Math.max(38, dist * 0.14);
+                const p0 = { x: x1, y: y1 };
+                const p1 = { x: x1 + dx * 0.32 + nx * arcLateral, y: y1 + dy * 0.32 + ny * arcLateral - arcLift };
+                const p2 = { x: x1 + dx * 0.68 + nx * (arcLateral * 0.5), y: y1 + dy * 0.68 + ny * (arcLateral * 0.5) - arcLift * 0.72 };
+                const p3 = { x: x2, y: y2 };
+
+                const trail = [], smoke = [], impactParticles = [];
+                const duration = 500;
+                const startTime = performance.now();
+                let impacted = false;
+
+                const bezier = (t) => {
+                    const u = 1 - t, tt = t * t, uu = u * u, uuu = uu * u, ttt = tt * t;
+                    return {
+                        x: uuu * p0.x + 3 * uu * t * p1.x + 3 * u * tt * p2.x + ttt * p3.x,
+                        y: uuu * p0.y + 3 * uu * t * p1.y + 3 * u * tt * p2.y + ttt * p3.y
+                    };
+                };
+
+                const loop = (now) => {
+                    const elapsed = now - startTime;
+                    const p = Math.min(1, elapsed / duration);
+                    ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+                    if (p < 1) {
+                        const pos = bezier(p);
+                        // Substantially larger shadow head and trail
+                        trail.push({ x: pos.x, y: pos.y, alpha: 1.0, size: 44 });
+
+                        if (Math.random() < 0.75) {
+                            smoke.push({
+                                x: pos.x + (Math.random() - 0.5) * 14,
+                                y: pos.y + (Math.random() - 0.5) * 14,
+                                vx: (Math.random() - 0.5) * 2.0,
+                                vy: (Math.random() - 0.5) * 2.0,
+                                size: 16 + Math.random() * 22,
+                                alpha: 0.82,
+                                decay: 0.03
+                            });
+                        }
+
+                        ctx.save();
+                        // Outer dark violet / abyssal aura
+                        const hGrad = ctx.createRadialGradient(pos.x, pos.y, 0, pos.x, pos.y, 42);
+                        hGrad.addColorStop(0, '#000000');
+                        hGrad.addColorStop(0.35, 'rgba(10, 4, 18, 0.98)');
+                        hGrad.addColorStop(0.65, 'rgba(67, 24, 120, 0.65)');
+                        hGrad.addColorStop(0.9, 'rgba(109, 40, 217, 0.25)');
+                        hGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+                        ctx.fillStyle = hGrad;
+                        ctx.beginPath();
+                        ctx.arc(pos.x, pos.y, 42, 0, Math.PI * 2);
+                        ctx.fill();
+
+                        // Solid pitch black core
+                        ctx.fillStyle = '#000000';
+                        ctx.beginPath();
+                        ctx.arc(pos.x, pos.y, 14, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.restore();
+
+                    } else if (!impacted) {
+                        impacted = true;
+
+                        for (let i = 0; i < 30; i++) {
+                            const ang = Math.random() * Math.PI * 2;
+                            const spd = 2.5 + Math.random() * 7.5;
+                            impactParticles.push({
+                                x: x2, y: y2,
+                                vx: Math.cos(ang) * spd,
+                                vy: Math.sin(ang) * spd,
+                                size: 3 + Math.random() * 5.5,
+                                alpha: 1.0,
+                                decay: 0.04,
+                                color: Math.random() > 0.4 ? '#000000' : '#4c1d95'
+                            });
+                        }
+
+                        if (window.LotrEngine && window.LotrEngine.window && window.LotrEngine.window.screenShake) {
+                            window.LotrEngine.window.screenShake(4, 150);
+                        }
+
+                        if (onImpact) onImpact();
+                    }
+
+                    for (let i = trail.length - 1; i >= 0; i--) {
+                        const tr = trail[i];
+                        tr.alpha -= 0.06;
+                        if (tr.alpha <= 0) { trail.splice(i, 1); continue; }
+                        ctx.save();
+                        const rad = tr.size * tr.alpha;
+                        const g = ctx.createRadialGradient(tr.x, tr.y, 0, tr.x, tr.y, rad);
+                        g.addColorStop(0, `rgba(8, 4, 16, ${tr.alpha * 0.9})`);
+                        g.addColorStop(0.6, `rgba(45, 10, 70, ${tr.alpha * 0.45})`);
+                        g.addColorStop(1, 'rgba(0, 0, 0, 0)');
+                        ctx.fillStyle = g;
+                        ctx.beginPath();
+                        ctx.arc(tr.x, tr.y, rad, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.restore();
+                    }
+
+                    for (let i = smoke.length - 1; i >= 0; i--) {
+                        const sm = smoke[i];
+                        sm.x += sm.vx; sm.y += sm.vy; sm.size += 0.4; sm.alpha -= sm.decay;
+                        if (sm.alpha <= 0) { smoke.splice(i, 1); continue; }
+                        ctx.save();
+                        ctx.globalAlpha = Math.max(0, sm.alpha);
+                        ctx.fillStyle = 'rgba(12, 8, 20, 0.45)';
+                        ctx.beginPath();
+                        ctx.arc(sm.x, sm.y, sm.size, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.restore();
+                    }
+
+                    for (let i = impactParticles.length - 1; i >= 0; i--) {
+                        const ip = impactParticles[i];
+                        ip.x += ip.vx; ip.y += ip.vy; ip.alpha -= ip.decay;
+                        if (ip.alpha <= 0) { impactParticles.splice(i, 1); continue; }
+                        ctx.save();
+                        ctx.globalAlpha = Math.max(0, ip.alpha);
+                        ctx.fillStyle = ip.color;
+                        ctx.beginPath();
+                        ctx.arc(ip.x, ip.y, ip.size, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.restore();
+                    }
+
+                    if (p < 1 || trail.length > 0 || smoke.length > 0 || impactParticles.length > 0) {
+                        requestAnimationFrame(loop);
+                    } else {
+                        canvas.remove();
+                    }
+                };
+                requestAnimationFrame(loop);
+            };
+            return [];
+        })(),
         {
            id: 'nibin_cavern_warg', name: 'Cavern Warg', type: 'enemy', sphere: 'encounter-enemy', portrait: '🐺', engagement: 33, threat: 2, attack: 3, defense: 2, hp: 3, trait: 'Creature · Warg', copies: 2,
             img: 'cards/dark_of_mirkwood/caves_of_nibin/cavern_warg.jpg',
@@ -3612,11 +14021,41 @@ window.LotrExpansions['dark_of_nibin'] = {
 
                 const setWargReturn = () => {
                     const isAlreadyInStaging = game && game.stagingArea && game.stagingArea.some(e => e._uid === enemy._uid) && (!game.engagedEnemies || !game.engagedEnemies.some(e => e._uid === enemy._uid));
-                    if (isAlreadyInStaging) return;
-                    if (!enemy._wargsLikeReturnToStaging) {
-                        enemy._wargsLikeReturnToStaging = true;
-                        engine.toast("Cavern Warg Shadow", "Character destroyed! Attacking enemy will return to staging area.", "danger");
-                    }
+                    if (isAlreadyInStaging || enemy._wargReturningActive) return;
+                    enemy._wargReturningActive = true;
+                    enemy._cavernWargShadowReturn = true;
+                    delete enemy._wargsLikeReturnToStaging;
+
+                    engine.toast("Cavern Warg Shadow", "Character destroyed! Attacking enemy returns to staging area.", "danger");
+
+                    setTimeout(() => {
+                        const animateFn = window.animateReturnToStaging || (engine && engine.window && engine.window.animateReturnToStaging);
+                        if (animateFn) {
+                            animateFn(enemy, () => {
+                                delete enemy._wargReturningActive;
+                                delete enemy._cavernWargShadowReturn;
+                                if (window.cardPositions) delete window.cardPositions[enemy._uid];
+                                delete enemy._engagedWithPlayerIdx;
+                                game.engagedEnemies = game.engagedEnemies.filter(e => e._uid !== enemy._uid);
+                                if (!game.stagingArea.some(e => e._uid === enemy._uid)) {
+                                    game.stagingArea.push(enemy);
+                                }
+                                enemy._activeAttacker = false;
+                                if (engine && engine.render) engine.render();
+                            });
+                        } else {
+                            delete enemy._wargReturningActive;
+                            delete enemy._cavernWargShadowReturn;
+                            if (window.cardPositions) delete window.cardPositions[enemy._uid];
+                            delete enemy._engagedWithPlayerIdx;
+                            game.engagedEnemies = game.engagedEnemies.filter(e => e._uid !== enemy._uid);
+                            if (!game.stagingArea.some(e => e._uid === enemy._uid)) {
+                                game.stagingArea.push(enemy);
+                            }
+                            enemy._activeAttacker = false;
+                            if (engine && engine.render) engine.render();
+                        }
+                    }, 100);
                 };
 
                 const origOnHero = window.onHeroLeftPlay;
@@ -3676,6 +14115,32 @@ window.LotrExpansions['dark_of_nibin'] = {
             id: 'nibin_goblin_tunnels', name: 'Goblin Tunnels', type: 'location', sphere: 'encounter-location', portrait: '🕳️', threat: 2, questPts: 7, trait: 'Underground · Dark', copies: 2,
             img: 'cards/dark_of_mirkwood/caves_of_nibin/goblin_tunnels.jpg',
             text: 'While Goblin Tunnels is in the staging area, it gains: "Forced: After a Goblin is revealed from the encounter deck, remove a progress token from the current quest card."\nShadow: Attacking enemy gets +1 Attack (+3 Attack instead if attacking enemy is a Goblin.)',
+            shadow: 'Shadow: Attacking enemy gets +1 attack (+3 attack instead if attacking enemy is a Goblin.)',
+            onShadow: function(shadow, enemy, defChars, game, engine, next) {
+                if (typeof window.resolveGoblinTunnelsShadow === 'function') {
+                    window.resolveGoblinTunnelsShadow(shadow, enemy, defChars, game, engine, next);
+                } else {
+                    const isGoblin = Boolean(enemy && (
+                        (enemy.trait || '').toLowerCase().includes('goblin') ||
+                        (enemy.name || '').toLowerCase().includes('goblin') ||
+                        (enemy.id || '').toLowerCase().includes('goblin')
+                    ));
+                    const buff = isGoblin ? 3 : 1;
+                    enemy._goblinTunnelsShadowApplied = true;
+                    enemy.attackBonus = (enemy.attackBonus || 0) + buff;
+                    if (typeof window.triggerForestSpiderPowerUp === 'function') {
+                        window.triggerForestSpiderPowerUp(enemy._uid, 'red');
+                    }
+                    if (typeof window.playForestSpiderPowerUpAudio === 'function') {
+                        window.playForestSpiderPowerUpAudio();
+                    }
+                    if (engine && engine.toast) {
+                        engine.toast('Shadow Effect', isGoblin ? 'Goblin Tunnels: Attacking Goblin enemy gets +3 ⚔' : 'Goblin Tunnels: Attacking enemy gets +1 ⚔', 'danger', 2800);
+                    }
+                    if (engine && engine.render) engine.render();
+                    setTimeout(() => { if (typeof next === 'function') next(); }, 400);
+                }
+            },
             getThreatMod: function(card, game, engine) {
                 let mod = 0;
                 if ((card.trait||'').includes('Dark') && game.stagingArea.some(c => c.id === 'nibin_branching_paths')) {
@@ -3720,46 +14185,69 @@ window.LotrExpansions['dark_of_nibin'] = {
                     }
                 });
                 if (torch && !torch.exhausted) {
-                    torch.exhausted = true;
-                    engine.toast("Lightless Passage", "Exhausted Cave Torch to travel.", "success");
-                    engine.render();
-                    const triggerForced = () => {
-                        if (game.encounterDeck.length === 0 && game.encounterDiscard.length > 0) {
-                            game.encounterDeck = engine.shuffle(game.encounterDiscard);
-                            game.encounterDiscard = [];
-                        }
-                        if (game.encounterDeck.length > 0) {
-                            const top = game.encounterDeck.pop();
-                            if (top.type === 'enemy') {
-                                engine.toast("Cave Torch", `Forced: Discarded ${top.name} — it is an enemy! Added to staging.`, "danger");
-                                if (engine.window && engine.window.animateDrawDirectToStaging) {
-                                    engine.window.animateDrawDirectToStaging(top, () => {
+                    const locEl = document.querySelector(`[data-uid="${loc._uid}"]`);
+                    const torchEl = document.querySelector(`.is-attachment[data-uid="${torch._uid}"]`) || document.querySelector(`[data-uid="${torch._uid}"]`);
+
+                    const finishTravel = () => {
+                        torch.exhausted = true;
+                        engine.toast("Lightless Passage", "Exhausted Cave Torch to travel.", "success");
+                        engine.render();
+                        const triggerForced = () => {
+                            if (game.encounterDeck.length === 0 && game.encounterDiscard.length > 0) {
+                                game.encounterDeck = engine.shuffle(game.encounterDiscard);
+                                game.encounterDiscard = [];
+                            }
+                            if (game.encounterDeck && game.encounterDeck.length > 0) {
+                                const top = game.encounterDeck.pop();
+                                if (top.type === 'enemy') {
+                                    engine.toast("Cave Torch", `Forced: Discarded ${top.name} — it is an enemy! Added to staging.`, "danger");
+                                    if (engine.window && engine.window.animateDrawDirectToStaging) {
+                                        engine.window.animateDrawDirectToStaging(top, () => {
+                                            game.stagingArea.push(top);
+                                            engine.render();
+                                        });
+                                    } else {
                                         game.stagingArea.push(top);
                                         engine.render();
-                                    });
+                                    }
                                 } else {
-                                    game.stagingArea.push(top);
+                                    engine.toast("Cave Torch", `Forced: Discarded ${top.name}.`, "info");
+                                    const deckEl = document.getElementById('encounter-deck-pile');
+                                    const startRect = deckEl ? deckEl.getBoundingClientRect() : null;
+                                    if (engine.window && engine.window.discardCard) {
+                                        engine.window.discardCard(top, game.encounterDiscard, false, startRect);
+                                    } else {
+                                        game.encounterDiscard.push(top);
+                                    }
                                     engine.render();
                                 }
-                            } else {
-                                engine.toast("Cave Torch", `Forced: Discarded ${top.name}.`, "info");
-                                const deckEl = document.getElementById('encounter-deck-pile');
-                                const startRect = deckEl ? deckEl.getBoundingClientRect() : null;
-                                if (engine.window && engine.window.discardCard) {
-                                    engine.window.discardCard(top, game.encounterDiscard, false, startRect);
-                                } else {
-                                    game.encounterDiscard.push(top);
-                                }
-                                engine.render();
                             }
+                        };
+                        if (engine.window && engine.window.checkEmptyEncounterDeck) {
+                            engine.window.checkEmptyEncounterDeck(triggerForced);
+                        } else {
+                            triggerForced();
                         }
+                        proceedTravel();
                     };
-                    if (engine.window && engine.window.checkEmptyEncounterDeck) {
-                        engine.window.checkEmptyEncounterDeck(triggerForced);
+
+                    if (locEl && torchEl && typeof window.triggerBlackShadowComet === 'function') {
+                        try {
+                            const snd = new Audio('./sound_effects/dark_of_mirkwood/lightless_passage_travel.mp3');
+                            const volSlider = document.getElementById('volume-slider');
+                            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                            snd.play().catch(() => {});
+                        } catch (e) {}
+
+                        window.triggerBlackShadowComet(locEl, torchEl, () => {
+                            torchEl.style.transition = 'transform 0.4s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                            torchEl.style.transformOrigin = 'center center';
+                            torchEl.style.transform = 'rotate(90deg)';
+                            setTimeout(finishTravel, 420);
+                        });
                     } else {
-                        triggerForced();
+                        finishTravel();
                     }
-                    proceedTravel();
                 } else {
                     engine.toast("Lightless Passage", "You must exhaust a ready Cave Torch to travel here.", "danger");
                 }
@@ -3767,6 +14255,9 @@ window.LotrExpansions['dark_of_nibin'] = {
             onShadow: function(shadow, enemy, defChars, game, engine, next) {
                 enemy._lightlessPassageActive = true;
                 engine.toast("Lightless Passage", "Combat damage against this enemy is cancelled for the phase!", "warning");
+                if (typeof window.activateLightlessShield === 'function') {
+                    window.activateLightlessShield(enemy);
+                }
                 const clearCheck = setInterval(() => {
                     if (game.phase === 'refresh' || game.gameOver || !game.engagedEnemies.includes(enemy)) {
                         delete enemy._lightlessPassageActive;
@@ -3780,6 +14271,12 @@ window.LotrExpansions['dark_of_nibin'] = {
             id: 'nibin_branching_paths', name: 'Branching Paths', type: 'location', sphere: 'encounter-location', portrait: '🔱', threat: 1, questPts: 3, trait: 'Underground · Dark', copies: 2,
             img: 'cards/dark_of_mirkwood/caves_of_nibin/branching_paths.jpg',
             text: 'While Branching Paths is in the staging area, each Dark location gets +1 Threat.\nForced: After Branching Paths leaves play as an explored location, look at the top 3 cards of the encounter deck. Players must choose 1 of those to reveal and add to the staging area, moving the other 2 to the bottom of the deck.',
+            onReveal: function(card, game, engine, cb) {
+                if (typeof window.playBranchingPathsAudio === 'function') {
+                    window.playBranchingPathsAudio(card);
+                }
+                if (cb) cb();
+            },
             getThreatMod: function(card, game, engine) {
                 let mod = 0;
                 if ((card.trait||'').includes('Dark') && game.stagingArea.some(c => c.id === 'nibin_branching_paths')) {
@@ -3805,124 +14302,132 @@ window.LotrExpansions['dark_of_nibin'] = {
                         done();
                     };
 
-                    engine.window.checkEmptyEncounterDeck(() => {
-                        if (game.encounterDeck.length === 0) {
-                            wrapUp();
-                            return;
-                        }
-                        const count = Math.min(3, game.encounterDeck.length);
-                        const topCards = [];
-                        for(let i=0; i<count; i++) topCards.push(game.encounterDeck.pop());
-                        
-                        const promptHTML = `<span style="font-size:1.6rem; font-weight:600; color:var(--gold-bright); display:block; margin-bottom:12px; line-height:1.35; text-align:center;">Branching Paths: Choose 1 card to reveal and add to staging:</span>`;
-                        
-                        engine.showCardPicker("Branching Paths", promptHTML, topCards, (chosen) => {
-                            if (!chosen) chosen = topCards[0];
-                            const others = topCards.filter(c => c._uid !== chosen._uid);
+                    const executeSearch = () => {
+                        engine.window.checkEmptyEncounterDeck(() => {
+                            if (game.encounterDeck.length === 0) {
+                                wrapUp();
+                                return;
+                            }
+                            const count = Math.min(3, game.encounterDeck.length);
+                            const topCards = [];
+                            for(let i=0; i<count; i++) topCards.push(game.encounterDeck.pop());
                             
-                            // Push chosen card onto top of deck so engine reveals and adds it to staging properly
-                            game.encounterDeck.push(chosen);
-                            engine.toast("Branching Paths", `Revealing ${chosen.name}!`, "danger");
+                            const promptHTML = `<span style="font-size:1.6rem; font-weight:600; color:var(--gold-bright); display:block; margin-bottom:12px; line-height:1.35; text-align:center;">Branching Paths: Choose 1 card to reveal and add to staging:</span>`;
                             
-                            engine.window.revealEncounterCard(() => {
-                                engine.render();
+                            engine.showCardPicker("Branching Paths", promptHTML, topCards, (chosen) => {
+                                if (!chosen) chosen = topCards[0];
+                                const others = topCards.filter(c => c._uid !== chosen._uid);
                                 
-                                if (others.length === 0) {
-                                    wrapUp();
-                                } else if (others.length === 1) {
-                                    game.encounterDeck.unshift(others[0]);
+                                // Push chosen card onto top of deck so engine reveals and adds it to staging properly
+                                game.encounterDeck.push(chosen);
+                                engine.toast("Branching Paths", `Revealing ${chosen.name}!`, "danger");
+                                
+                                engine.window.revealEncounterCard(() => {
                                     engine.render();
-                                    wrapUp();
-                                } else {
-                                    // Prompt player to select which remaining card goes to the very bottom first
-                                    const bottomPrompt = `<span style="font-size:1.6rem; font-weight:600; color:var(--gold-bright); display:block; margin-bottom:12px; line-height:1.35; text-align:center;">Branching Paths: Choose which card to place at the VERY BOTTOM of the encounter deck first:</span>`;
-                                    engine.showCardPicker("Branching Paths", bottomPrompt, others, (bottomCard) => {
-                                        if (!bottomCard) bottomCard = others[0];
-                                        const secondCard = others.find(c => c._uid !== bottomCard._uid) || others[1];
-                                        const startRect = engine.window._lastPickerRect;
+                                    
+                                    if (others.length === 0) {
+                                        wrapUp();
+                                    } else if (others.length === 1) {
+                                        game.encounterDeck.unshift(others[0]);
+                                        engine.render();
+                                        wrapUp();
+                                    } else {
+                                        // Prompt player to select which remaining card goes to the very bottom first
+                                        const bottomPrompt = `<span style="font-size:1.6rem; font-weight:600; color:var(--gold-bright); display:block; margin-bottom:12px; line-height:1.35; text-align:center;">Branching Paths: Choose which card to place at the VERY BOTTOM of the encounter deck first:</span>`;
+                                        engine.showCardPicker("Branching Paths", bottomPrompt, others, (bottomCard) => {
+                                            if (!bottomCard) bottomCard = others[0];
+                                            const secondCard = others.find(c => c._uid !== bottomCard._uid) || others[1];
+                                            const startRect = engine.window._lastPickerRect;
 
-                                        const animateCardToDeckBottom = (card, rect, onFinish) => {
-                                            const deckEl = document.getElementById('encounter-deck-pile');
-                                            if (!deckEl || !rect) {
-                                                onFinish();
-                                                return;
-                                            }
-                                            const deckRect = deckEl.getBoundingClientRect();
-                                            const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
-                                            const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
+                                            const animateCardToDeckBottom = (card, rect, onFinish) => {
+                                                const deckEl = document.getElementById('encounter-deck-pile');
+                                                if (!deckEl || !rect) {
+                                                    onFinish();
+                                                    return;
+                                                }
+                                                const deckRect = deckEl.getBoundingClientRect();
+                                                const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
+                                                const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
 
-                                            const ghostWrap = document.createElement('div');
-                                            ghostWrap.style.cssText = `
-                                                position: fixed; z-index: 2000;
-                                                width: ${cardW}px; height: ${cardH}px;
-                                                left: ${rect.left}px; top: ${rect.top}px;
-                                                perspective: 1000px;
-                                                transform: scale(${rect.width / cardW});
-                                                transform-origin: top left;
-                                                transition: all 0.55s cubic-bezier(0.25, 0.8, 0.25, 1);
-                                                pointer-events: none;
-                                            `;
+                                                const ghostWrap = document.createElement('div');
+                                                ghostWrap.style.cssText = `
+                                                    position: fixed; z-index: 2000;
+                                                    width: ${cardW}px; height: ${cardH}px;
+                                                    left: ${rect.left}px; top: ${rect.top}px;
+                                                    perspective: 1000px;
+                                                    transform: scale(${rect.width / cardW});
+                                                    transform-origin: top left;
+                                                    transition: all 0.55s cubic-bezier(0.25, 0.8, 0.25, 1);
+                                                    pointer-events: none;
+                                                `;
 
-                                            const ghostInner = document.createElement('div');
-                                            ghostInner.style.cssText = `
-                                                width: 100%; height: 100%; position: relative;
-                                                transform-style: preserve-3d;
-                                                transition: transform 0.55s cubic-bezier(0.25, 0.8, 0.25, 1);
-                                            `;
+                                                const ghostInner = document.createElement('div');
+                                                ghostInner.style.cssText = `
+                                                    width: 100%; height: 100%; position: relative;
+                                                    transform-style: preserve-3d;
+                                                    transition: transform 0.55s cubic-bezier(0.25, 0.8, 0.25, 1);
+                                                `;
 
-                                            const ghostFront = document.createElement('div');
-                                            ghostFront.style.cssText = `
-                                                position: absolute; inset: 0; backface-visibility: hidden;
-                                                border-radius: 6px; overflow: hidden;
-                                            `;
-                                            const cardImg = card.img || 'cards/dark_of_mirkwood/caves_of_nibin/cave_torch.jpg';
-                                            ghostFront.innerHTML = `<img src="${cardImg}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
+                                                const ghostFront = document.createElement('div');
+                                                ghostFront.style.cssText = `
+                                                    position: absolute; inset: 0; backface-visibility: hidden;
+                                                    border-radius: 6px; overflow: hidden;
+                                                `;
+                                                const cardImg = card.img || 'cards/dark_of_mirkwood/caves_of_nibin/cave_torch.jpg';
+                                                ghostFront.innerHTML = `<img src="${cardImg}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
 
-                                            const ghostBack = document.createElement('div');
-                                            ghostBack.style.cssText = `
-                                                position: absolute; inset: 0; backface-visibility: hidden;
-                                                transform: rotateY(180deg); border-radius: 6px; border: 2px solid #7a2020;
-                                                background: url('cards/ecb.png') no-repeat center center;
-                                                background-size: cover; box-shadow: 0 4px 10px rgba(0,0,0,0.6);
-                                            `;
+                                                const ghostBack = document.createElement('div');
+                                                ghostBack.style.cssText = `
+                                                    position: absolute; inset: 0; backface-visibility: hidden;
+                                                    transform: rotateY(180deg); border-radius: 6px; border: 2px solid #7a2020;
+                                                    background: url('cards/ecb.png') no-repeat center center;
+                                                    background-size: cover; box-shadow: 0 4px 10px rgba(0,0,0,0.6);
+                                                `;
 
-                                            ghostInner.appendChild(ghostFront);
-                                            ghostInner.appendChild(ghostBack);
-                                            ghostWrap.appendChild(ghostInner);
-                                            document.body.appendChild(ghostWrap);
+                                                ghostInner.appendChild(ghostFront);
+                                                ghostInner.appendChild(ghostBack);
+                                                ghostWrap.appendChild(ghostInner);
+                                                document.body.appendChild(ghostWrap);
 
-                                            void ghostWrap.offsetWidth;
+                                                void ghostWrap.offsetWidth;
 
-                                            ghostWrap.style.left = `${deckRect.left}px`;
-                                            ghostWrap.style.top = `${deckRect.top}px`;
-                                            ghostWrap.style.transform = `scale(${deckRect.width / cardW})`;
-                                            ghostInner.style.transform = 'rotateY(180deg)';
+                                                ghostWrap.style.left = `${deckRect.left}px`;
+                                                ghostWrap.style.top = `${deckRect.top}px`;
+                                                ghostWrap.style.transform = `scale(${deckRect.width / cardW})`;
+                                                ghostInner.style.transform = 'rotateY(180deg)';
 
-                                            if (window.SoundFX) window.SoundFX.playWhoosh();
+                                                if (window.SoundFX) window.SoundFX.playWhoosh();
 
-                                            setTimeout(() => {
-                                                ghostWrap.remove();
-                                                onFinish();
-                                            }, 550);
-                                        };
+                                                setTimeout(() => {
+                                                    ghostWrap.remove();
+                                                    onFinish();
+                                                }, 550);
+                                            };
 
-                                        // Animate bottomCard first (flips face-down to bottom of deck)
-                                        animateCardToDeckBottom(bottomCard, startRect, () => {
-                                            game.encounterDeck.unshift(bottomCard);
-                                            
-                                            // Animate secondCard next (flips face-down to bottom of deck, right above bottomCard)
-                                            animateCardToDeckBottom(secondCard, startRect, () => {
-                                                game.encounterDeck.unshift(secondCard);
-                                                engine.toast("Branching Paths", "Placed remaining 2 cards at the bottom of the deck.", "info");
-                                                engine.render();
-                                                wrapUp();
+                                            // Animate bottomCard first (flips face-down to bottom of deck)
+                                            animateCardToDeckBottom(bottomCard, startRect, () => {
+                                                game.encounterDeck.unshift(bottomCard);
+                                                
+                                                // Animate secondCard next (flips face-down to bottom of deck, right above bottomCard)
+                                                animateCardToDeckBottom(secondCard, startRect, () => {
+                                                    game.encounterDeck.unshift(secondCard);
+                                                    engine.toast("Branching Paths", "Placed remaining 2 cards at the bottom of the deck.", "info");
+                                                    engine.render();
+                                                    wrapUp();
+                                                });
                                             });
-                                        });
-                                    }, true);
-                                }
-                            });
-                        }, true);
-                    });
+                                        }, true);
+                                    }
+                                });
+                            }, true);
+                        });
+                    };
+
+                    if (typeof window.playBranchingPathsModalEffect === 'function') {
+                        window.playBranchingPathsModalEffect(executeSearch);
+                    } else {
+                        executeSearch();
+                    }
                 });
             }
         },
@@ -3955,55 +14460,15 @@ window.LotrExpansions['dark_of_nibin'] = {
                                 const diff = val - prev;
                                 if (diff > 0) {
                                     const pIdx = enemy._engagedWithPlayerIdx !== undefined ? enemy._engagedWithPlayerIdx : game.activeTabPlayerIdx;
-                                    game.threats[pIdx] += diff;
-                                    if (game.numPlayers === 1) game.threat += diff;
                                     engine.toast("Shadow Effect", `Collapsed Mine raises threat by ${diff}!`, "danger");
 
-                                    // Full-screen brief red overlay vignette
-                                    const overlay = document.createElement('div');
-                                    overlay.style.cssText = 'position:fixed; inset:0; z-index:99999; display:flex; flex-direction:column; align-items:center; justify-content:center; background:rgba(200,0,0,0.45); pointer-events:none; transition: background 0.3s ease-out;';
-                                    
-                                    // Giant floating center-screen feedback text
-                                    const bigText = document.createElement('div');
-                                    bigText.style.cssText = "font-family:'Cinzel Decorative', serif; font-size:4.5rem; font-weight:900; color:#ff3030; text-shadow:0 0 35px #ff0000, 0 4px 15px #000; transform:scale(0.5); opacity:0; transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);";
-                                    bigText.textContent = `+${diff} Threat!`;
-                                    overlay.appendChild(bigText);
-                                    document.body.appendChild(overlay);
-
-                                    if (engine.window && engine.window.screenShake) {
-                                        engine.window.screenShake(18, 500);
+                                    if (typeof window.triggerCollapsedMineThreatBoulders === 'function') {
+                                        window.triggerCollapsedMineThreatBoulders(diff, enemy, pIdx);
+                                    } else {
+                                        game.threats[pIdx] += diff;
+                                        if (game.numPlayers === 1) game.threat += diff;
+                                        engine.render();
                                     }
-                                    const hudThreat = document.getElementById('hud-threat');
-                                    if (hudThreat && engine.window && engine.window.spawnBurstAtElement) {
-                                        engine.window.spawnBurstAtElement(hudThreat, '#c0392b', 15);
-                                    }
-
-                                    setTimeout(() => {
-                                        bigText.style.transform = 'scale(1)';
-                                        bigText.style.opacity = '1';
-                                    }, 50);
-
-                                    setTimeout(() => {
-                                        overlay.style.background = 'rgba(200,0,0,0)';
-                                        bigText.style.transform = 'scale(1.2) translateY(-100px)';
-                                        bigText.style.opacity = '0';
-                                        setTimeout(() => overlay.remove(), 400);
-
-                                        // Update top HUD element (+# text below Threat Dial)
-                                        const diffEl = document.getElementById('hud-threat-diff');
-                                        if (diffEl) {
-                                            diffEl.textContent = `+${diff}`;
-                                            diffEl.classList.remove('threat-diff-active');
-                                            void diffEl.offsetWidth; // Trigger DOM reflow to restart CSS keyframe animation
-                                            diffEl.classList.add('threat-diff-active');
-                                            setTimeout(() => {
-                                                diffEl.classList.remove('threat-diff-active');
-                                                diffEl.textContent = '';
-                                            }, 3500);
-                                        }
-                                    }, 1500);
-
-                                    engine.render();
                                 }
                             },
                             configurable: true,
@@ -4032,32 +14497,87 @@ window.LotrExpansions['dark_of_nibin'] = {
             img: 'cards/dark_of_mirkwood/caves_of_nibin/goblin_dungeon.jpg',
             text: 'Travel: Reveal the top card of the encounter deck to travel here.\nResponse: After Goblin Dungeon leaves play as an explored location, the first player searches the top 5 cards of his deck for an ally and puts it into play under his control. Shuffle the rest of the searched cards back into his deck.',
             onTravel: function(loc, game, engine, proceedTravel) {
-                engine.toast("Goblin Dungeon", "Revealing top card of encounter deck...", "warning");
-                engine.window.revealEncounterCard(proceedTravel);
+                engine.toast("Goblin Dungeon", "Opening dungeon gates...", "warning");
+
+                const doTravelSequence = () => {
+                    let travelDone = false;
+                    const triggerMoveToActiveLocation = () => {
+                        if (travelDone) return;
+                        travelDone = true;
+                        window._triggerDungeonTravelEarly = null;
+
+                        try {
+                            const snd = new Audio('./sound_effects/enemy_move.mp3');
+                            const volSlider = document.getElementById('volume-slider');
+                            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                            snd.play().catch(() => {});
+                        } catch (e) {}
+
+                        proceedTravel();
+                    };
+
+                    window._triggerDungeonTravelEarly = triggerMoveToActiveLocation;
+
+                    // Watch for the revealed encounter card beginning its departure flight from center screen
+                    const checkDeparture = setInterval(() => {
+                        if (travelDone) {
+                            clearInterval(checkDeparture);
+                            return;
+                        }
+                        const ghost = document.getElementById('encounter-reveal-ghost') || document.getElementById('encounter-limbo-ghost');
+                        if (ghost) {
+                            const leftVal = ghost.style.left || '';
+                            if (leftVal && !leftVal.includes('50vw') && !leftVal.includes('calc')) {
+                                clearInterval(checkDeparture);
+                                triggerMoveToActiveLocation();
+                            }
+                        }
+                    }, 25);
+
+                    engine.window.revealEncounterCard(() => {
+                        clearInterval(checkDeparture);
+                        triggerMoveToActiveLocation();
+                    });
+                };
+
+                if (typeof window.triggerGoblinDungeonChainComet === 'function') {
+                    window.triggerGoblinDungeonChainComet(loc, () => {
+                        if (typeof window.playGoblinDungeonGateAnimation === 'function') {
+                            window.playGoblinDungeonGateAnimation(doTravelSequence);
+                        } else {
+                            doTravelSequence();
+                        }
+                    });
+                } else if (typeof window.playGoblinDungeonGateAnimation === 'function') {
+                    window.playGoblinDungeonGateAnimation(doTravelSequence);
+                } else {
+                    doTravelSequence();
+                }
             },
             onExplored: function(loc, game, engine) {
                 game._dungeonResolving = true;
                 window.queueNibinExplored(loc, game, engine, (done) => {
-                    const wrapUp = () => {
-                        game._dungeonResolving = false;
-                        if (game._pendingDungeonProgress > 0) {
-                            const p = game._pendingDungeonProgress;
-                            game._pendingDungeonProgress = 0;
-                            if (engine.addProgressToQuest) {
-                                engine.addProgressToQuest(p);
-                            } else {
-                                game.questProgress += p;
+                    const doSearch = () => {
+                        const wrapUp = () => {
+                            game._dungeonResolving = false;
+                            if (game._pendingDungeonProgress > 0) {
+                                const p = game._pendingDungeonProgress;
+                                game._pendingDungeonProgress = 0;
+                                if (engine.addProgressToQuest) {
+                                    engine.addProgressToQuest(p);
+                                } else {
+                                    game.questProgress += p;
+                                }
                             }
-                        }
-                        if (engine.render) engine.render();
-                        done();
-                    };
+                            if (engine.render) engine.render();
+                            done();
+                        };
 
-                    const p1Idx = game.firstPlayerIdx || 0;
-                    if (game.activeTabPlayerIdx !== p1Idx && engine.window && engine.window._switchTab) {
-                        engine.window._switchTab(p1Idx);
-                    }
-                    const deck = (game.playerDecks && game.playerDecks[p1Idx]) ? game.playerDecks[p1Idx] : game.playerDeck;
+                        const p1Idx = game.firstPlayerIdx || 0;
+                        if (game.activeTabPlayerIdx !== p1Idx && engine.window && engine.window._switchTab) {
+                            engine.window._switchTab(p1Idx);
+                        }
+                        const deck = (game.playerDecks && game.playerDecks[p1Idx]) ? game.playerDecks[p1Idx] : game.playerDeck;
                     if (!deck || deck.length === 0) {
                         wrapUp();
                         return;
@@ -4087,8 +14607,43 @@ window.LotrExpansions['dark_of_nibin'] = {
                     };
 
                     if (allies.length > 0) {
+                        if (!document.getElementById('gd-modal-style')) {
+                            const st = document.createElement('style');
+                            st.id = 'gd-modal-style';
+                            st.textContent = `
+                                @keyframes dungeonModalEmerge {
+                                    0% { transform: scale(0.4) rotateX(-25deg) translateY(-80px); opacity: 0; box-shadow: 0 0 100px #c89cff, inset 0 0 60px #e0b0ff; }
+                                    50% { transform: scale(1.05) rotateX(5deg) translateY(10px); opacity: 1; box-shadow: 0 0 60px #c89cff; }
+                                    100% { transform: scale(max(0.8, var(--res-scale, 1))) rotateX(0deg) translateY(0); opacity: 1; box-shadow: 0 0 40px rgba(212,175,55,0.4),0 12px 40px rgba(0,0,0,0.9); }
+                                }
+                            `;
+                            document.head.appendChild(st);
+                        }
+
+                        const mContent = document.getElementById('modal-content');
+                        if (mContent) {
+                            mContent.style.animation = 'dungeonModalEmerge 0.8s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards';
+                            setTimeout(() => {
+                                if (mContent) mContent.style.animation = '';
+                            }, 850);
+                        }
+
+                        try {
+                            const snd = new Audio('./sound_effects/enemy_move.mp3');
+                            const volSlider = document.getElementById('volume-slider');
+                            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                            snd.play().catch(() => {});
+                        } catch (e) {}
+
                         engine.showCardPicker("Goblin Dungeon", '<span style="font-size:1.6rem; font-weight:600; color:var(--gold-bright); display:block; margin-bottom:12px; line-height:1.35; text-align:center;">Choose 1 ally to put into play:</span>', allies, (chosen) => {
                             if (chosen) {
+                                try {
+                                    const cpSnd = new Audio('./sound_effects/card_play.wav');
+                                    const vol = document.getElementById('volume-slider');
+                                    cpSnd.volume = vol ? parseFloat(vol.value) : 0.25;
+                                    cpSnd.play().catch(() => {});
+                                } catch (e) {}
+
                                 const idx = deck.findIndex(c => c._uid === chosen._uid);
                                 if (idx >= 0) deck.splice(idx, 1);
                                 chosen._ownerIdx = p1Idx;
@@ -4131,6 +14686,14 @@ window.LotrExpansions['dark_of_nibin'] = {
                         performShuffle();
                         wrapUp();
                     }
+                    };
+
+                    if (typeof window.playGoblinDungeonBreakout === 'function') {
+                        engine.toast("Goblin Dungeon", "The dungeon chains shatter! Prisoners are freed!", "success");
+                        window.playGoblinDungeonBreakout(loc, engine, doSearch);
+                    } else {
+                        doSearch();
+                    }
                 });
             }
         },
@@ -4138,9 +14701,31 @@ window.LotrExpansions['dark_of_nibin'] = {
             id: 'nibin_crumbling_stairs', name: 'Crumbling Stairs', type: 'location', sphere: 'encounter-location', portrait: '🧱', threat: 3, questPts: 3, trait: 'Underground', copies: 1,
             img: 'cards/dark_of_mirkwood/caves_of_nibin/crumbling_stairs.jpg',
             text: 'While Crumbling Stairs is in the staging area, progress cannot be placed on it.\nForced: When Crumbling Stairs leaves play as an explored location, discard the top card of the encounter deck. If the discarded card is a location, put it into play as the active location.',
+            onReveal: function(loc, game, engine, cb) {
+                if (typeof window.playCrumblingStairsAudio === 'function') {
+                    window.playCrumblingStairsAudio(loc);
+                }
+                if (typeof window.updateCrumblingStairsAura === 'function') {
+                    setTimeout(window.updateCrumblingStairsAura, 50);
+                }
+                if (cb) cb();
+            },
             onExplored: function(loc, game, engine) {
                 window.queueNibinExplored(loc, game, engine, (done) => {
-                    if (game.encounterDeck.length > 0) {
+                    const playCardMoveSound = () => {
+                        try {
+                            const snd = new Audio('./sound_effects/enemy_move.mp3');
+                            const volSlider = document.getElementById('volume-slider');
+                            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                            snd.play().catch(() => {});
+                        } catch (e) {}
+                    };
+
+                    const handleDiscardEncounterCard = () => {
+                        if (game.encounterDeck.length === 0) {
+                            done();
+                            return;
+                        }
                         const top = game.encounterDeck.pop();
                         
                         const deckEl = document.getElementById('encounter-deck-pile');
@@ -4193,13 +14778,11 @@ window.LotrExpansions['dark_of_nibin'] = {
 
                             requestAnimationFrame(() => {
                                 requestAnimationFrame(() => {
-                                    ghost.style.transition = 'all 0.65s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                                    ghost.style.transition = 'all 0.8s cubic-bezier(0.22, 1, 0.36, 1)';
                                     ghost.style.left = `${destRect.left}px`;
                                     ghost.style.top = `${destRect.top}px`;
                                     ghost.style.transform = `scale(${destRect.width / cardW})`;
-                                    if (window.SoundFX && window.SoundFX.playWhoosh) {
-                                        window.SoundFX.playWhoosh();
-                                    }
+                                    playCardMoveSound();
                                 });
                             });
 
@@ -4214,7 +14797,7 @@ window.LotrExpansions['dark_of_nibin'] = {
                                 }
                                 engine.render();
                                 done();
-                            }, 650);
+                            }, 820);
                         } else {
                             if (top.type === 'location') {
                                 game.activeLocation = top;
@@ -4226,8 +14809,20 @@ window.LotrExpansions['dark_of_nibin'] = {
                             engine.render();
                             done();
                         }
+                    };
+
+                    const triggerExploredSequence = () => {
+                        if (typeof window.playCrumblingStairsDeckAnimation === 'function') {
+                            window.playCrumblingStairsDeckAnimation(handleDiscardEncounterCard);
+                        } else {
+                            handleDiscardEncounterCard();
+                        }
+                    };
+
+                    if (game.encounterDeck.length === 0 && typeof window.checkEmptyEncounterDeck === 'function') {
+                        window.checkEmptyEncounterDeck(triggerExploredSequence);
                     } else {
-                        done();
+                        triggerExploredSequence();
                     }
                 });
             }
@@ -4239,22 +14834,101 @@ window.LotrExpansions['dark_of_nibin'] = {
             onReveal: function(card, game, engine, cb) {
                 let pIdx = 0;
                 const destroyedAlliesQueue = [];
+
+                const playCardMoveSound = () => {
+                    try {
+                        const snd = new Audio('./sound_effects/enemy_move.mp3');
+                        const volSlider = document.getElementById('volume-slider');
+                        snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                        snd.play().catch(() => {});
+                    } catch(e) {}
+                };
+
+                const hasMorePlayersToChoose = (currentPIdx) => {
+                    for (let i = currentPIdx + 1; i < game.numPlayers; i++) {
+                        if (game.eliminated && game.eliminated[i]) continue;
+                        const pDeck = (game.playerDecks && game.playerDecks[i]) ? game.playerDecks[i] : game.playerDeck;
+                        const readyChars = [...game.heroes, ...game.allies].filter(c => (c._ownerIdx === undefined || c._ownerIdx === i) && !c.exhausted);
+                        if (readyChars.length > 0 && pDeck && pDeck.length > 0) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
+                const discardCrumblingEncounterCard = (onComplete) => {
+                    if (card._alreadyResolved) {
+                        if (onComplete) onComplete();
+                        return;
+                    }
+                    card._alreadyResolved = true;
+                    const eGhost = window._activeEncounterGhost || document.getElementById('encounter-limbo-ghost');
+                    const eDiscardEl = document.getElementById('encounter-discard-pile');
+                    if (eGhost && eDiscardEl) {
+                        playCardMoveSound();
+                        const eDiscRect = eDiscardEl.getBoundingClientRect();
+                        const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
+                        eGhost.style.transition = 'all 0.75s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                        eGhost.style.transformOrigin = 'top left';
+                        eGhost.style.left = `${eDiscRect.left}px`;
+                        eGhost.style.top = `${eDiscRect.top}px`;
+                        eGhost.style.transform = `scale(${eDiscRect.width / cardW}) rotate(0deg)`;
+                        eGhost.style.opacity = '0.3';
+
+                        if (engine.window) engine.window._activeEncounterGhost = null;
+                        window._activeEncounterGhost = null;
+                        setTimeout(() => {
+                            try { eGhost.remove(); } catch(e) {}
+                            if (!game.encounterDiscard.includes(card)) {
+                                game.encounterDiscard.push(card);
+                            }
+                            if (onComplete) {
+                                if (engine.render) engine.render();
+                                onComplete();
+                            } else {
+                                const edCount = document.getElementById('encounter-discard-count');
+                                if (edCount) edCount.textContent = game.encounterDiscard.length;
+                            }
+                        }, 750);
+                    } else {
+                        if (eGhost) {
+                            try { eGhost.remove(); } catch(e) {}
+                            if (engine.window) engine.window._activeEncounterGhost = null;
+                            window._activeEncounterGhost = null;
+                        }
+                        if (!game.encounterDiscard.includes(card)) {
+                            game.encounterDiscard.push(card);
+                        }
+                        if (onComplete) {
+                            if (engine.render) engine.render();
+                            onComplete();
+                        }
+                    }
+                };
+
                 const processNext = () => {
                     while (pIdx < game.numPlayers && game.eliminated[pIdx]) pIdx++;
                     if (pIdx >= game.numPlayers) {
-                        const resolveDeferredVS = () => {
-                            if (destroyedAlliesQueue.length > 0) {
-                                if (engine.window && engine.window.onAllyLeftPlay) {
-                                    engine.window.onAllyLeftPlay(destroyedAlliesQueue, () => {
-                                        destroyedAlliesQueue.length = 0;
-                                        cb();
-                                    });
-                                } else cb();
-                            } else {
-                                cb();
-                            }
+                        const finalizeAll = () => {
+                            const resolveDeferredVS = () => {
+                                if (destroyedAlliesQueue.length > 0) {
+                                    if (engine.window && engine.window.onAllyLeftPlay) {
+                                        engine.window.onAllyLeftPlay(destroyedAlliesQueue, () => {
+                                            destroyedAlliesQueue.length = 0;
+                                            cb();
+                                        });
+                                    } else cb();
+                                } else {
+                                    cb();
+                                }
+                            };
+                            resolveDeferredVS();
                         };
-                        resolveDeferredVS();
+                        if (!card._alreadyResolved) {
+                            discardCrumblingEncounterCard(finalizeAll);
+                        } else {
+                            finalizeAll();
+                        }
                         return;
                     }
                     const deck = (game.playerDecks && game.playerDecks[pIdx]) ? game.playerDecks[pIdx] : game.playerDeck;
@@ -4274,6 +14948,7 @@ window.LotrExpansions['dark_of_nibin'] = {
                                 const charRect = charEl ? charEl.getBoundingClientRect() : { left: window.innerWidth / 2 - 160, top: window.innerHeight / 2 - 100, width: 144, height: 202 };
                                 const deckRect = deckEl ? deckEl.getBoundingClientRect() : { left: window.innerWidth - 120, top: window.innerHeight - 150, width: 100, height: 140 };
 
+                                chosen._isAnimatingTravel = true;
                                 if (charEl) charEl.style.opacity = '0';
 
                                 const discarded = deck.pop();
@@ -4323,7 +14998,7 @@ window.LotrExpansions['dark_of_nibin'] = {
                                 void gChar.offsetWidth;
                                 void gCard.offsetWidth;
 
-                                if (window.SoundFX) window.SoundFX.playWhoosh();
+                                playCardMoveSound();
 
                                 // Step 1: Slide both cards to center screen
                                 gChar.style.left = `${targetCharX}px`;
@@ -4377,13 +15052,55 @@ window.LotrExpansions['dark_of_nibin'] = {
                                                 banner.style.transform = 'translate(-50%, -50%) scale(1)';
                                             });
 
+                                            // Play FX Forge visual and sound effect from destroyed.txt or success.txt
+                                            try {
+                                                const fxCanvas = document.createElement('canvas');
+                                                fxCanvas.style.cssText = `
+                                                    position: fixed; top: 0; left: 0;
+                                                    width: 100vw; height: 100vh;
+                                                    pointer-events: none; z-index: 99999;
+                                                `;
+                                                const dpr = window.devicePixelRatio || 1;
+                                                fxCanvas.width = window.innerWidth * dpr;
+                                                fxCanvas.height = window.innerHeight * dpr;
+                                                document.body.appendChild(fxCanvas);
+
+                                                const cardCenterX = targetCharX + (cardW / 2);
+                                                const cardCenterY = targetY + (cardH / 2);
+                                                const destroyedFxX = cardCenterX;
+                                                const destroyedFxY = cardCenterY;
+                                                // Success visual effect in the exact same spot as the destroyed effect
+                                                const successFxX = cardCenterX;
+                                                const successFxY = cardCenterY;
+
+                                                if (isDestroyed) {
+                                                    const fx = (typeof createCrumblingDestroyedEffect === 'function')
+                                                        ? createCrumblingDestroyedEffect(fxCanvas)
+                                                        : (window.createCrumblingDestroyedEffect ? window.createCrumblingDestroyedEffect(fxCanvas) : null);
+                                                    if (fx) fx.fire(destroyedFxX, destroyedFxY);
+                                                } else {
+                                                    const fx = (typeof createCrumblingSuccessEffect === 'function')
+                                                        ? createCrumblingSuccessEffect(fxCanvas)
+                                                        : (window.createCrumblingSuccessEffect ? window.createCrumblingSuccessEffect(fxCanvas) : null);
+                                                    if (fx) fx.fire(successFxX, successFxY);
+                                                }
+
+                                                setTimeout(() => {
+                                                    try { fxCanvas.remove(); } catch(e) {}
+                                                }, 3500);
+                                            } catch (fxErr) {
+                                                console.error('Error firing Crumbling Ruin outcome FX:', fxErr);
+                                            }
+
+                                            // Go to the next card sooner instead of waiting for the entire visual effect duration
                                             setTimeout(() => {
+                                                banner.style.transition = 'all 0.25s ease-out';
                                                 banner.style.opacity = '0';
-                                                banner.style.transform = 'translate(-50%, -80%) scale(1.3)';
-                                                setTimeout(() => banner.remove(), 400);
+                                                banner.style.transform = 'translate(-50%, -80%) scale(1.2)';
+                                                setTimeout(() => { try { banner.remove(); } catch(e) {} }, 250);
 
                                                 // Step 4: Resolve card movements to final destinations
-                                                gCard.style.transition = 'all 0.6s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                                                gCard.style.transition = 'all 0.75s cubic-bezier(0.25, 0.8, 0.25, 1)';
                                                 let discRect = pDiscardEl ? pDiscardEl.getBoundingClientRect() : null;
                                                 if (!discRect || (discRect.left === 0 && discRect.top === 0)) {
                                                     discRect = { left: window.innerWidth - 120, top: window.innerHeight - 150, width: 100, height: 140 };
@@ -4392,113 +15109,103 @@ window.LotrExpansions['dark_of_nibin'] = {
                                                 gCard.style.top = `${discRect.top + (discRect.height - cardH) / 2}px`;
                                                 gCard.style.transform = `scale(${discRect.width / cardW})`;
                                                 gCard.style.opacity = '0.3';
+                                                playCardMoveSound();
 
-                                                // Move Crumbling Ruin treachery card to encounter discard pile simultaneously
-                                                const eGhost = window._activeEncounterGhost || document.getElementById('encounter-limbo-ghost');
-                                                const eDiscardEl = document.getElementById('encounter-discard-pile');
-                                                if (eGhost && eDiscardEl) {
-                                                    const eDiscRect = eDiscardEl.getBoundingClientRect();
-                                                    eGhost.style.transition = 'all 0.6s cubic-bezier(0.25, 0.8, 0.25, 1)';
-                                                    eGhost.style.transformOrigin = 'top left';
-                                                    eGhost.style.left = `${eDiscRect.left}px`;
-                                                    eGhost.style.top = `${eDiscRect.top}px`;
-                                                    eGhost.style.transform = `scale(${eDiscRect.width / cardW}) rotate(0deg)`;
-                                                    eGhost.style.opacity = '0.3';
-
-                                                    card._alreadyResolved = true;
-                                                    window._activeEncounterGhost = null;
-                                                    setTimeout(() => {
-                                                        eGhost.remove();
-                                                        if (!game.encounterDiscard.includes(card)) {
-                                                            game.encounterDiscard.push(card);
-                                                        }
-                                                    }, 600);
+                                                // In multiplayer, crumbling ruin should not move to the encounter discard pile until all player cards have been chosen
+                                                const morePlayers = hasMorePlayersToChoose(pIdx);
+                                                if (!morePlayers) {
+                                                    discardCrumblingEncounterCard();
                                                 }
 
-                                                gChar.style.transition = 'all 0.6s cubic-bezier(0.25, 0.8, 0.25, 1)';
                                                 if (isDestroyed) {
-                                                    let targetDiscardEl = pDiscardEl;
-                                                    if (chosen.isHero) {
-                                                        const hDisc = document.getElementById('hero-discard-pile');
-                                                        const hDiscCount = document.getElementById('hero-discard-count');
-                                                        const hDiscLabel = document.getElementById('hero-discard-label');
-                                                        if (hDisc) {
-                                                            hDisc.style.display = 'block';
-                                                            if (hDiscCount) hDiscCount.style.display = 'block';
-                                                            if (hDiscLabel) hDiscLabel.style.display = 'block';
-                                                            targetDiscardEl = hDisc;
+                                                    // Destroyed chosen character card smoothly moves to discard pile shortly after the discarded deck card
+                                                    setTimeout(() => {
+                                                        playCardMoveSound();
+                                                        let targetDiscardEl = pDiscardEl;
+                                                        if (chosen.isHero) {
+                                                            const hDisc = document.getElementById('hero-discard-pile');
+                                                            const hDiscCount = document.getElementById('hero-discard-count');
+                                                            const hDiscLabel = document.getElementById('hero-discard-label');
+                                                            if (hDisc) {
+                                                                hDisc.style.display = 'block';
+                                                                if (hDiscCount) hDiscCount.style.display = 'block';
+                                                                if (hDiscLabel) hDiscLabel.style.display = 'block';
+                                                                targetDiscardEl = hDisc;
+                                                            }
                                                         }
-                                                    }
-                                                    let destHeroRect = targetDiscardEl ? targetDiscardEl.getBoundingClientRect() : null;
-                                                    if (!destHeroRect || (destHeroRect.left === 0 && destHeroRect.top === 0)) {
-                                                        destHeroRect = discRect;
-                                                    }
-                                                    gChar.style.left = `${destHeroRect.left + (destHeroRect.width - cardW) / 2}px`;
-                                                    gChar.style.top = `${destHeroRect.top + (destHeroRect.height - cardH) / 2}px`;
-                                                    gChar.style.transform = `scale(${destHeroRect.width / cardW})`;
-                                                    gChar.style.opacity = '0.3';
-
-                                                    if (chosen.attached) {
-                                                        const torchIdx = chosen.attached.findIndex(a => a.id === 'nibin_cave_torch');
-                                                        if (torchIdx >= 0) {
-                                                            const torch = chosen.attached.splice(torchIdx, 1)[0];
-                                                            delete torch._attachedToUid;
-
-                                                            const torchEl = document.querySelector(`.is-attachment[data-uid="${torch._uid}"]`) || document.querySelector(`[data-uid="${torch._uid}"]`);
-                                                            let startTorchRect = torchEl ? torchEl.getBoundingClientRect() : null;
-                                                            if (!startTorchRect || startTorchRect.width === 0) startTorchRect = charRect;
-
-                                                            const centerRect = { left: window.innerWidth / 2 - 72, top: window.innerHeight / 2 - 101, width: 144, height: 202 };
-
-                                                            const gTorch = document.createElement('div');
-                                                            gTorch.style.cssText = `
-                                                                position: fixed; z-index: 2502;
-                                                                width: ${cardW}px; height: ${cardH}px;
-                                                                left: ${startTorchRect.left + (startTorchRect.width - cardW) / 2}px;
-                                                                top: ${startTorchRect.top + (startTorchRect.height - cardH) / 2}px;
-                                                                transform: scale(${startTorchRect.width / cardW});
-                                                                transform-origin: center;
-                                                                transition: all 0.5s cubic-bezier(0.25, 0.8, 0.25, 1);
-                                                                pointer-events: none;
-                                                                box-shadow: 0 10px 25px rgba(0,0,0,0.8);
-                                                                border-radius: 6px; overflow: hidden;
-                                                            `;
-                                                            const torchImgUrl = torch.img || 'cards/dark_of_mirkwood/caves_of_nibin/cave_torch.jpg';
-                                                            gTorch.innerHTML = `<img src="${torchImgUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
-                                                            gTorch.className = 'card encounter-objective';
-                                                            document.body.appendChild(gTorch);
-
-                                                            void gTorch.offsetWidth;
-
-                                                            gTorch.style.left = `${centerRect.left}px`;
-                                                            gTorch.style.top = `${centerRect.top}px`;
-                                                            gTorch.style.transform = `scale(1)`;
-
-                                                            if (engine && engine.toast) engine.toast('Removed from Game', 'Cave Torch is removed from the game!', 'danger', 4000);
-
-                                                            setTimeout(() => {
-                                                                gTorch.remove();
-                                                                if (window._triggerCaveTorchBurn) {
-                                                                    window._triggerCaveTorchBurn(torch, centerRect, () => {
-                                                                        if (engine && engine.render) engine.render();
-                                                                    });
-                                                                }
-                                                            }, 500);
+                                                        let destHeroRect = targetDiscardEl ? targetDiscardEl.getBoundingClientRect() : null;
+                                                        if (!destHeroRect || (destHeroRect.left === 0 && destHeroRect.top === 0)) {
+                                                            destHeroRect = discRect;
                                                         }
-                                                    }
+                                                        gChar.style.transition = 'all 0.75s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                                                        gChar.style.left = `${destHeroRect.left + (destHeroRect.width - cardW) / 2}px`;
+                                                        gChar.style.top = `${destHeroRect.top + (destHeroRect.height - cardH) / 2}px`;
+                                                        gChar.style.transform = `scale(${destHeroRect.width / cardW})`;
+                                                        gChar.style.opacity = '0.3';
+
+                                                        if (chosen.attached) {
+                                                            const torchIdx = chosen.attached.findIndex(a => a.id === 'nibin_cave_torch');
+                                                            if (torchIdx >= 0) {
+                                                                const torch = chosen.attached.splice(torchIdx, 1)[0];
+                                                                delete torch._attachedToUid;
+
+                                                                const torchEl = document.querySelector(`.is-attachment[data-uid="${torch._uid}"]`) || document.querySelector(`[data-uid="${torch._uid}"]`);
+                                                                let startTorchRect = torchEl ? torchEl.getBoundingClientRect() : null;
+                                                                if (!startTorchRect || startTorchRect.width === 0) startTorchRect = charRect;
+
+                                                                const centerRect = { left: window.innerWidth / 2 - 72, top: window.innerHeight / 2 - 101, width: 144, height: 202 };
+
+                                                                const gTorch = document.createElement('div');
+                                                                gTorch.style.cssText = `
+                                                                    position: fixed; z-index: 2502;
+                                                                    width: ${cardW}px; height: ${cardH}px;
+                                                                    left: ${startTorchRect.left + (startTorchRect.width - cardW) / 2}px;
+                                                                    top: ${startTorchRect.top + (startTorchRect.height - cardH) / 2}px;
+                                                                    transform: scale(${startTorchRect.width / cardW});
+                                                                    transform-origin: center;
+                                                                    transition: all 0.75s cubic-bezier(0.25, 0.8, 0.25, 1);
+                                                                    pointer-events: none;
+                                                                    box-shadow: 0 10px 25px rgba(0,0,0,0.8);
+                                                                    border-radius: 6px; overflow: hidden;
+                                                                `;
+                                                                const torchImgUrl = torch.img || 'cards/dark_of_mirkwood/caves_of_nibin/cave_torch.jpg';
+                                                                gTorch.innerHTML = `<img src="${torchImgUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;">`;
+                                                                gTorch.className = 'card encounter-objective';
+                                                                document.body.appendChild(gTorch);
+
+                                                                void gTorch.offsetWidth;
+
+                                                                gTorch.style.left = `${centerRect.left}px`;
+                                                                gTorch.style.top = `${centerRect.top}px`;
+                                                                gTorch.style.transform = `scale(1)`;
+
+                                                                if (engine && engine.toast) engine.toast('Removed from Game', 'Cave Torch is removed from the game!', 'danger', 4000);
+
+                                                                setTimeout(() => {
+                                                                    gTorch.remove();
+                                                                    if (window._triggerCaveTorchBurn) {
+                                                                        window._triggerCaveTorchBurn(torch, centerRect, () => {
+                                                                            if (engine && engine.render) engine.render();
+                                                                        });
+                                                                    }
+                                                                }, 600);
+                                                            }
+                                                        }
+                                                    }, 180);
                                                 } else {
                                                     // Return safely to play area position and smoothly rotate to 90deg
+                                                    gChar.style.transition = 'all 0.75s cubic-bezier(0.25, 0.8, 0.25, 1)';
                                                     gChar.style.left = `${charRect.left + (charRect.width - cardW) / 2}px`;
                                                     gChar.style.top = `${charRect.top + (charRect.height - cardH) / 2}px`;
                                                     gChar.style.transform = `scale(${charRect.width / cardW}) rotate(90deg)`;
                                                 }
 
-                                                if (window.SoundFX) window.SoundFX.playWhoosh();
-
+                                                const cleanupDelay = isDestroyed ? 980 : 780;
                                                 setTimeout(() => {
 																										const gCharRect = gChar.getBoundingClientRect();
 																										gChar.remove();
 																										gCard.remove();
+																										delete chosen._isAnimatingTravel;
 
 																										if (engine.discardCard) {
 																												engine.discardCard(discarded, discardPile, true);
@@ -4566,14 +15273,15 @@ window.LotrExpansions['dark_of_nibin'] = {
 																														finishCrumbling();
 																												}
 																										} else {
+																												delete chosen._isAnimatingTravel;
 																												chosen.exhausted = true;
 																												delete chosen._justExhaustedTime;
 																												if (charEl) charEl.style.opacity = '1';
 																												engine.toast("Crumbling Ruin", `Discarded ${discarded.name} (Cost: ${cost}). ${chosen.name} (HP: ${remainingHp}) survived!`, "info", 4000);
 																												finishCrumbling();
 																										}
-																								}, 600);
-                                            }, 1000);
+																								}, cleanupDelay);
+                                            }, 750);
                                         }, 120);
                                     }, 150);
                                 }, 500);
@@ -4619,12 +15327,595 @@ window.LotrExpansions['dark_of_nibin'] = {
                         }
                     }
                 });
+
+                const triggerTorchSnuff = (torchUid, onDone) => {
+                    const torchEl = document.querySelector(`.is-attachment[data-uid="${torchUid}"]`) || document.querySelector(`[data-uid="${torchUid}"]`);
+                    if (!torchEl) { if (onDone) onDone(); return; }
+                    const r = torchEl.getBoundingClientRect();
+                    const padLeft = 180;
+                    const padRight = 180;
+                    const padTop = 290;
+                    const padBottom = 90;
+                    const cW = r.width + padLeft + padRight;
+                    const cH = r.height + padTop + padBottom;
+                    const canvasLeft = r.left - padLeft;
+                    const canvasTop = r.top - padTop;
+
+                    try {
+                        const wind = new Audio('./sound_effects/dark_of_mirkwood/cave_torch.mp3');
+                        const vol = document.getElementById('volume-slider');
+                        wind.volume = vol ? parseFloat(vol.value) : 0.25;
+                        wind.playbackRate = 1.35;
+                        wind.play().catch(() => {});
+                    } catch(e) {}
+
+                    const canvas = document.createElement('canvas');
+                    const dpr = window.devicePixelRatio || 1;
+                    canvas.width = cW * dpr;
+                    canvas.height = cH * dpr;
+                    canvas.style.cssText = `position:fixed; left:${canvasLeft}px; top:${canvasTop}px; width:${cW}px; height:${cH}px; z-index:10030; pointer-events:none;`;
+                    document.body.appendChild(canvas);
+                    const ctx = canvas.getContext('2d');
+                    ctx.scale(dpr, dpr);
+
+                    let flameX = padLeft + r.width / 2;
+                    let flameY = padTop + r.height * 0.22;
+                    const particles = [];
+                    const shockwaves = [];
+                    const tendrils = [];
+                    const ashFlecks = [];
+                    const sparks = [];
+                    const startTime = performance.now();
+                    const surgeTime = 300;
+                    const snuffTime = 540;
+                    const totalDuration = 2800;
+                    let snuffed = false;
+
+                    // Rich slate, charcoal, and warm ash tones with core/mantle depth
+                    const smokeTones = [
+                        { core: '22, 18, 24', mantle: '46, 40, 50', highlight: '78, 72, 84' },
+                        { core: '30, 24, 32', mantle: '58, 50, 62', highlight: '92, 85, 98' },
+                        { core: '18, 16, 20', mantle: '38, 34, 42', highlight: '68, 62, 74' },
+                        { core: '26, 22, 28', mantle: '52, 46, 56', highlight: '84, 78, 90' }
+                    ];
+
+                    const createSmokePuff = (originX, originY, isBurst) => {
+                        const tone = smokeTones[Math.floor(Math.random() * smokeTones.length)];
+                        // Tight vertical launch angle with minimal left/right variation
+                        const angle = -Math.PI * 0.5 + (Math.random() - 0.5) * 0.35;
+                        // Slower, graceful vertical launch speed
+                        const speed = isBurst ? (0.55 + Math.random() * 0.85) : (0.3 + Math.random() * 0.5);
+
+                        // Organic sub-lobes for internal billow detail without hard edges
+                        const lobes = [
+                            { ox: 0, oy: 0, rMult: 1.0, weight: 1.0 },
+                            { ox: (Math.random() - 0.5) * 0.35, oy: (Math.random() - 0.5) * 0.3, rMult: 0.65 + Math.random() * 0.2, weight: 0.7 },
+                            { ox: (Math.random() - 0.5) * 0.35, oy: (Math.random() - 0.5) * 0.3, rMult: 0.55 + Math.random() * 0.25, weight: 0.6 }
+                        ];
+
+                        return {
+                            x: originX + (Math.random() - 0.5) * (isBurst ? 8 : 4),
+                            y: originY + (Math.random() - 0.5) * (isBurst ? 8 : 4),
+                            vx: Math.cos(angle) * speed * 0.22, // Minimal horizontal velocity
+                            vy: Math.sin(angle) * speed - (isBurst ? 0.38 : 0.26), // Slower, steady upward pace
+                            size: 15 + Math.random() * 11,
+                            maxSize: isBurst ? (48 + Math.random() * 26) : (34 + Math.random() * 20),
+                            growSpeed: 0.034 + Math.random() * 0.016,
+                            angle: Math.random() * Math.PI * 2,
+                            rotSpeed: (Math.random() - 0.5) * 0.012, // Subtle slow tumbling
+                            alpha: isBurst ? (0.64 + Math.random() * 0.18) : (0.48 + Math.random() * 0.15),
+                            decay: 0.0016 + Math.random() * 0.0012,
+                            wobblePhase: Math.random() * Math.PI * 2,
+                            wobbleSpeed: 0.018 + Math.random() * 0.015,
+                            wobbleAmp: 0.018 + Math.random() * 0.015, // Greatly reduced lateral sway
+                            tone: tone,
+                            lobes: lobes
+                        };
+                    };
+
+                    // Initialise 2 delicate wispy tendrils closely hugging the central plume
+                    for (let t = 0; t < 2; t++) {
+                        tendrils.push({
+                            startDelay: snuffTime + t * 110 + Math.random() * 30,
+                            headX: flameX,
+                            headY: flameY,
+                            vx: (Math.random() - 0.5) * 0.18, // Tight horizontal discipline
+                            vy: -0.85 - Math.random() * 0.45,  // Slower upward pace
+                            phase: Math.random() * Math.PI * 2,
+                            curlSpeed: 0.024 + Math.random() * 0.015,
+                            curlAmp: 0.25 + Math.random() * 0.18, // Subtle weave
+                            alpha: 0.7,
+                            decay: 0.0025 + Math.random() * 0.0012,
+                            trail: []
+                        });
+                    }
+
+                    const loop = (now) => {
+                        const elapsed = now - startTime;
+                        ctx.clearRect(0, 0, cW, cH);
+
+                        // Dynamically update torch wick anchor position if card moves or rotates
+                        const curEl = document.querySelector(`.is-attachment[data-uid="${torchUid}"]`) || document.querySelector(`[data-uid="${torchUid}"]`);
+                        if (curEl) {
+                            const curR = curEl.getBoundingClientRect();
+                            const isEx = curEl.classList.contains('exhausted');
+                            if (!isEx) {
+                                flameX = curR.left - canvasLeft + curR.width * 0.5;
+                                flameY = curR.top - canvasTop + curR.height * 0.22;
+                            } else {
+                                flameX = curR.left - canvasLeft + curR.width * 0.78;
+                                flameY = curR.top - canvasTop + curR.height * 0.5;
+                            }
+                        }
+
+                        // 1. Pre-Snuff Sputtering Flame & Wind Lean (0ms - 540ms)
+                        if (elapsed < snuffTime) {
+                            const isSurging = elapsed < surgeTime;
+                            const flareScale = isSurging ? (1 + (elapsed / surgeTime) * 0.65) : Math.max(0.2, 1.65 - ((elapsed - surgeTime) / (snuffTime - surgeTime)) * 1.4);
+                            const flicker = 0.75 + Math.random() * 0.5;
+                            const rad = 28 * flareScale * flicker;
+                            const windLean = elapsed > surgeTime ? Math.min(26, ((elapsed - surgeTime) / 240) * 26) : 0;
+
+                            // Torch card subtle shudder under the cavern draft
+                            if (elapsed > surgeTime && curEl) {
+                                const shkX = (Math.random() - 0.5) * 4;
+                                const shkY = (Math.random() - 0.5) * 2.5;
+                                curEl.style.transform = `translate(${shkX}px, ${shkY}px)`;
+                            }
+
+                            ctx.save();
+                            ctx.globalCompositeOperation = 'screen';
+
+                            // Outer ambient fire aura
+                            const outGrad = ctx.createRadialGradient(flameX + windLean, flameY, 2, flameX + windLean, flameY, rad * 1.6);
+                            outGrad.addColorStop(0, 'rgba(255, 255, 255, 0.95)');
+                            outGrad.addColorStop(0.25, 'rgba(254, 240, 138, 0.85)');
+                            outGrad.addColorStop(0.55, 'rgba(249, 115, 22, 0.65)');
+                            outGrad.addColorStop(0.85, 'rgba(220, 38, 38, 0.3)');
+                            outGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+                            ctx.fillStyle = outGrad;
+                            ctx.beginPath();
+                            ctx.arc(flameX + windLean, flameY, rad * 1.6, 0, Math.PI * 2);
+                            ctx.fill();
+
+                            // Intense white-hot core
+                            ctx.fillStyle = '#ffffff';
+                            ctx.beginPath();
+                            ctx.arc(flameX + windLean, flameY, rad * 0.45, 0, Math.PI * 2);
+                            ctx.fill();
+                            ctx.restore();
+
+                            // Pre-snuff orbit embers
+                            if (Math.random() < 0.5) {
+                                const ang = Math.random() * Math.PI * 2;
+                                sparks.push({
+                                    x: flameX + Math.cos(ang) * 12,
+                                    y: flameY + Math.sin(ang) * 12,
+                                    vx: (Math.random() - 0.5) * 2.0 + (windLean * 0.08),
+                                    vy: -1.2 - Math.random() * 1.6,
+                                    size: 1.5 + Math.random() * 2.0,
+                                    alpha: 1,
+                                    decay: 0.04,
+                                    color: Math.random() > 0.4 ? '#fffbeb' : '#f59e0b'
+                                });
+                            }
+                        }
+
+                        // 2. The Snuff Flash, Screen Shake, & Plume Eruption (at 540ms)
+                        if (elapsed >= snuffTime && !snuffed) {
+                            snuffed = true;
+                            if (curEl) curEl.style.transform = '';
+                            if (engine.window && engine.window.screenShake) engine.window.screenShake(6, 200);
+
+                            shockwaves.push({ x: flameX, y: flameY, radius: 6, maxRadius: 52, alpha: 0.9 });
+
+                            // Erupt 32 detailed, soft-edged smoke puffs in a compact vertical column
+                            for (let i = 0; i < 32; i++) {
+                                particles.push(createSmokePuff(flameX, flameY, true));
+                            }
+
+                            // Erupt 18 gentle ballistic dying sparks
+                            for (let i = 0; i < 18; i++) {
+                                const ang = -Math.PI * 0.5 + (Math.random() - 0.5) * 1.6;
+                                const spd = 1.4 + Math.random() * 3.6;
+                                sparks.push({
+                                    x: flameX + (Math.random() - 0.5) * 8,
+                                    y: flameY + (Math.random() - 0.5) * 8,
+                                    vx: Math.cos(ang) * spd * 0.6,
+                                    vy: Math.sin(ang) * spd - 1.2,
+                                    size: 1.8 + Math.random() * 2.0,
+                                    alpha: 1.0,
+                                    decay: 0.026 + Math.random() * 0.02,
+                                    color: Math.random() > 0.4 ? '#ffedd5' : (Math.random() > 0.5 ? '#f97316' : '#ef4444')
+                                });
+                            }
+
+                            // 12 subtle soot flecks
+                            for (let i = 0; i < 12; i++) {
+                                const ang = -Math.PI * 0.5 + (Math.random() - 0.5) * 0.8;
+                                const spd = 0.5 + Math.random() * 1.2;
+                                ashFlecks.push({
+                                    x: flameX + (Math.random() - 0.5) * 8,
+                                    y: flameY + (Math.random() - 0.5) * 6,
+                                    vx: Math.cos(ang) * spd * 0.35,
+                                    vy: Math.sin(ang) * spd * 0.6 - 0.3,
+                                    size: 1.2 + Math.random() * 1.6,
+                                    alpha: 0.7 + Math.random() * 0.2,
+                                    decay: 0.0024 + Math.random() * 0.0016,
+                                    color: '#262626'
+                                });
+                            }
+                        }
+
+                        // 3. Sustained Smoldering Wick & Rising Secondary Smoke (540ms - 1950ms)
+                        if (elapsed >= snuffTime && elapsed < 1950) {
+                            const smolderProgress = (elapsed - snuffTime) / (1950 - snuffTime);
+                            const smolderAlpha = Math.max(0, 1 - smolderProgress);
+                            const emberPulse = 0.72 + Math.sin(elapsed * 0.015) * 0.28;
+
+                            ctx.save();
+                            ctx.globalCompositeOperation = 'screen';
+                            const embGrad = ctx.createRadialGradient(flameX, flameY, 0, flameX, flameY, 15 * smolderAlpha);
+                            embGrad.addColorStop(0, `rgba(255, 255, 255, ${0.9 * smolderAlpha * emberPulse})`);
+                            embGrad.addColorStop(0.28, `rgba(254, 215, 170, ${0.8 * smolderAlpha * emberPulse})`);
+                            embGrad.addColorStop(0.65, `rgba(234, 88, 12, ${0.55 * smolderAlpha})`);
+                            embGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+                            ctx.fillStyle = embGrad;
+                            ctx.beginPath();
+                            ctx.arc(flameX, flameY, 15 * smolderAlpha, 0, Math.PI * 2);
+                            ctx.fill();
+                            ctx.restore();
+
+                            // Steady stream of gentle smoke puffs wafting from the wick
+                            if (Math.random() < 0.42) {
+                                particles.push(createSmokePuff(flameX, flameY, false));
+                            }
+                        }
+
+                        // 4. Render Soft Ring Shockwave
+                        for (let i = shockwaves.length - 1; i >= 0; i--) {
+                            const sw = shockwaves[i];
+                            sw.radius += (sw.maxRadius - sw.radius) * 0.16;
+                            sw.alpha -= 0.055;
+                            if (sw.alpha <= 0) { shockwaves.splice(i, 1); continue; }
+                            ctx.save();
+                            ctx.globalCompositeOperation = 'screen';
+                            ctx.globalAlpha = Math.max(0, sw.alpha);
+                            ctx.lineWidth = 2.8;
+                            ctx.strokeStyle = '#fef08a';
+                            ctx.beginPath();
+                            ctx.arc(sw.x, sw.y, sw.radius, 0, Math.PI * 2);
+                            ctx.stroke();
+                            ctx.restore();
+                        }
+
+                        // 5. Render Wispy Tendrils Weaving Upward in Narrow Channel
+                        tendrils.forEach(td => {
+                            if (elapsed < td.startDelay || td.alpha <= 0) return;
+
+                            td.phase += td.curlSpeed;
+                            td.headX += td.vx + Math.sin(td.phase) * td.curlAmp;
+                            td.headY += td.vy;
+                            td.vy *= 0.99;
+                            td.alpha -= td.decay;
+
+                            td.trail.unshift({ x: td.headX, y: td.headY, alpha: td.alpha });
+                            if (td.trail.length > 20) td.trail.pop();
+
+                            if (td.trail.length > 2) {
+                                ctx.save();
+                                ctx.lineCap = 'round';
+                                ctx.lineJoin = 'round';
+                                for (let p = 0; p < td.trail.length - 1; p++) {
+                                    const pt = td.trail[p];
+                                    const nextPt = td.trail[p + 1];
+                                    const ratio = 1 - (p / td.trail.length);
+                                    const w = 2.0 + (1 - ratio) * 7;
+                                    ctx.beginPath();
+                                    ctx.moveTo(pt.x, pt.y);
+                                    ctx.lineTo(nextPt.x, nextPt.y);
+                                    ctx.strokeStyle = `rgba(125, 118, 135, ${pt.alpha * ratio * 0.32})`;
+                                    ctx.lineWidth = w;
+                                    ctx.stroke();
+                                }
+                                ctx.restore();
+                            }
+                        });
+
+                        // 6. Render Detailed, Multi-Node Soft Smoke Puffs
+                        for (let i = particles.length - 1; i >= 0; i--) {
+                            const p = particles[i];
+                            p.wobblePhase += p.wobbleSpeed;
+                            p.vx += Math.sin(p.wobblePhase) * p.wobbleAmp;
+
+                            // Gentle, controlled upward buoyancy and strong lateral damping (no wide left/right drift)
+                            p.vy -= 0.007;
+                            p.vy *= 0.988;
+                            p.vx *= 0.94; // Quickly dampen left/right movement
+
+                            p.x += p.vx;
+                            p.y += p.vy;
+                            p.angle += p.rotSpeed;
+
+                            p.size += (p.maxSize - p.size) * p.growSpeed;
+                            p.alpha -= p.decay;
+
+                            if (p.alpha <= 0) {
+                                particles.splice(i, 1);
+                                continue;
+                            }
+
+                            ctx.save();
+                            ctx.globalCompositeOperation = 'source-over';
+                            ctx.translate(p.x, p.y);
+                            ctx.rotate(p.angle);
+
+                            const r = p.size;
+
+                            // Render multi-node internal lobes for textured volume with 100% soft feathered perimeter
+                            for (let l = 0; l < p.lobes.length; l++) {
+                                const lobe = p.lobes[l];
+                                const lx = lobe.ox * r;
+                                const ly = lobe.oy * r;
+                                const lr = r * lobe.rMult;
+
+                                const grad = ctx.createRadialGradient(lx, ly, 0, lx, ly, lr);
+                                grad.addColorStop(0, `rgba(${p.tone.core}, ${p.alpha * lobe.weight * 0.82})`);
+                                grad.addColorStop(0.3, `rgba(${p.tone.mantle}, ${p.alpha * lobe.weight * 0.58})`);
+                                grad.addColorStop(0.65, `rgba(${p.tone.highlight}, ${p.alpha * lobe.weight * 0.22})`);
+                                grad.addColorStop(0.85, `rgba(${p.tone.highlight}, ${p.alpha * lobe.weight * 0.06})`);
+                                grad.addColorStop(1, `rgba(${p.tone.highlight}, 0)`);
+
+                                ctx.fillStyle = grad;
+                                ctx.beginPath();
+                                ctx.arc(lx, ly, lr, 0, Math.PI * 2);
+                                ctx.fill();
+                            }
+
+                            ctx.restore();
+                        }
+
+                        // 7. Render Subtle Ash Specks
+                        for (let i = ashFlecks.length - 1; i >= 0; i--) {
+                            const af = ashFlecks[i];
+                            af.vy -= 0.003;
+                            af.vy *= 0.988;
+                            af.vx *= 0.95;
+                            af.x += af.vx;
+                            af.y += af.vy;
+                            af.alpha -= af.decay;
+
+                            if (af.alpha <= 0) {
+                                ashFlecks.splice(i, 1);
+                                continue;
+                            }
+
+                            ctx.save();
+                            ctx.globalAlpha = Math.max(0, af.alpha);
+                            ctx.fillStyle = af.color;
+                            ctx.beginPath();
+                            ctx.arc(af.x, af.y, af.size * 0.5, 0, Math.PI * 2);
+                            ctx.fill();
+                            ctx.restore();
+                        }
+
+                        // 8. Render Sparks
+                        for (let i = sparks.length - 1; i >= 0; i--) {
+                            const sp = sparks[i];
+                            sp.x += sp.vx;
+                            sp.y += sp.vy;
+                            sp.vy += 0.06;
+                            sp.vx *= 0.98;
+                            sp.alpha -= sp.decay;
+
+                            if (sp.alpha <= 0) {
+                                sparks.splice(i, 1);
+                                continue;
+                            }
+
+                            ctx.save();
+                            ctx.globalAlpha = Math.max(0, sp.alpha);
+                            ctx.fillStyle = sp.color;
+                            ctx.shadowColor = '#f97316';
+                            ctx.shadowBlur = 6;
+                            ctx.beginPath();
+                            ctx.arc(sp.x, sp.y, sp.size * sp.alpha, 0, Math.PI * 2);
+                            ctx.fill();
+                            ctx.restore();
+                        }
+
+                        if (elapsed < totalDuration || particles.length > 0) {
+                            requestAnimationFrame(loop);
+                        } else {
+                            canvas.remove();
+                            if (onDone) onDone();
+                        }
+                    };
+                    requestAnimationFrame(loop);
+                };
+
+                const triggerAbyssalFogShroud = (onDone) => {
+                    try {
+                        const snd = new Audio('./sound_effects/dark_of_mirkwood/lost_in_the_dark_quest_card.mp3');
+                        const volSlider = document.getElementById('volume-slider');
+                        snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                        snd.play().catch(()=>{});
+                    } catch(e) {}
+
+                    const questCard = document.querySelector('#quest-content .quest-card') || document.querySelector('.card.quest-card') || document.getElementById('quest-zone');
+                    if (!questCard) { if (onDone) onDone(); return; }
+
+                    if (!document.getElementById('nibin-lost-fog-style')) {
+                        const st = document.createElement('style');
+                        st.id = 'nibin-lost-fog-style';
+                        st.textContent = `
+                            @keyframes questRippleEmanateSoft {
+                                0% {
+                                    transform: translate(-50%, -50%) scale(0.12);
+                                    opacity: 0;
+                                    filter: blur(6px);
+                                }
+                                25% {
+                                    opacity: 0.52;
+                                    filter: blur(8px);
+                                }
+                                70% {
+                                    opacity: 0.22;
+                                    filter: blur(12px);
+                                }
+                                100% {
+                                    transform: translate(-50%, -50%) scale(2.45);
+                                    opacity: 0;
+                                    filter: blur(16px);
+                                }
+                            }
+                            @keyframes cumulusCloudRoll1 {
+                                0%, 100% { transform: scale(1) translate(0, 0) rotate(0deg); opacity: 0.75; }
+                                33% { transform: scale(1.18) translate(-14px, -12px) rotate(8deg); opacity: 0.92; }
+                                66% { transform: scale(1.08) translate(-6px, 8px) rotate(-6deg); opacity: 0.80; }
+                            }
+                            @keyframes cumulusCloudRoll2 {
+                                0%, 100% { transform: scale(1.06) translate(0, 0) rotate(0deg); opacity: 0.72; }
+                                33% { transform: scale(1.22) translate(14px, -10px) rotate(-10deg); opacity: 0.94; }
+                                66% { transform: scale(0.98) translate(8px, 12px) rotate(7deg); opacity: 0.78; }
+                            }
+                            @keyframes cumulusCloudRoll3 {
+                                0%, 100% { transform: scale(0.96) translate(0, 0) rotate(0deg); opacity: 0.78; }
+                                33% { transform: scale(1.24) translate(-10px, 16px) rotate(-8deg); opacity: 0.95; }
+                                66% { transform: scale(1.12) translate(10px, 6px) rotate(10deg); opacity: 0.82; }
+                            }
+                            @keyframes cumulusCloudRoll4 {
+                                0%, 100% { transform: scale(1) translate(0, 0) rotate(0deg); opacity: 0.70; }
+                                33% { transform: scale(1.26) translate(16px, 14px) rotate(11deg); opacity: 0.92; }
+                                66% { transform: scale(1.06) translate(-8px, -10px) rotate(-7deg); opacity: 0.76; }
+                            }
+                            @keyframes cumulusCloudCenterA {
+                                0%, 100% { transform: translate(-50%, -50%) rotate(0deg) scale(1); opacity: 0.58; }
+                                50% { transform: translate(-42%, -54%) rotate(15deg) scale(1.22); opacity: 0.82; }
+                            }
+                            @keyframes cumulusCloudCenterB {
+                                0%, 100% { transform: translate(-50%, -50%) rotate(0deg) scale(1.08); opacity: 0.54; }
+                                50% { transform: translate(-56%, -46%) rotate(-16deg) scale(1.26); opacity: 0.80; }
+                            }
+                            .quest-abyssal-shield {
+                                position: absolute;
+                                inset: 0;
+                                z-index: 15;
+                                pointer-events: none;
+                                border-radius: 6px;
+                                overflow: visible;
+                                border: 2px solid rgba(192, 132, 252, 0.75);
+                                box-shadow: inset 0 0 22px rgba(126, 34, 206, 0.45), 0 0 28px rgba(147, 51, 234, 0.65);
+                                background: radial-gradient(ellipse at center, rgba(15, 5, 25, 0.08) 0%, rgba(20, 5, 35, 0.28) 80%, rgba(10, 0, 20, 0.46) 100%);
+                                transition: opacity 1.2s ease-in-out;
+                                opacity: 0;
+                            }
+                            .quest-card .token-layer,
+                            .quest-card .token.progress,
+                            #quest-content .token-layer,
+                            #quest-content .token.progress {
+                                z-index: 35 !important;
+                            }
+                            .quest-drop-ripple {
+                                position: absolute;
+                                top: 50%;
+                                left: 50%;
+                                width: 85cqw;
+                                height: 85cqw;
+                                border-radius: 50%;
+                                border: none !important;
+                                background: radial-gradient(circle, transparent 40%, rgba(216, 180, 254, 0.0) 45%, rgba(192, 132, 252, 0.28) 58%, rgba(147, 51, 234, 0.16) 66%, transparent 75%);
+                                transform: translate(-50%, -50%);
+                                transform-origin: center center;
+                                animation: questRippleEmanateSoft 11.5s cubic-bezier(0.2, 0.5, 0.5, 1) infinite;
+                                will-change: transform, opacity, filter;
+                                pointer-events: none;
+                                opacity: 0;
+                            }
+                        `;
+                        document.head.appendChild(st);
+                    }
+
+                    let existingShroud = questCard.querySelector('.quest-abyssal-shield');
+                    if (!existingShroud) {
+                        existingShroud = document.createElement('div');
+                        existingShroud.className = 'quest-abyssal-shield';
+                        existingShroud.innerHTML = `
+                            <!-- Heavy Volumetric Cumulus Smoke Clouds Billowing Over & Far Outside Card Edges -->
+                            <div style="position:absolute; inset:-45px; overflow:visible; pointer-events:none;">
+                                <!-- Corner & Perimeter Cloud Heads -->
+                                <div style="position:absolute; left:-30px; top:-28px; width:175px; height:140px; border-radius:45% 55% 50% 50% / 55% 45% 55% 45%; background:radial-gradient(circle at 45% 45%, rgba(12,3,20,0.92) 0%, rgba(22,6,32,0.65) 52%, transparent 78%); filter:blur(14px); animation:cumulusCloudRoll1 9s ease-in-out infinite;"></div>
+                                <div style="position:absolute; right:-32px; top:-30px; width:180px; height:145px; border-radius:50% 50% 45% 55% / 45% 55% 45% 55%; background:radial-gradient(circle at 55% 45%, rgba(8,2,14,0.94) 0%, rgba(28,8,40,0.68) 50%, transparent 78%); filter:blur(15px); animation:cumulusCloudRoll2 10.2s ease-in-out 1.2s infinite;"></div>
+                                <div style="position:absolute; left:-32px; bottom:-32px; width:185px; height:150px; border-radius:55% 45% 50% 50% / 50% 50% 45% 55%; background:radial-gradient(circle at 45% 55%, rgba(14,3,22,0.90) 0%, rgba(24,6,36,0.62) 52%, transparent 78%); filter:blur(15px); animation:cumulusCloudRoll3 9.6s ease-in-out 0.6s infinite;"></div>
+                                <div style="position:absolute; right:-30px; bottom:-34px; width:175px; height:145px; border-radius:45% 55% 55% 45% / 55% 45% 50% 50%; background:radial-gradient(circle at 55% 55%, rgba(10,2,16,0.92) 0%, rgba(26,7,38,0.65) 50%, transparent 78%); filter:blur(14px); animation:cumulusCloudRoll4 10.8s ease-in-out 2.0s infinite;"></div>
+
+                                <!-- Flank Billows Extending Out Left & Right -->
+                                <div style="position:absolute; left:-38px; top:28%; width:145px; height:155px; border-radius:50% 45% 55% 50%; background:radial-gradient(circle, rgba(12,3,18,0.88) 0%, rgba(24,7,34,0.58) 52%, transparent 76%); filter:blur(14px); animation:cumulusCloudRoll1 8.2s ease-in-out 3.2s infinite;"></div>
+                                <div style="position:absolute; right:-38px; top:30%; width:150px; height:160px; border-radius:45% 50% 50% 55%; background:radial-gradient(circle, rgba(10,2,16,0.90) 0%, rgba(26,8,38,0.60) 52%, transparent 76%); filter:blur(14px); animation:cumulusCloudRoll2 8.6s ease-in-out 2.4s infinite;"></div>
+
+                                <!-- Top & Bottom Billowing Cloud Crests -->
+                                <div style="position:absolute; left:22%; top:-38px; width:220px; height:120px; border-radius:50% 50% 45% 45%; background:radial-gradient(circle at 50% 40%, rgba(14,4,22,0.85) 0%, rgba(20,5,30,0.55) 54%, transparent 78%); filter:blur(16px); animation:cumulusCloudRoll3 9.4s ease-in-out 2.6s infinite;"></div>
+                                <div style="position:absolute; left:20%; bottom:-40px; width:230px; height:125px; border-radius:45% 45% 50% 50%; background:radial-gradient(circle at 50% 60%, rgba(10,2,16,0.88) 0%, rgba(22,6,32,0.58) 54%, transparent 78%); filter:blur(16px); animation:cumulusCloudRoll4 9.1s ease-in-out 1.6s infinite;"></div>
+                            </div>
+
+                            <!-- Dense Rolling Cumulus Clouds Swirling Over the Face of the Card -->
+                            <div style="position:absolute; inset:0; overflow:hidden; border-radius:6px; pointer-events:none;">
+                                <div style="position:absolute; left:44%; top:40%; width:240px; height:180px; border-radius:50% 45% 55% 50%; background:radial-gradient(circle at 45% 45%, rgba(16,4,24,0.78) 0%, rgba(8,2,14,0.46) 52%, transparent 76%); filter:blur(16px); animation:cumulusCloudCenterA 11.5s ease-in-out infinite;"></div>
+                                <div style="position:absolute; left:56%; top:60%; width:230px; height:170px; border-radius:45% 55% 50% 50%; background:radial-gradient(circle at 55% 55%, rgba(12,2,18,0.75) 0%, rgba(20,5,30,0.42) 52%, transparent 76%); filter:blur(16px); animation:cumulusCloudCenterB 13s ease-in-out 2.5s infinite;"></div>
+                            </div>
+
+                            <!-- Borderless, Pure Feathered Gradient Wave Ripples (No Rings or Edges Sitting Frozen) -->
+                            <div style="position:absolute; inset:0; width:100%; height:100%; container-type:size; overflow:hidden; border-radius:6px; pointer-events:none;">
+                                <div class="quest-drop-ripple" style="animation-delay: 0s;"></div>
+                                <div class="quest-drop-ripple" style="animation-delay: -5.75s;"></div>
+                            </div>
+                        `;
+                        questCard.appendChild(existingShroud);
+                    }
+
+                    requestAnimationFrame(() => {
+                        existingShroud.style.opacity = '1';
+                    });
+
+                    // Ambient Fog Shroud Watcher (Automatically clears upon Phase change)
+                    const watcher = setInterval(() => {
+                        if (!game._nibinQuestProgressBlock || (game.phase && !game.phase.startsWith('quest'))) {
+                            clearInterval(watcher);
+                            document.querySelectorAll('.quest-abyssal-shield').forEach(sh => {
+                                sh.style.opacity = '0';
+                                setTimeout(() => sh.remove(), 1200);
+                            });
+                        }
+                    }, 250);
+
+                    if (onDone) onDone();
+                };
+
                 if (torch && !torch.exhausted) {
                     engine.window.showChoiceModal("Lost in the Dark", `<span style="font-size:1.6rem; font-weight:600; color:var(--gold-bright); display:block; margin-bottom:12px; line-height:1.35; text-align:center;">Choose one:</span>`, [
                         {label: "Exhaust Cave Torch", cb: () => {
                             const ownerIdx = torchOwnerHero && torchOwnerHero._ownerIdx !== undefined ? torchOwnerHero._ownerIdx : game.activeTabPlayerIdx;
                             
-                            const doDiscard = () => {
+                            const doSnuff = () => {
+                                triggerTorchSnuff(torch._uid, () => {});
+                                setTimeout(() => {
+                                    proceedExhaust();
+                                }, 540);
+                            };
+
+                            if (game.numPlayers > 1 && game.activeTabPlayerIdx !== ownerIdx) {
+                                if (engine.window && engine.window._switchTab) {
+                                    engine.window._switchTab(ownerIdx);
+                                } else {
+                                    game.activeTabPlayerIdx = ownerIdx;
+                                    if (engine.render) engine.render();
+                                }
+                                setTimeout(doSnuff, 150);
+                            } else {
+                                doSnuff();
+                            }
+
+                            const doDiscard = (onDone) => {
                                 if (!game.encounterDeck || game.encounterDeck.length === 0) {
                                     if (game.encounterDiscard && game.encounterDiscard.length > 0) {
                                         game.encounterDeck = engine.shuffle(game.encounterDiscard);
@@ -4639,12 +15930,12 @@ window.LotrExpansions['dark_of_nibin'] = {
                                             engine.window.animateDrawDirectToStaging(top, () => {
                                                 game.stagingArea.push(top);
                                                 engine.render();
-                                                cb();
+                                                if (onDone) onDone();
                                             });
                                         } else {
                                             game.stagingArea.push(top);
                                             engine.render();
-                                            cb();
+                                            if (onDone) onDone();
                                         }
                                     } else {
                                         engine.toast("Cave Torch", `Forced: Discarded ${top.name}.`, "info");
@@ -4678,23 +15969,21 @@ window.LotrExpansions['dark_of_nibin'] = {
                                             ghost.style.left = `${discRect.left}px`;
                                             ghost.style.top = `${discRect.top}px`;
                                             ghost.style.transform = `scale(${discRect.width / cardW})`;
-                                            
-                                            if (window.SoundFX) window.SoundFX.playWhoosh();
 
                                             setTimeout(() => {
                                                 ghost.remove();
                                                 game.encounterDiscard.push(top);
                                                 engine.render();
-                                                cb();
+                                                if (onDone) onDone();
                                             }, 500);
                                         } else {
                                             game.encounterDiscard.push(top);
                                             engine.render();
-                                            cb();
+                                            if (onDone) onDone();
                                         }
                                     }
                                 } else {
-                                    cb();
+                                    if (onDone) onDone();
                                 }
                             };
 
@@ -4704,57 +15993,57 @@ window.LotrExpansions['dark_of_nibin'] = {
                                 engine.render();
 
                                 setTimeout(() => {
-                                    // Immediately slide "Lost in the Dark" to the encounter discard
-                                    const ghost = document.getElementById('encounter-limbo-ghost');
-                                    const discardEl = document.getElementById('encounter-discard-pile');
-                                    if (ghost && discardEl) {
-                                        const discRect = discardEl.getBoundingClientRect();
-                                        const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
-                                        
-                                        ghost.style.transformOrigin = 'top left';
-                                        ghost.style.transition = 'all 0.5s cubic-bezier(0.25, 0.8, 0.25, 1)';
-                                        ghost.style.left = `${discRect.left}px`;
-                                        ghost.style.top = `${discRect.top}px`;
-                                        ghost.style.transform = `scale(${discRect.width / cardW}) rotate(0deg)`;
-                                        
-                                        // Prevent engine from double-animating it later
-                                        if (engine.window) engine.window._activeEncounterGhost = null;
-                                        window._activeEncounterGhost = null;
-                                        card._alreadyResolved = true;
+                                    const finishLostInTheDark = () => {
+                                        const ghost = document.getElementById('encounter-limbo-ghost');
+                                        const discardEl = document.getElementById('encounter-discard-pile');
+                                        if (ghost && discardEl) {
+                                            try {
+                                                const snd = new Audio('./sound_effects/enemy_move.mp3');
+                                                const volSlider = document.getElementById('volume-slider');
+                                                snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                                                snd.play().catch(()=>{});
+                                            } catch(e) {}
 
-                                        setTimeout(() => {
-                                            ghost.remove();
-                                            if (!game.encounterDiscard.includes(card)) {
-                                                game.encounterDiscard.push(card);
-                                                engine.render();
-                                            }
-                                            if (engine.window && engine.window.checkEmptyEncounterDeck) {
-                                                engine.window.checkEmptyEncounterDeck(doDiscard);
-                                            } else {
-                                                doDiscard();
-                                            }
-                                        }, 500);
-                                    } else {
-                                        if (engine.window && engine.window.checkEmptyEncounterDeck) {
-                                            engine.window.checkEmptyEncounterDeck(doDiscard);
+                                            const discRect = discardEl.getBoundingClientRect();
+                                            const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
+                                            
+                                            ghost.style.transformOrigin = 'top left';
+                                            ghost.style.transition = 'all 0.5s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                                            ghost.style.left = `${discRect.left}px`;
+                                            ghost.style.top = `${discRect.top}px`;
+                                            ghost.style.transform = `scale(${discRect.width / cardW}) rotate(0deg)`;
+                                            
+                                            if (engine.window) engine.window._activeEncounterGhost = null;
+                                            window._activeEncounterGhost = null;
+                                            card._alreadyResolved = true;
+
+                                            setTimeout(() => {
+                                                ghost.remove();
+                                                if (!game.encounterDiscard.includes(card)) {
+                                                    game.encounterDiscard.push(card);
+                                                    engine.render();
+                                                }
+                                                cb();
+                                            }, 500);
                                         } else {
-                                            doDiscard();
+                                            cb();
                                         }
+                                    };
+
+                                    if (engine.window && engine.window.checkEmptyEncounterDeck) {
+                                        engine.window.checkEmptyEncounterDeck(() => doDiscard(finishLostInTheDark));
+                                    } else {
+                                        doDiscard(finishLostInTheDark);
                                     }
                                 }, 800);
                             };
-
-                            if (game.activeTabPlayerIdx !== ownerIdx && engine.window && engine.window._switchTab) {
-                                engine.window._switchTab(ownerIdx);
-                                setTimeout(proceedExhaust, 400);
-                            } else {
-                                proceedExhaust();
-                            }
                         }},
                         {label: "No progress on quest this phase", cb: () => {
                             game._nibinQuestProgressBlock = true;
                             engine.toast("Lost in the Dark", "No progress can be placed on the quest this phase.", "danger");
-                            cb();
+                            triggerAbyssalFogShroud(() => {
+                                cb();
+                            });
                         }}
                     ], true);
                 } else {
@@ -4762,19 +16051,136 @@ window.LotrExpansions['dark_of_nibin'] = {
                         {label: "No progress on quest this phase", cb: () => {
                             game._nibinQuestProgressBlock = true;
                             engine.toast("Lost in the Dark", "No progress can be placed on the quest this phase.", "danger");
-                            cb();
+                            triggerAbyssalFogShroud(() => {
+                                cb();
+                            });
                         }}
                     ], true);
                 }
             },
             onShadow: function(shadow, enemy, defChars, game, engine, next) {
                 if (defChars.length > 0) {
-                    defChars[0].damage++;
-                    engine.checkHeroDeath(defChars[0]);
-                    engine.toast("Lost in the Dark", "Shadow: Deal 1 damage to defender.", "danger");
-                    engine.render();
+                    const target = defChars[0];
+                    const el = document.querySelector(`[data-uid="${target._uid}"]`);
+                    
+                    if (el) {
+                        try {
+                            const snd = new Audio('./sound_effects/dark_of_mirkwood/lost_in_the_dark_quest_card.mp3');
+                            const volSlider = document.getElementById('volume-slider');
+                            snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                            snd.play().catch(()=>{});
+                        } catch(e){}
+
+                        if (!document.getElementById('nibin-defender-shadow-fog-style')) {
+                            const st = document.createElement('style');
+                            st.id = 'nibin-defender-shadow-fog-style';
+                            st.textContent = `
+                                @keyframes defCloudDriftLeft1 {
+                                    0% { transform: translate(12px, 0px) scale(0.92); opacity: 0.8; }
+                                    50% { transform: translate(-8px, -4px) scale(1.04); opacity: 0.95; }
+                                    100% { transform: translate(-22px, -1px) scale(0.96); opacity: 0.8; }
+                                }
+                                @keyframes defCloudDriftRight1 {
+                                    0% { transform: translate(-12px, 0px) scale(0.92); opacity: 0.8; }
+                                    50% { transform: translate(8px, -4px) scale(1.05); opacity: 0.95; }
+                                    100% { transform: translate(22px, -1px) scale(0.96); opacity: 0.8; }
+                                }
+                                @keyframes defCloudDriftLeft2 {
+                                    0% { transform: translate(10px, 3px) scale(0.94); opacity: 0.78; }
+                                    50% { transform: translate(-10px, -3px) scale(1.06); opacity: 0.94; }
+                                    100% { transform: translate(-20px, 1px) scale(0.98); opacity: 0.78; }
+                                }
+                                @keyframes defCloudDriftRight2 {
+                                    0% { transform: translate(-10px, 3px) scale(0.94); opacity: 0.78; }
+                                    50% { transform: translate(10px, -3px) scale(1.06); opacity: 0.94; }
+                                    100% { transform: translate(20px, 1px) scale(0.98); opacity: 0.78; }
+                                }
+                                .defender-shadow-shroud {
+                                    border-radius: 6px;
+                                    overflow: visible;
+                                    border: 1.5px solid rgba(130, 35, 55, 0.6);
+                                    box-shadow: inset 0 0 16px rgba(0, 0, 0, 0.92), 0 0 20px rgba(50, 10, 25, 0.7);
+                                    background: radial-gradient(ellipse at center, rgba(15, 6, 12, 0.15) 0%, rgba(18, 5, 14, 0.4) 80%, rgba(8, 2, 8, 0.75) 100%);
+                                    pointer-events: none;
+                                }
+                            `;
+                            document.head.appendChild(st);
+                        }
+
+                        const r = el.getBoundingClientRect();
+                        const shroud = document.createElement('div');
+                        shroud.className = 'defender-shadow-shroud';
+                        shroud.style.cssText = `
+                            position: fixed;
+                            left: ${r.left}px;
+                            top: ${r.top}px;
+                            width: ${r.width}px;
+                            height: ${r.height}px;
+                            z-index: 10030;
+                            pointer-events: none;
+                            opacity: 0;
+                            transition: opacity 0.4s ease-out;
+                        `;
+                        shroud.innerHTML = `
+                            <!-- Tighter Inset with Dark Obsidian, Charcoal, & Muted Blood-Smoke Clouds -->
+                            <div style="position:absolute; inset:-16px; overflow:visible; pointer-events:none;">
+                                <!-- Clouds Moving Left -->
+                                <div style="position:absolute; left:-14px; top:-10px; width:100px; height:80px; border-radius:50% 45% 55% 45%; background:radial-gradient(circle at 45% 45%, rgba(12,4,8,0.96) 0%, rgba(42,14,26,0.85) 45%, rgba(75,22,42,0.45) 70%, transparent 84%); filter:blur(9px); animation:defCloudDriftLeft1 6.5s ease-in-out infinite;"></div>
+                                <div style="position:absolute; left:-18px; bottom:-12px; width:110px; height:85px; border-radius:55% 45% 50% 50%; background:radial-gradient(circle at 45% 55%, rgba(10,3,7,0.96) 0%, rgba(48,15,30,0.82) 45%, rgba(80,24,48,0.4) 70%, transparent 84%); filter:blur(9px); animation:defCloudDriftLeft2 7.2s ease-in-out 0.4s infinite;"></div>
+                                <div style="position:absolute; left:18%; top:-18px; width:115px; height:75px; border-radius:50%; background:radial-gradient(circle at 50% 40%, rgba(14,5,10,0.94) 0%, rgba(45,15,28,0.8) 45%, rgba(70,22,42,0.38) 72%, transparent 85%); filter:blur(10px); animation:defCloudDriftLeft1 6.8s ease-in-out 0.8s infinite;"></div>
+
+                                <!-- Clouds Moving Right -->
+                                <div style="position:absolute; right:-14px; top:-12px; width:105px; height:82px; border-radius:45% 55% 50% 50%; background:radial-gradient(circle at 55% 45%, rgba(10,3,7,0.96) 0%, rgba(40,12,24,0.85) 45%, rgba(72,20,40,0.42) 70%, transparent 84%); filter:blur(9px); animation:defCloudDriftRight1 7.0s ease-in-out 0.2s infinite;"></div>
+                                <div style="position:absolute; right:-16px; bottom:-14px; width:105px; height:82px; border-radius:45% 55% 55% 45%; background:radial-gradient(circle at 55% 55%, rgba(12,4,8,0.96) 0%, rgba(46,14,28,0.82) 45%, rgba(78,22,46,0.4) 70%, transparent 84%); filter:blur(9px); animation:defCloudDriftRight2 7.6s ease-in-out 0.6s infinite;"></div>
+                                <div style="position:absolute; left:12%; bottom:-18px; width:120px; height:78px; border-radius:50%; background:radial-gradient(circle at 50% 60%, rgba(12,4,8,0.94) 0%, rgba(42,12,26,0.82) 45%, rgba(68,20,40,0.38) 72%, transparent 85%); filter:blur(10px); animation:defCloudDriftRight1 6.2s ease-in-out 1.0s infinite;"></div>
+                            </div>
+
+                            <!-- Interior Billowing Mist (Counter-Drifting Across Center Face) -->
+                            <div style="position:absolute; inset:0; overflow:hidden; border-radius:6px; pointer-events:none;">
+                                <div style="position:absolute; left:22%; top:28%; width:135px; height:105px; border-radius:50% 45% 55% 50%; background:radial-gradient(circle at 45% 45%, rgba(15,5,10,0.88) 0%, rgba(48,15,30,0.72) 48%, transparent 78%); filter:blur(10px); animation:defCloudDriftLeft2 8.5s ease-in-out infinite;"></div>
+                                <div style="position:absolute; left:32%; top:48%; width:130px; height:100px; border-radius:45% 55% 50% 50%; background:radial-gradient(circle at 55% 55%, rgba(12,4,8,0.88) 0%, rgba(44,14,28,0.7) 48%, transparent 78%); filter:blur(10px); animation:defCloudDriftRight2 9.2s ease-in-out 1.2s infinite;"></div>
+                            </div>
+                        `;
+                        
+                        document.body.appendChild(shroud);
+                        requestAnimationFrame(() => {
+                            shroud.style.opacity = '1';
+                        });
+
+                        setTimeout(() => {
+                            if (engine.window && engine.window.screenShake) {
+                                engine.window.screenShake(5, 180);
+                            }
+                            window._suppressDamageFxBurst = true;
+                            setTimeout(() => { window._suppressDamageFxBurst = false; }, 1400);
+
+                            target.damage++;
+                            engine.checkHeroDeath(target);
+                            engine.toast("Lost in the Dark", "Shadow: Dealt 1 damage to defender.", "danger");
+                            engine.render();
+                            next();
+
+                            setTimeout(() => {
+                                shroud.style.transition = 'opacity 2.2s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                                shroud.style.opacity = '0';
+                                setTimeout(() => shroud.remove(), 2300);
+                            }, 500);
+
+                        }, 750);
+                    } else {
+                        window._suppressDamageFxBurst = true;
+                        setTimeout(() => { window._suppressDamageFxBurst = false; }, 1000);
+                        setTimeout(() => {
+                            target.damage++;
+                            engine.checkHeroDeath(target);
+                            engine.toast("Lost in the Dark", "Shadow: Dealt 1 damage to defender.", "danger");
+                            engine.render();
+                            next();
+                        }, 250);
+                    }
+                } else {
+                    next();
                 }
-                next();
             }
         },
         {
@@ -4832,9 +16238,19 @@ window.LotrExpansions['dark_of_nibin'] = {
             shadow: 'Shadow: Attacking enemy gets +2 Attack.',
             onShadow: function(shadow, enemy, defChars, game, engine, next) {
                 enemy.attackBonus = (enemy.attackBonus || 0) + 2;
-                engine.toast('Shadow Effect', `${shadow.name}: Attacking enemy gets +2 Attack.`, 'danger', 2800);
+                if (typeof window.playForestSpiderPowerUpAudio === 'function') {
+                    window.playForestSpiderPowerUpAudio();
+                } else if (typeof playForestSpiderPowerUpAudio === 'function') {
+                    playForestSpiderPowerUpAudio();
+                }
+                if (typeof window.triggerForestSpiderPowerUp === 'function') {
+                    window.triggerForestSpiderPowerUp(enemy._uid, 'red');
+                }
+                engine.toast('Shadow Effect', `Goblin Troop: Attacking enemy +2 ⚔`, 'danger', 2800);
                 engine.render();
-                next();
+                setTimeout(() => {
+                    next();
+                }, 350);
             }
         },
         {
@@ -4847,7 +16263,21 @@ window.LotrExpansions['dark_of_nibin'] = {
             img: 'cards/dark_of_mirkwood/caves_of_nibin/goblin_runners.jpg',
             text: 'Surge.\nShadow: Attacking enemy makes an additional attack immediately after this one. (Deal a new shadow card for that attack.)',
             shadow: 'Shadow: Attacking enemy makes an additional attack immediately after this one.',
+            onReveal: function(card, game, engine, cb) {
+                if (typeof window.playGoblinRunnersRevealAudio === 'function') {
+                    window.playGoblinRunnersRevealAudio();
+                }
+                card._surging = true;
+                engine.toast('Surge', `${card.name} has Surge! Revealing an additional card.`, 'warning');
+                if (cb) cb();
+            },
             onShadow: function(shadow, enemy, defChars, game, engine, next) {
+                if (typeof window.triggerGoblinRunnersSecondAttackEffect === 'function') {
+                    window.triggerGoblinRunnersSecondAttackEffect(enemy);
+                }
+                if (typeof window.startGoblinRunnersSmokeEffect === 'function') {
+                    window.startGoblinRunnersSmokeEffect(enemy);
+                }
                 engine.toast("Goblin Runners", "Shadow: Attacking enemy will make an additional attack!", "danger", 4000);
                 enemy._extraAttackPending = (enemy._extraAttackPending || 0) + 1;
                 game._nibinBlockCombatTransitions = true;
@@ -4887,6 +16317,7 @@ window.LotrExpansions['dark_of_nibin'] = {
                     while (pIdx < game.numPlayers && game.eliminated[pIdx]) pIdx++;
                     if (pIdx >= game.numPlayers) {
                         card.threatBonus = totalCost;
+                        card._scavengersThreatBonus = totalCost;
                         engine.toast('Goblintown Scavengers', `Scavenged printed cost total: +${totalCost} Threat!`, 'danger', 3500);
                         engine.render();
                         if (cb) cb();
@@ -4901,170 +16332,316 @@ window.LotrExpansions['dark_of_nibin'] = {
                     const discardPile = (game.playerDiscards && game.playerDiscards[pIdx]) ? game.playerDiscards[pIdx] : game.playerDiscard;
 
                     if (deck && deck.length > 0) {
-                        const dropped = deck.pop();
-                        const cost = Number(dropped.cost) || 0;
-
                         const deckEl = document.getElementById('player-deck-pile');
                         const pDiscardEl = document.getElementById('player-discard-pile');
 
                         const startRect = deckEl ? deckEl.getBoundingClientRect() : { left: window.innerWidth - 120, top: window.innerHeight - 150, width: 100, height: 140 };
                         const discRect = pDiscardEl ? pDiscardEl.getBoundingClientRect() : { left: window.innerWidth - 120, top: window.innerHeight - 150, width: 100, height: 140 };
 
-                        const gCard = document.createElement('div');
-                        gCard.style.cssText = `
-                            position: fixed; z-index: 2200;
-                            width: ${baseW}px; height: ${baseH}px;
-                            left: ${startRect.left + (startRect.width - baseW) / 2}px;
-                            top: ${startRect.top + (startRect.height - baseH) / 2}px;
-                            transform: scale(${startRect.width / baseW});
-                            transform-origin: center;
+                        // 1. Throw dark, slender Orc machete matching capture.png to a random spot on the player's deck
+                        const sRect = ghostScav ? ghostScav.getBoundingClientRect() : { left: scavX, top: scavY, width: baseW * scale, height: baseH * scale };
+                        const mStartX = sRect.left + sRect.width / 2;
+                        const mStartY = sRect.top + sRect.height * 0.45;
+
+                        const randOffsetX = (Math.random() - 0.5) * (startRect.width * 0.15);
+                        const randOffsetY = (Math.random() - 0.5) * (startRect.height * 0.15);
+                        const mTargetX = startRect.left + startRect.width / 2 - 25 + randOffsetX;
+                        const mTargetY = startRect.top + startRect.height / 2 + randOffsetY;
+                        const embedAngle = -28 - Math.random() * 32;
+
+                        const machete = document.createElement('div');
+                        machete.style.cssText = `
+                            position: fixed; z-index: 100000;
+                            left: ${mStartX - 55}px; top: ${mStartY - 13}px;
+                            width: 110px; height: 26px;
+                            transform-origin: 55px 13px;
                             pointer-events: none;
-                            box-shadow: 0 10px 25px rgba(0,0,0,0.8);
-                            border-radius: 6px; overflow: hidden;
-                            transition: none;
+                            filter: drop-shadow(0 4px 10px rgba(0,0,0,0.95)) drop-shadow(0 0 4px rgba(0,0,0,0.8));
                         `;
-                        const cardImg = dropped.code ? `https://ringsdb.com/bundles/cards/${dropped.code}.png` : (dropped.img || 'cards/cardback.png');
-                        gCard.innerHTML = `<img src="${cardImg}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;" alt="${dropped.name}">`;
-                        gCard.className = 'card ' + (dropped.sphere || 'neutral');
-                        document.body.appendChild(gCard);
+                        machete.innerHTML = `
+                            <svg viewBox="0 0 140 32" width="110" height="26" style="overflow:visible;">
+                              <defs>
+                                <linearGradient id="scavDarkSteel" x1="0%" y1="100%" x2="0%" y2="0%">
+                                  <stop offset="0%" stop-color="#050505"/>
+                                  <stop offset="45%" stop-color="#18181b"/>
+                                  <stop offset="85%" stop-color="#3f3f46"/>
+                                  <stop offset="100%" stop-color="#52525b"/>
+                                </linearGradient>
+                                <linearGradient id="scavEdgeBevel" x1="0%" y1="0%" x2="100%" y2="0%">
+                                  <stop offset="0%" stop-color="#3f3f46"/>
+                                  <stop offset="75%" stop-color="#71717a"/>
+                                  <stop offset="95%" stop-color="#d4d4d8"/>
+                                  <stop offset="100%" stop-color="#f4f4f5"/>
+                                </linearGradient>
+                              </defs>
+                              <rect x="4" y="11.5" width="28" height="9" rx="1.5" fill="#18110b" transform="rotate(-3 18 16)"/>
+                              <line x1="10" y1="10.5" x2="9" y2="21.5" stroke="#090503" stroke-width="2"/>
+                              <line x1="16" y1="10.5" x2="15" y2="21.5" stroke="#090503" stroke-width="2"/>
+                              <line x1="22" y1="10.5" x2="21" y2="21.5" stroke="#090503" stroke-width="2"/>
+                              <line x1="28" y1="10.5" x2="27" y2="21.5" stroke="#090503" stroke-width="2"/>
+                              <rect x="31" y="9.5" width="4.5" height="13" rx="1" fill="#18181b" stroke="#09090b" stroke-width="1"/>
+                              <path d="M 35,11 L 115,8 L 136,15.5 L 126,21.5 L 35,21.5 Z" fill="url(#scavDarkSteel)" stroke="#09090b" stroke-width="1.4"/>
+                              <path d="M 36,20 L 126,20 L 135,15.5 L 124,18 L 36,18 Z" fill="url(#scavEdgeBevel)" opacity="0.85"/>
+                              <line x1="35" y1="21" x2="127" y2="21" stroke="#a1a1aa" stroke-width="1"/>
+                              <circle cx="4" cy="16" r="3.2" fill="#27272a" stroke="#09090b" stroke-width="1"/>
+                            </svg>
+                        `;
+                        document.body.appendChild(machete);
 
-                        void gCard.offsetWidth;
+                        try {
+                            const revealSnd = new Audio('./sound_effects/dark_of_mirkwood/goblintown_scavengers_reveal.mp3');
+                            const vol = document.getElementById('volume-slider');
+                            revealSnd.volume = vol ? parseFloat(vol.value) : 0.25;
+                            revealSnd.play().catch(() => {});
+                        } catch(e) {}
 
-                        if (window.SoundFX && window.SoundFX.playWhoosh) window.SoundFX.playWhoosh();
+                        const mStartTime = performance.now();
+                        const mDuration = 480;
 
-                        requestAnimationFrame(() => {
-                            requestAnimationFrame(() => {
-                                gCard.style.transition = 'all 0.5s cubic-bezier(0.25, 0.8, 0.25, 1)';
-                                gCard.style.left = `${pCardX}px`;
-                                gCard.style.top = `${pCardY}px`;
-                                gCard.style.transform = `scale(${scale})`;
-                            });
-                        });
+                        const animateMachete = (now) => {
+                            const elapsed = now - mStartTime;
+                            const p = Math.min(1, elapsed / mDuration);
+                            const curX = mStartX + (mTargetX - mStartX) * p;
+                            const curY = mStartY + (mTargetY - mStartY) * p - Math.sin(p * Math.PI) * 45;
+                            const rot = p * 1080 + embedAngle;
 
-                        setTimeout(() => {
-														const scavRect = ghostScav ? ghostScav.getBoundingClientRect() : null;
-														const pCardRect = gCard.getBoundingClientRect();
+                            machete.style.left = `${curX - 55}px`;
+                            machete.style.top = `${curY - 13}px`;
+                            machete.style.transform = `rotate(${rot}deg) scale(${0.85 + p * 0.25})`;
 
-														const tokenSize = baseW * scale * 0.38;
-														
-														const tokenStartX = pCardRect ? pCardRect.left - 10 : pCardX - 10;
-														const tokenStartY = pCardRect ? pCardRect.top - 10 : pCardY - 10;
+                            if (p < 1) {
+                                requestAnimationFrame(animateMachete);
+                            } else {
+                                if (deckEl) {
+                                    deckEl.style.transition = 'transform 0.08s ease-out';
+                                    deckEl.style.transform = 'translate(-3px, 2px) scale(1.05)';
+                                    setTimeout(() => { deckEl.style.transform = ''; }, 120);
+                                    if (engine.spawnBurstAtElement) engine.spawnBurstAtElement(deckEl, '#a1a1aa', 16);
+                                }
 
-														const tokenTargetX = scavRect ? (scavRect.left + (2 * scale)) : (scavX + (2 * scale));
-														const tokenTargetY = scavRect ? (scavRect.top + (2 * scale)) : (scavY + (2 * scale));
-
-														const threatImgUrl = 'tokens/threat_str.png';
-
-                            const token = document.createElement('div');
-                            token.style.cssText = `
-                                position: fixed; z-index: 2500;
-                                left: ${tokenStartX}px; top: ${tokenStartY}px;
-                                width: ${tokenSize}px; height: ${tokenSize}px;
-                                border-radius: 50%; background: rgba(0,0,0,0.85);
-                                border: 2px solid #ffb74d; box-shadow: 0 0 10px #ffb74d;
-                                display: flex; align-items: center; justify-content: center;
-                                pointer-events: none; opacity: 0;
-                                transform: scale(0.5); transition: none;
-                            `;
-                            token.innerHTML = `
-                                <img src="${threatImgUrl}" style="width:100%;height:100%;object-fit:contain;border-radius:50%;" alt="threat">
-                                <div style="position:absolute; top:50%; right:-20px; transform:translateY(-50%); background:#1a120b; border:2px solid #ffb74d; font-size:1.4rem; font-weight:bold; border-radius:4px; padding:2px 6px; color:#fff; font-family:'Cinzel',serif; box-shadow:0 2px 4px rgba(0,0,0,0.9);">+${cost}</div>
-                            `;
-                            document.body.appendChild(token);
-
-                            void token.offsetWidth;
-
-                            requestAnimationFrame(() => {
-                                requestAnimationFrame(() => {
-                                    token.style.opacity = '1';
-                                    token.style.transform = 'scale(1)';
-                                });
-                            });
-
-                            setTimeout(() => {
-                                token.style.transition = 'all 0.6s cubic-bezier(0.25, 0.8, 0.25, 1)';
-                                token.style.left = `${tokenTargetX}px`;
-                                token.style.top = `${tokenTargetY}px`;
-
-                                if (window.SoundFX && window.SoundFX.playWhoosh) window.SoundFX.playWhoosh();
+                                machete.style.transition = 'opacity 0.3s ease-out';
+                                machete.style.transform = `rotate(${embedAngle}deg) scale(1.02)`;
 
                                 setTimeout(() => {
-                                    token.remove();
-                                    totalCost += cost;
-                                    card.threatBonus = totalCost;
+                                    machete.style.opacity = '0';
+                                    setTimeout(() => machete.remove(), 320);
+                                }, 1000);
 
-                                    if (ghostScav) {
-                                        const targetCard = ghostScav.querySelector('.card');
-                                        if (targetCard) {
-                                            const existingToken = targetCard.querySelector('.buff-token');
-                                            if (existingToken) existingToken.remove();
+                                // 2. Card gets drawn ONLY AFTER the machete impacts the deck
+                                setTimeout(() => {
+                                    const dropped = deck.pop();
+                                    const cost = Number(dropped.cost) || 0;
 
-                                            const buffToken = document.createElement('div');
-                                            buffToken.className = 'buff-token';
-                                            buffToken.style.cssText = `
-                                                position: absolute;
-                                                top: 0%; left: 0%;
-                                                width: calc(var(--card-w) * 0.38);
-                                                height: calc(var(--card-w) * 0.38);
-                                                border-radius: 50%;
-                                                background: rgba(0,0,0,0.85);
-                                                border: calc(var(--card-w) * 0.008) solid #ffb74d;
-                                                box-shadow: 0 0 4px #ffb74d;
-                                                display: flex; align-items: center; justify-content: center;
-                                                z-index: 15;
-                                                pointer-events: none;
-                                            `;
-                                            buffToken.innerHTML = `
-                                                <img src="${threatImgUrl}" style="width:100%; height:100%; object-fit:contain; border-radius:50%;" alt="threat">
-                                                <div class="badge plus" style="position:absolute; top:50%; right:calc(var(--card-w) * -0.06); transform:translateY(-50%); background:#1a120b; border:calc(var(--card-w) * 0.008) solid #ffb74d; font-size:calc(var(--card-w) * 0.135); font-weight:bold; border-radius:3.5px; padding:calc(var(--card-w) * 0.015) calc(var(--card-w) * 0.035); white-space:nowrap; box-shadow:0 2px 4px rgba(0,0,0,0.95); color:#fff;">+${totalCost}</div>
-                                            `;
-                                            targetCard.appendChild(buffToken);
-                                        }
-                                        if (engine.window.spawnBurstAtElement) {
-                                            engine.window.spawnBurstAtElement(ghostScav, '#ffb74d', 25);
-                                        }
-                                    }
+                                    const gCard = document.createElement('div');
+                                    gCard.style.cssText = `
+                                        position: fixed; z-index: 2200;
+                                        width: ${baseW}px; height: ${baseH}px;
+                                        left: ${startRect.left + (startRect.width - baseW) / 2}px;
+                                        top: ${startRect.top + (startRect.height - baseH) / 2}px;
+                                        transform: scale(${startRect.width / baseW});
+                                        transform-origin: center;
+                                        pointer-events: none;
+                                        box-shadow: 0 10px 25px rgba(0,0,0,0.8);
+                                        border-radius: 6px; overflow: hidden;
+                                        transition: none;
+                                    `;
+                                    const cardImg = dropped.code ? `https://ringsdb.com/bundles/cards/${dropped.code}.png` : (dropped.img || 'cards/cardback.png');
+                                    gCard.innerHTML = `<img src="${cardImg}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;" alt="${dropped.name}">`;
+                                    gCard.className = 'card ' + (dropped.sphere || 'neutral');
+                                    document.body.appendChild(gCard);
 
-                                    engine.toast('Goblintown Scavengers', `Scavenged ${dropped.name} (Cost: ${cost})!`, 'danger', 2500);
+                                    void gCard.offsetWidth;
 
-                                    gCard.style.transition = 'all 0.85s cubic-bezier(0.25, 0.8, 0.25, 1)';
-                                    gCard.style.left = `${discRect.left + (discRect.width - baseW) / 2}px`;
-                                    gCard.style.top = `${discRect.top + (discRect.height - baseH) / 2}px`;
-                                    gCard.style.transform = `scale(${discRect.width / baseW})`;
-                                    gCard.style.opacity = '0.3';
-
-                                    if (window.SoundFX && window.SoundFX.playWhoosh) window.SoundFX.playWhoosh();
-
-                                    let nextActivePlayerIdx = pIdx + 1;
-                                    while (nextActivePlayerIdx < game.numPlayers && game.eliminated[nextActivePlayerIdx]) {
-                                        nextActivePlayerIdx++;
-                                    }
-                                    const isLastPlayer = (nextActivePlayerIdx >= game.numPlayers);
-
-                                    if (isLastPlayer) {
-                                        card.threatBonus = totalCost;
-                                        if (cb) {
-                                            const origCb = cb;
-                                            cb = null;
-                                            origCb();
-                                        }
-                                    }
+                                    requestAnimationFrame(() => {
+                                        requestAnimationFrame(() => {
+                                            gCard.style.transition = 'all 0.5s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                                            gCard.style.left = `${pCardX}px`;
+                                            gCard.style.top = `${pCardY}px`;
+                                            gCard.style.transform = `scale(${scale})`;
+                                        });
+                                    });
 
                                     setTimeout(() => {
-                                        gCard.remove();
-                                        if (engine.window.discardCard) {
-                                            engine.window.discardCard(dropped, discardPile, true);
-                                        } else {
-                                            discardPile.push(dropped);
-                                        }
-                                        engine.render();
+                                        const scavRect = ghostScav ? ghostScav.getBoundingClientRect() : null;
+                                        const pCardRect = gCard.getBoundingClientRect();
 
-                                        pIdx++;
-                                        setTimeout(processNextPlayer, 50);
-                                    }, 850);
-                                }, 600);
-                            }, 300);
-                        }, 500);
+                                        const tokenSize = baseW * scale * 0.38;
+                                        const tokenStartX = pCardRect ? pCardRect.left - 10 : pCardX - 10;
+                                        const tokenStartY = pCardRect ? pCardRect.top - 10 : pCardY - 10;
+
+                                        const scavH = scavRect ? scavRect.height : (baseH * scale);
+                                        const tokenTargetX = scavRect ? (scavRect.left - (2 * scale)) : (scavX - (2 * scale));
+                                        const tokenTargetY = scavRect ? (scavRect.top + (scavH * 0.145)) : (scavY + (baseH * scale * 0.145));
+
+                                        const threatImgUrl = 'tokens/threat_str.png';
+
+                                        try {
+                                            const tokenSnd = new Audio('./sound_effects/dark_of_mirkwood/goblintown_scavengers_threat_token.mp3');
+                                            const volSlider = document.getElementById('volume-slider');
+                                            tokenSnd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                                            tokenSnd.play().catch(() => {});
+                                        } catch(e) {}
+
+                                        // 3. Reverse-disintegration materialization
+                                        const tokenCenterWorldX = tokenStartX + tokenSize / 2;
+                                        const tokenCenterWorldY = tokenStartY + tokenSize / 2;
+                                        const emberCount = 14;
+
+                                        const shardContainer = document.createElement('div');
+                                        shardContainer.style.cssText = 'position:fixed; inset:0; pointer-events:none; z-index:100006; overflow:visible;';
+                                        document.body.appendChild(shardContainer);
+
+                                        for (let i = 0; i < emberCount; i++) {
+                                            const rad = (i / emberCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
+                                            const dist = 42 + Math.random() * 36;
+                                            const ex = tokenCenterWorldX + Math.cos(rad) * dist;
+                                            const ey = tokenCenterWorldY + Math.sin(rad) * dist;
+                                            const shardSize = 4 + Math.random() * 3.5;
+
+                                            const shard = document.createElement('div');
+                                            shard.style.cssText = `
+                                                position: fixed;
+                                                left: ${ex}px; top: ${ey}px;
+                                                width: ${shardSize}px; height: ${shardSize}px;
+                                                background: linear-gradient(135deg, #ffffff, #ffb74d);
+                                                clip-path: polygon(0 20%, 80% 0, 100% 80%, 20% 100%);
+                                                border-radius: 2px;
+                                                filter: drop-shadow(0 0 6px #ffb74d);
+                                                pointer-events: none; opacity: 0.95;
+                                                transform: rotate(${Math.random() * 360}deg) scale(0.65);
+                                                transition: left 0.42s cubic-bezier(0.15, 0.85, 0.25, 1), top 0.42s cubic-bezier(0.15, 0.85, 0.25, 1), transform 0.42s ease-in, opacity 0.4s ease-in;
+                                            `;
+                                            shardContainer.appendChild(shard);
+
+                                            requestAnimationFrame(() => {
+                                                shard.style.left = `${tokenCenterWorldX - shardSize / 2}px`;
+                                                shard.style.top = `${tokenCenterWorldY - shardSize / 2}px`;
+                                                shard.style.transform = `rotate(180deg) scale(0.1)`;
+                                                shard.style.opacity = '0';
+                                            });
+                                        }
+
+                                        setTimeout(() => shardContainer.remove(), 450);
+
+                                        const token = document.createElement('div');
+                                        token.style.cssText = `
+                                            position: fixed; z-index: 100005;
+                                            left: ${tokenStartX}px; top: ${tokenStartY}px;
+                                            width: ${tokenSize}px; height: ${tokenSize}px;
+                                            border-radius: 50%; background: rgba(0,0,0,0.85);
+                                            border: 2px solid #ffb74d; box-shadow: 0 0 10px #ffb74d;
+                                            display: flex; align-items: center; justify-content: center;
+                                            pointer-events: none; opacity: 0;
+                                            transform: scale(0.3);
+                                            filter: brightness(2.2) contrast(1.8) drop-shadow(0 0 16px #ffb74d);
+                                            clip-path: circle(0% at 50% 50%);
+                                            transition: clip-path 0.5s cubic-bezier(0.15, 0.85, 0.25, 1), transform 0.5s cubic-bezier(0.15, 0.85, 0.25, 1), opacity 0.35s ease-out, filter 0.5s ease-out;
+                                        `;
+                                        token.innerHTML = `
+                                            <img src="${threatImgUrl}" style="width:100%;height:100%;object-fit:contain;border-radius:50%;" alt="threat">
+                                            <div style="position:absolute; top:50%; right:-20px; transform:translateY(-50%); background:#1a120b; border:2px solid #ffb74d; font-size:1.4rem; font-weight:bold; border-radius:4px; padding:2px 6px; color:#fff; font-family:'Cinzel',serif; box-shadow:0 2px 4px rgba(0,0,0,0.9);">+${cost}</div>
+                                        `;
+                                        document.body.appendChild(token);
+
+                                        void token.offsetWidth;
+
+                                        requestAnimationFrame(() => {
+                                            requestAnimationFrame(() => {
+                                                token.style.opacity = '1';
+                                                token.style.transform = 'scale(1)';
+                                                token.style.clipPath = 'circle(100% at 50% 50%)';
+                                                token.style.filter = 'brightness(1) contrast(1) drop-shadow(0 0 8px #ffb74d)';
+                                            });
+                                        });
+
+                                        setTimeout(() => {
+                                            token.style.transition = 'all 0.6s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                                            token.style.left = `${tokenTargetX}px`;
+                                            token.style.top = `${tokenTargetY}px`;
+
+                                            setTimeout(() => {
+                                                token.remove();
+                                                totalCost += cost;
+                                                card.threatBonus = totalCost;
+                                                card._scavengersThreatBonus = totalCost;
+
+                                                if (ghostScav) {
+                                                    const targetCard = ghostScav.querySelector('.card');
+                                                    if (targetCard) {
+                                                        const existingToken = targetCard.querySelector('.buff-token');
+                                                        if (existingToken) existingToken.remove();
+
+                                                        const buffToken = document.createElement('div');
+                                                        buffToken.className = 'buff-token';
+                                                        buffToken.style.cssText = `
+                                                            position: absolute;
+                                                            top: 14.5%; left: 0%;
+                                                            width: calc(var(--card-w) * 0.38);
+                                                            height: calc(var(--card-w) * 0.38);
+                                                            border-radius: 50%;
+                                                            background: rgba(0,0,0,0.85);
+                                                            border: calc(var(--card-w) * 0.008) solid #ffb74d;
+                                                            box-shadow: 0 0 4px #ffb74d;
+                                                            display: flex; align-items: center; justify-content: center;
+                                                            z-index: 15;
+                                                            pointer-events: none;
+                                                        `;
+                                                        buffToken.innerHTML = `
+                                                            <img src="${threatImgUrl}" style="width:100%; height:100%; object-fit:contain; border-radius:50%;" alt="threat">
+                                                            <div class="badge plus" style="position:absolute; top:50%; right:calc(var(--card-w) * -0.06); transform:translateY(-50%); background:#1a120b; border:calc(var(--card-w) * 0.008) solid #ffb74d; font-size:calc(var(--card-w) * 0.135); font-weight:bold; border-radius:3.5px; padding:calc(var(--card-w) * 0.015) calc(var(--card-w) * 0.035); white-space:nowrap; box-shadow:0 2px 4px rgba(0,0,0,0.95); color:#fff;">+${totalCost}</div>
+                                                        `;
+                                                        targetCard.appendChild(buffToken);
+                                                    }
+                                                    if (engine.window.spawnBurstAtElement) {
+                                                        engine.window.spawnBurstAtElement(ghostScav, '#ffb74d', 25);
+                                                    }
+                                                }
+
+                                                engine.toast('Goblintown Scavengers', `Scavenged ${dropped.name} (Cost: ${cost})!`, 'danger', 2500);
+
+                                                gCard.style.transition = 'all 0.85s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                                                gCard.style.left = `${discRect.left + (discRect.width - baseW) / 2}px`;
+                                                gCard.style.top = `${discRect.top + (discRect.height - baseH) / 2}px`;
+                                                gCard.style.transform = `scale(${discRect.width / baseW})`;
+                                                gCard.style.opacity = '0.3';
+
+                                                let nextActivePlayerIdx = pIdx + 1;
+                                                while (nextActivePlayerIdx < game.numPlayers && game.eliminated[nextActivePlayerIdx]) {
+                                                    nextActivePlayerIdx++;
+                                                }
+                                                const isLastPlayer = (nextActivePlayerIdx >= game.numPlayers);
+
+                                                if (isLastPlayer) {
+                                                    card.threatBonus = totalCost;
+                                                    card._scavengersThreatBonus = totalCost;
+                                                    if (cb) {
+                                                        const origCb = cb;
+                                                        cb = null;
+                                                        origCb();
+                                                    }
+                                                } else {
+                                                    setTimeout(() => {
+                                                        pIdx++;
+                                                        processNextPlayer();
+                                                    }, 300);
+                                                }
+
+                                                setTimeout(() => {
+                                                    gCard.remove();
+                                                    if (engine.window.discardCard) {
+                                                        engine.window.discardCard(dropped, discardPile, true);
+                                                    } else {
+                                                        discardPile.push(dropped);
+                                                    }
+                                                    engine.render();
+                                                }, 850);
+                                            }, 600);
+                                        }, 550);
+                                    }, 500);
+                                }, 90);
+                            }
+                        };
+                        requestAnimationFrame(animateMachete);
                     } else {
                         pIdx++;
                         processNextPlayer();
@@ -5078,19 +16655,24 @@ window.LotrExpansions['dark_of_nibin'] = {
             id: 'nibin_goblins_are_upon_you', name: 'Goblins are Upon You!', type: 'treachery', sphere: 'encounter-treachery', portrait: '👺', copies: 1,
             img: 'cards/dark_of_mirkwood/caves_of_nibin/goblins_are_upon_you.jpg',
             text: 'When Revealed: Each player must search the encounter deck and discard pile for a Goblin enemy and put it into play, engaged with him. Then, shuffle the encounter deck. (This effect cannot be canceled.)\nShadow: Attacking enemy gets +1 Attack for each Goblin enemy engaged with you.',
+            shadow: 'Shadow: Attacking enemy gets +1 Attack for each Goblin enemy engaged with you.',
             onReveal: function(card, game, engine, cb) {
                 let pIdx = 0;
                 const processNext = () => {
                     while(pIdx < game.numPlayers && game.eliminated[pIdx]) pIdx++;
                     if(pIdx >= game.numPlayers) {
                         game.encounterDeck = engine.shuffle(game.encounterDeck);
+                        if (engine.window._animateDeckShuffle) {
+                            engine.window._animateDeckShuffle('Encounter Deck', 'Shuffled after Goblins are Upon You!');
+                        }
                         if(cb) cb();
                         return;
                     }
                     if (game.activeTabPlayerIdx !== pIdx) engine.window._switchTab(pIdx);
                     const goblins = [...game.encounterDeck, ...game.encounterDiscard].filter(x => (x.trait||'').includes('Goblin'));
                     if(goblins.length > 0) {
-                        engine.showCardPicker('Goblins are Upon You!', `Player ${pIdx+1}: Choose a Goblin enemy to engage:`, goblins, (chosen) => {
+                        const promptText = `<span style="font-size:1.6rem; font-weight:600; color:var(--gold-bright); display:block; margin-bottom:12px; line-height:1.35; text-align:center;">Player ${pIdx+1}: Choose a Goblin enemy to engage:</span>`;
+                        engine.showCardPicker('Goblins are Upon You!', promptText, goblins, (chosen) => {
                             if(chosen){
                                 let idx = game.encounterDeck.findIndex(x => x._uid === chosen._uid);
                                 if(idx >= 0) game.encounterDeck.splice(idx, 1);
@@ -5098,72 +16680,178 @@ window.LotrExpansions['dark_of_nibin'] = {
                                     idx = game.encounterDiscard.findIndex(x => x._uid === chosen._uid);
                                     if(idx >= 0) game.encounterDiscard.splice(idx, 1);
                                 }
-                                
-                                const startRect = engine.window._lastPickerRect;
-                                const finalizeEngage = () => {
-                                    chosen._engagedWithPlayerIdx = pIdx;
-                                    game.engagedEnemies.push(chosen);
-                                    engine.toast('Goblins are Upon You!', `Player ${pIdx+1} engaged ${chosen.name}.`, 'danger');
-                                    engine.render();
-                                    pIdx++; processNext();
+                                chosen._engagedWithPlayerIdx = pIdx;
+                                if (engine.window && engine.window.cardPositions) {
+                                    delete engine.window.cardPositions[chosen._uid];
+                                }
+
+                                const startRect = engine.window._lastPickerRect || {
+                                    left: window.innerWidth / 2 - 72,
+                                    top: window.innerHeight / 2 - 101,
+                                    width: 144,
+                                    height: 202
                                 };
 
-                                if (startRect) {
-                                    const engagedZone = document.getElementById('engaged-content');
-                                    let destRect = null;
-                                    if (engagedZone) {
-                                        const hasPlaceholder = game.engagedEnemies.length === 0;
-                                        const originalHTML = engagedZone.innerHTML;
-                                        if (hasPlaceholder) engagedZone.innerHTML = '';
-                                        const stub = document.createElement('div');
-                                        stub.className = 'card';
-                                        stub.style.visibility = 'hidden';
-                                        stub.style.margin = '0';
-                                        engagedZone.appendChild(stub);
-                                        destRect = stub.getBoundingClientRect();
-                                        stub.remove();
-                                        if (hasPlaceholder) engagedZone.innerHTML = originalHTML;
-                                    }
-                                    if (destRect) {
-                                        const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
-                                        const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
-                                        const ghost = document.createElement('div');
-                                        ghost.style.cssText = `
-                                            position: fixed; z-index: 2000;
-                                            width: ${cardW}px; height: ${cardH}px;
-                                            left: ${startRect.left}px; top: ${startRect.top}px;
-                                            transform: scale(${startRect.width / cardW});
-                                            transform-origin: top left;
-                                            transition: all 0.6s cubic-bezier(0.25, 0.8, 0.25, 1);
-                                            pointer-events: none;
-                                            box-shadow: 0 10px 25px rgba(0,0,0,0.7);
-                                            border-radius: 6px; overflow: hidden;
-                                        `;
-                                        const cardImg = chosen.img ? chosen.img : (chosen.code ? `https://ringsdb.com/bundles/cards/${chosen.code}.png` : `https://hallofbeorn.com/Images/Cards/Core-Set/${chosen.name.replace(/ /g, '-').replace(/'/g, '')}.jpg`);
-                                        ghost.innerHTML = `<img src="${cardImg}" style="width:100%;height:100%;object-fit:cover;border-radius:4px;" alt="${chosen.name}">`;
-                                        ghost.className = `card ${chosen.sphere || 'encounter-enemy'}`;
-                                        document.body.appendChild(ghost);
-                                        void ghost.offsetWidth;
-
-                                        const targetScale = destRect.width / cardW;
-                                        ghost.style.left = `${destRect.left}px`;
-                                        ghost.style.top = `${destRect.top}px`;
-                                        ghost.style.transform = `scale(${targetScale})`;
-
-                                        if (window.SoundFX) window.SoundFX.playWhoosh();
-
-                                        setTimeout(() => {
-                                            ghost.remove();
-                                            finalizeEngage();
-                                        }, 600);
-                                    } else {
-                                        finalizeEngage();
-                                    }
-                                } else {
-                                    finalizeEngage();
+                                const engagedZone = document.getElementById('engaged-content');
+                                let destRect = null;
+                                if (engagedZone) {
+                                    const hasPlaceholder = game.engagedEnemies.length === 0;
+                                    const originalHTML = engagedZone.innerHTML;
+                                    if (hasPlaceholder) engagedZone.innerHTML = '';
+                                    const stub = document.createElement('div');
+                                    stub.className = 'card';
+                                    stub.style.visibility = 'hidden';
+                                    stub.style.margin = '0';
+                                    engagedZone.appendChild(stub);
+                                    destRect = stub.getBoundingClientRect();
+                                    stub.remove();
+                                    if (hasPlaceholder) engagedZone.innerHTML = originalHTML;
                                 }
+                                if (!destRect) {
+                                    destRect = { left: window.innerWidth / 2 - 72, top: window.innerHeight / 2, width: 144, height: 202 };
+                                }
+
+                                const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
+                                const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
+                                const startScale = startRect.width / cardW;
+                                const targetScaleX = destRect.width / cardW;
+                                const targetScaleY = destRect.height / cardH;
+
+                                const startCenterX = startRect.left + startRect.width / 2;
+                                const startCenterY = startRect.top + startRect.height / 2;
+                                const destCenterX = destRect.left + destRect.width / 2;
+                                const destCenterY = destRect.top + destRect.height / 2;
+
+                                let cardImg = chosen.img || '';
+                                if (cardImg) {
+                                    if (!cardImg.startsWith('http') && !cardImg.startsWith('cards/') && !cardImg.startsWith('./') && !cardImg.startsWith('/')) {
+                                        cardImg = `https://drive.google.com/thumbnail?id=${cardImg}&sz=w400`;
+                                    }
+                                } else if (chosen.code) {
+                                    cardImg = `https://ringsdb.com/bundles/cards/${chosen.code}.png`;
+                                } else {
+                                    let cleanName = (chosen.name || '').replace(/ /g, '-').replace(/'/g, '');
+                                    cardImg = `https://hallofbeorn.com/Images/Cards/Core-Set/${cleanName}.jpg`;
+                                }
+                                if (window.appLang === 'zh' && window.ZH_IMAGES && window.ZH_IMAGES[chosen.id || chosen.code]) {
+                                    cardImg = window.ZH_IMAGES[chosen.id || chosen.code];
+                                }
+                                let cleanName = (chosen.name || '').replace(/ /g, '-').replace(/'/g, '');
+                                let fallback = `https://hallofbeorn.com/Images/Cards/Core-Set/${cleanName}.jpg`;
+
+                                const ghost = document.createElement('div');
+                                ghost.style.cssText = `
+                                    position: fixed; z-index: 100005;
+                                    left: ${startCenterX - cardW / 2}px; top: ${startCenterY - cardH / 2}px;
+                                    width: ${cardW}px; height: ${cardH}px;
+                                    transform-origin: center center;
+                                    transform: scale(${startScale});
+                                    pointer-events: none;
+                                    overflow: visible;
+                                `;
+
+                                ghost.innerHTML = `
+                                    <style>
+                                        @keyframes goblinGodRaysSpin {
+                                            0% { transform: rotate(0deg); }
+                                            100% { transform: rotate(360deg); }
+                                        }
+                                        @keyframes goblinGodRaysPulse {
+                                            0%, 100% { opacity: 0.9; filter: blur(3px) drop-shadow(0 0 16px #ff2222) drop-shadow(0 0 32px #dc2626); }
+                                            50% { opacity: 1; filter: blur(2.5px) drop-shadow(0 0 24px #ff4444) drop-shadow(0 0 45px #ef4444); }
+                                        }
+                                        @keyframes goblinShockwave {
+                                            0% { transform: translate(-50%, -50%) scale(0.3); opacity: 1; border-width: 3px; }
+                                            100% { transform: translate(-50%, -50%) scale(1.35); opacity: 0; border-width: 1px; }
+                                        }
+                                        @keyframes goblinEmberRise {
+                                            0% { transform: translate(0, 0) scale(1); opacity: 0; }
+                                            25% { opacity: 1; }
+                                            100% { transform: translate(var(--edrift, 8px), -80px) scale(0.2); opacity: 0; }
+                                        }
+                                    </style>
+                                    <div style="position:absolute; left:50%; top:50%; width:240px; height:240px; border-radius:50%; border:2px solid #ff4444; box-shadow:0 0 14px #ef4444, inset 0 0 10px #ffffff; animation:goblinShockwave 0.65s cubic-bezier(0.16, 1, 0.3, 1) forwards; pointer-events:none;"></div>
+                                    <div class="goblin-god-rays" style="position:absolute; left:50%; top:50%; width:360px; height:360px; margin-left:-180px; margin-top:-180px; pointer-events:none; z-index:-1; opacity:0; transition:opacity 0.4s ease-out, transform 0.4s ease-out; animation:goblinGodRaysPulse 0.5s ease-in-out infinite alternate;">
+                                        <div style="position:absolute; inset:0; border-radius:50%; background:conic-gradient(from 0deg, transparent 0deg, rgba(255,255,255,0.95) 10deg, rgba(239,68,68,0.85) 18deg, transparent 32deg, transparent 48deg, rgba(254,202,202,0.85) 58deg, rgba(220,38,38,0.75) 75deg, transparent 88deg, transparent 110deg, rgba(255,255,255,0.9) 118deg, rgba(239,68,68,0.8) 128deg, transparent 142deg, transparent 168deg, rgba(248,113,113,0.7) 180deg, rgba(185,28,28,0.6) 205deg, transparent 220deg, transparent 242deg, rgba(255,255,255,0.95) 252deg, rgba(239,68,68,0.85) 268deg, transparent 282deg, transparent 315deg, rgba(254,202,202,0.85) 326deg, rgba(220,38,38,0.75) 342deg, transparent 355deg); -webkit-mask-image:radial-gradient(circle, black 20%, rgba(0,0,0,0.75) 38%, rgba(0,0,0,0.2) 52%, transparent 68%); mask-image:radial-gradient(circle, black 20%, rgba(0,0,0,0.75) 38%, rgba(0,0,0,0.2) 52%, transparent 68%); animation:goblinGodRaysSpin 4s linear infinite;"></div>
+                                        <div style="position:absolute; inset:12px; border-radius:50%; background:conic-gradient(from 40deg, transparent 0deg, rgba(254,226,226,0.85) 14deg, rgba(239,68,68,0.6) 30deg, transparent 45deg, transparent 85deg, rgba(255,255,255,0.9) 98deg, rgba(220,38,38,0.7) 116deg, transparent 132deg, transparent 175deg, rgba(254,202,202,0.8) 190deg, rgba(239,68,68,0.65) 212deg, transparent 228deg, transparent 270deg, rgba(255,255,255,0.9) 282deg, rgba(220,38,38,0.7) 302deg, transparent 318deg); -webkit-mask-image:radial-gradient(circle, black 16%, rgba(0,0,0,0.65) 35%, transparent 62%); mask-image:radial-gradient(circle, black 16%, rgba(0,0,0,0.65) 35%, transparent 62%); animation:goblinGodRaysSpin 2.6s linear infinite reverse;"></div>
+                                    </div>
+                                    <div style="position:absolute; inset:0; pointer-events:none; overflow:visible;">
+                                        <div style="position:absolute; left:26%; bottom:20px; width:3.5px; height:3.5px; border-radius:50%; background:#fef08a; box-shadow:0 0 6px #ef4444, 0 0 10px #f97316; --edrift:-12px; animation:goblinEmberRise 1.1s 0.05s ease-out infinite;"></div>
+                                        <div style="position:absolute; left:48%; bottom:16px; width:4px; height:4px; border-radius:50%; background:#fff; box-shadow:0 0 6px #ef4444, 0 0 12px #f43f5e; --edrift:15px; animation:goblinEmberRise 1.3s 0.15s ease-out infinite;"></div>
+                                        <div style="position:absolute; left:72%; bottom:22px; width:3px; height:3px; border-radius:50%; background:#fef08a; box-shadow:0 0 5px #ef4444, 0 0 8px #f97316; --edrift:-8px; animation:goblinEmberRise 1.0s 0.25s ease-out infinite;"></div>
+                                        <div style="position:absolute; left:38%; bottom:28px; width:3.5px; height:3.5px; border-radius:50%; background:#fca5a5; box-shadow:0 0 6px #ef4444; --edrift:10px; animation:goblinEmberRise 1.2s 0.35s ease-out infinite;"></div>
+                                    </div>
+                                    <div class="card ${chosen.sphere || 'encounter-enemy'}" style="width:100%; height:100%; margin:0; border-radius:6px; border:2.5px solid #ff4444; box-shadow:0 0 25px #ef4444, 0 0 50px rgba(220,38,38,0.7), inset 0 0 16px rgba(255,255,255,0.7); background:linear-gradient(180deg, #3a1a1a 0%, #1a0a0a 100%); overflow:hidden;">
+                                        <img src="${cardImg}" onerror="if(this.src!=='${fallback}')this.src='${fallback}'" style="width:100%;height:100%;object-fit:cover;display:block;">
+                                    </div>
+                                `;
+
+                                document.body.appendChild(ghost);
+                                const raysEl = ghost.querySelector('.goblin-god-rays');
+
+                                if (typeof window.playForestSpiderPowerUpAudio === 'function') {
+                                    window.playForestSpiderPowerUpAudio();
+                                }
+
+                                requestAnimationFrame(() => {
+                                    ghost.style.transition = 'transform 0.38s cubic-bezier(0.18, 0.89, 0.32, 1.28)';
+                                    ghost.style.transform = `scale(${startScale * 1.12})`;
+                                    if (raysEl) raysEl.style.opacity = '1';
+                                });
+
+                                setTimeout(() => {
+                                    if (raysEl) {
+                                        raysEl.style.opacity = '0';
+                                        raysEl.style.transform = 'scale(0.65)';
+                                    }
+                                    if (typeof window.playGoblinsAreUponYouPickedAudio === 'function') {
+                                        window.playGoblinsAreUponYouPickedAudio();
+                                    }
+
+                                    ghost.style.transition = 'left 0.62s cubic-bezier(0.25, 0.8, 0.25, 1), top 0.62s cubic-bezier(0.25, 0.8, 0.25, 1), transform 0.62s cubic-bezier(0.25, 0.8, 0.25, 1)';
+                                    ghost.style.left = `${destCenterX - cardW / 2}px`;
+                                    ghost.style.top = `${destCenterY - cardH / 2}px`;
+                                    ghost.style.transform = `scale(${targetScaleX}, ${targetScaleY})`;
+
+                                    setTimeout(() => {
+                                        const auraOverlay = document.createElement('div');
+                                        auraOverlay.style.cssText = `
+                                            position: fixed; z-index: 10000;
+                                            left: ${destRect.left}px; top: ${destRect.top}px;
+                                            width: ${destRect.width}px; height: ${destRect.height}px;
+                                            border-radius: 6px;
+                                            border: 2.5px solid #ff4444;
+                                            box-shadow: 0 0 25px #ef4444, 0 0 50px rgba(220,38,38,0.7), inset 0 0 16px rgba(255,255,255,0.7);
+                                            pointer-events: none;
+                                            opacity: 1;
+                                            transition: opacity 0.65s ease-out, box-shadow 0.65s ease-out, border-color 0.65s ease-out;
+                                        `;
+                                        document.body.appendChild(auraOverlay);
+
+                                        ghost.remove();
+                                        game.engagedEnemies.push(chosen);
+                                        engine.toast('Goblins are Upon You!', `Player ${pIdx+1} engaged ${chosen.name}.`, 'danger');
+                                        if (engine.spawnBurstAtElement) {
+                                            engine.spawnBurstAtElement(auraOverlay, '#ef4444', 25);
+                                        }
+                                        engine.render();
+
+                                        requestAnimationFrame(() => {
+                                            requestAnimationFrame(() => {
+                                                auraOverlay.style.opacity = '0';
+                                                auraOverlay.style.boxShadow = '0 0 0px rgba(239, 68, 68, 0)';
+                                                auraOverlay.style.borderColor = 'rgba(255, 68, 68, 0)';
+                                            });
+                                        });
+                                        setTimeout(() => auraOverlay.remove(), 700);
+
+                                        pIdx++;
+                                        processNext();
+                                    }, 650);
+                                }, 420);
                             } else {
-                                pIdx++; processNext();
+                                pIdx++;
+                                processNext();
                             }
                         }, true);
                     } else {
@@ -5172,6 +16860,24 @@ window.LotrExpansions['dark_of_nibin'] = {
                     }
                 };
                 processNext();
+            },
+            onShadow: function(shadow, enemy, defChars, game, engine, next) {
+                const targetPIdx = enemy._engagedWithPlayerIdx !== undefined ? enemy._engagedWithPlayerIdx : game.activeTabPlayerIdx;
+                const goblinCount = game.engagedEnemies.filter(e => (e.trait||'').includes('Goblin') && (e._engagedWithPlayerIdx === undefined ? 0 : e._engagedWithPlayerIdx) === targetPIdx).length;
+                enemy.attackBonus = (enemy.attackBonus || 0) + goblinCount;
+                if (goblinCount > 0) {
+                    if (typeof window.playForestSpiderPowerUpAudio === 'function') {
+                        window.playForestSpiderPowerUpAudio();
+                    }
+                    if (typeof window.triggerForestSpiderPowerUp === 'function') {
+                        window.triggerForestSpiderPowerUp(enemy._uid, 'red');
+                    }
+                }
+                engine.toast('Shadow Effect', `${shadow.name}: Attacking enemy +${goblinCount} ⚔`, 'danger', 2800);
+                engine.render();
+                setTimeout(() => {
+                    next();
+                }, goblinCount > 0 ? 350 : 0);
             }
         },
         {
@@ -5179,13 +16885,19 @@ window.LotrExpansions['dark_of_nibin'] = {
             img: 'cards/dark_of_mirkwood/caves_of_nibin/eyes_in_the_dark.jpg',
             text: 'Doomed 1. When Revealed: Each player must choose: Either raise your threat by 1 for each questing character you control, or discard a questing character you control.\nShadow: If this attack is undefended, discard an ally you control.',
             onReveal: function(card, game, engine, cb) {
-                // 1. Doomed 1 Application
+                try {
+                    const snd = new Audio('./sound_effects/threat_increase.mp3');
+                    const volSlider = document.getElementById('volume-slider');
+                    snd.volume = volSlider ? parseFloat(volSlider.value) : 0.25;
+                    snd.play().catch(()=>{});
+                } catch(e) {}
                 for(let p=0; p<game.numPlayers; p++) if(!game.eliminated[p]) game.threats[p]++;
                 if (game.numPlayers === 1) game.threat++;
-                engine.toast('Doomed 1', 'Threat increased by 1.', 'danger');
-                
-                // 2. Doomed 1 Cinematic
+                engine.spawnBurstAtElement(document.getElementById('hud-threat'), '#c0392b', 15);
+                engine.toast('Eyes in the Dark', 'Doomed 1.', 'danger');
+
                 const overlay = document.createElement('div');
+                overlay.id = 'doomed-threat-overlay-eyes';
                 overlay.style.cssText = 'position:fixed; inset:0; z-index:99999; display:flex; flex-direction:column; align-items:center; justify-content:center; background:rgba(200,0,0,0.45); pointer-events:none; transition: background 0.3s ease-out;';
                 
                 const bigText = document.createElement('div');
@@ -5194,9 +16906,7 @@ window.LotrExpansions['dark_of_nibin'] = {
                 overlay.appendChild(bigText);
                 document.body.appendChild(overlay);
                 
-                if (engine.window && engine.window.screenShake) engine.window.screenShake(18, 500);
-                const hudThreat = document.getElementById('hud-threat');
-                if (hudThreat && engine.window && engine.window.spawnBurstAtElement) engine.window.spawnBurstAtElement(hudThreat, '#c0392b', 15);
+                if (engine.screenShake) engine.screenShake(18, 500);
                 
                 setTimeout(() => {
                     bigText.style.transform = 'scale(1)';
@@ -5207,7 +16917,6 @@ window.LotrExpansions['dark_of_nibin'] = {
                     overlay.style.background = 'rgba(200,0,0,0)';
                     bigText.style.transform = 'scale(1.2) translateY(-100px)';
                     bigText.style.opacity = '0';
-                    setTimeout(() => overlay.remove(), 400);
                     
                     const diffEl = document.getElementById('hud-threat-diff');
                     if (diffEl) {
@@ -5215,166 +16924,98 @@ window.LotrExpansions['dark_of_nibin'] = {
                         diffEl.classList.remove('threat-diff-active');
                         void diffEl.offsetWidth;
                         diffEl.classList.add('threat-diff-active');
-                        setTimeout(() => { diffEl.classList.remove('threat-diff-active'); diffEl.textContent = ''; }, 3500);
+                        
+                        setTimeout(() => {
+                            diffEl.classList.remove('threat-diff-active');
+                            diffEl.textContent = '';
+                        }, 3500);
                     }
                     
                     for(let p=0; p<game.numPlayers; p++) {
-                        if (game.threats[p] >= 50 && engine.eliminatePlayer) engine.eliminatePlayer(p);
+                        if (game.threats && game.threats[p] >= 50) engine.eliminatePlayer(p);
                     }
                     
-                    // Proceed to player choices
                     setTimeout(() => {
+                        overlay.remove();
+                        
                         let pIdx = 0;
-                        const destroyedAlliesQueue = [];
                         const processNext = () => {
                             while(pIdx < game.numPlayers && game.eliminated[pIdx]) pIdx++;
                             if(pIdx >= game.numPlayers) {
-                                const resolveDeferredVS = () => {
-                                    if (destroyedAlliesQueue.length > 0) {
-                                        if (engine.window && engine.window.onAllyLeftPlay) {
-                                            engine.window.onAllyLeftPlay(destroyedAlliesQueue, () => {
-                                                destroyedAlliesQueue.length = 0;
-                                                if (cb) cb();
-                                            });
-                                        } else { if (cb) cb(); }
-                                    } else {
-                                        if(cb) cb();
-                                    }
-                                };
-                                resolveDeferredVS();
+                                if(cb) cb();
                                 return;
                             }
-                            
                             if (game.activeTabPlayerIdx !== pIdx && engine.window && engine.window._switchTab) {
                                 engine.window._switchTab(pIdx);
                             }
-                            const questing = game.selectedHeroIds.map(uid => [...game.heroes, ...game.allies].find(c => c._uid === uid)).filter(c => c && (c._ownerIdx === undefined ? 0 : c._ownerIdx) === pIdx);
-                            
+                            const questing = (game.selectedHeroIds || []).map(uid => [...game.heroes, ...game.allies].find(c => c._uid === uid)).filter(c => c && (c._ownerIdx === undefined ? 0 : c._ownerIdx) === pIdx);
+
                             if(questing.length > 0) {
                                 const promptHTML = `
-                                  <div style="font-size:1.6rem;line-height:1.5;color:var(--parchment);text-align:center;">
-                                    <span style="font-size:2.2rem;font-weight:bold;color:var(--gold-bright);display:block;margin-bottom:15px;">Eyes in the Dark</span>
-                                    Player ${pIdx+1}: Choose to either raise your threat by ${questing.length}, or discard a questing character you control:
-                                  </div>
+                                    <div style="font-size:1.6rem;line-height:1.5;color:var(--parchment);text-align:center;">
+                                        <span style="font-size:2.2rem;font-weight:bold;color:var(--gold-bright);display:block;margin-bottom:15px;">Eyes in the Dark</span>
+                                        Player ${pIdx+1}: Choose to either raise your threat by ${questing.length}, or discard a questing character you control:
+                                    </div>
                                 `;
-                                if (engine.window && engine.window.showChoiceModal) {
-                                    engine.window.showChoiceModal('Eyes in the Dark', promptHTML, [
-                                        {label: `Raise Threat by ${questing.length}`, cb: () => {
-                                           game.threats[pIdx] += questing.length;
-                                           if (game.numPlayers === 1) game.threat += questing.length;
-                                           engine.toast('Eyes in the Dark', `Player ${pIdx+1} threat raised by ${questing.length}.`, 'danger');
-                                           
-                                           // Threat cinematic
-                                           const overlay2 = document.createElement('div');
-                                           overlay2.style.cssText = 'position:fixed; inset:0; z-index:99999; display:flex; flex-direction:column; align-items:center; justify-content:center; background:rgba(200,0,0,0.45); pointer-events:none; transition: background 0.3s ease-out;';
-                                           const bigText2 = document.createElement('div');
-                                           bigText2.style.cssText = "font-family:'Cinzel Decorative', serif; font-size:4.5rem; font-weight:900; color:#ff3030; text-shadow:0 0 35px #ff0000, 0 4px 15px #000; transform:scale(0.5); opacity:0; transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);";
-                                           bigText2.textContent = `+${questing.length} Threat!`;
-                                           overlay2.appendChild(bigText2);
-                                           document.body.appendChild(overlay2);
-                                           
-                                           if (engine.window && engine.window.screenShake) engine.window.screenShake(18, 500);
-                                           const hudThreat2 = document.getElementById('hud-threat');
-                                           if (hudThreat2 && engine.window && engine.window.spawnBurstAtElement) engine.window.spawnBurstAtElement(hudThreat2, '#c0392b', 15);
-                                           
-                                           setTimeout(() => { bigText2.style.transform = 'scale(1)'; bigText2.style.opacity = '1'; }, 50);
-                                           setTimeout(() => {
-                                               overlay2.style.background = 'rgba(200,0,0,0)';
-                                               bigText2.style.transform = 'scale(1.2) translateY(-100px)';
-                                               bigText2.style.opacity = '0';
-                                               setTimeout(() => overlay2.remove(), 400);
-                                               const diffEl2 = document.getElementById('hud-threat-diff');
-                                               if (diffEl2) {
-                                                   diffEl2.textContent = `+${questing.length}`;
-                                                   diffEl2.classList.remove('threat-diff-active');
-                                                   void diffEl2.offsetWidth;
-                                                   diffEl2.classList.add('threat-diff-active');
-                                                   setTimeout(() => { diffEl2.classList.remove('threat-diff-active'); diffEl2.textContent = ''; }, 3500);
-                                               }
-                                               engine.render();
-                                               if (game.threats[pIdx] >= 50 && engine.eliminatePlayer) engine.eliminatePlayer(pIdx);
-                                               
-                                               pIdx++; 
-                                               processNext();
-                                           }, 1500);
-                                        }},
-                                        {label: 'Discard a Questing Character', cb: () => {
-                                           if (engine.showHeroPicker) {
-                                               engine.showHeroPicker('Eyes in the Dark', 'Choose a questing character to discard:', questing, (chosen) => {
-                                                   if(chosen) {
-                                                       if (chosen.isHero) {
-                                                           chosen.damage = chosen.hp || 99;
-                                                           if (engine.checkHeroDeath) engine.checkHeroDeath(chosen);
-                                                       } else {
-                                                           game.allies = game.allies.filter(a => a._uid !== chosen._uid);
-                                                           if (engine.discardCard) {
-                                                               engine.discardCard(chosen, game.playerDiscards[pIdx] || game.playerDiscard, false);
-                                                           } else {
-                                                               (game.playerDiscards[pIdx] || game.playerDiscard).push(chosen);
-                                                           }
-                                                           destroyedAlliesQueue.push({name: chosen.name, ownerIdx: chosen._ownerIdx});
-                                                       }
-                                                       engine.toast('Eyes in the Dark', `Discarded ${chosen.name}.`, 'danger');
-                                                       
-                                                       // Wait for checkHeroDeath/discardCard to finish visually
-                                                       setTimeout(() => {
-                                                           if (engine.window && engine.window.updateQuestWillpowerDisplay) engine.window.updateQuestWillpowerDisplay();
-                                                           engine.render();
-                                                           pIdx++; 
-                                                           processNext();
-                                                       }, 500);
-                                                   } else {
-                                                       // If they cancel out of the hero picker, we must raise their threat instead
-                                                       game.threats[pIdx] += questing.length;
-                                                       if (game.numPlayers === 1) game.threat += questing.length;
-                                                       engine.toast('Eyes in the Dark', `Player ${pIdx+1} threat raised by ${questing.length}.`, 'danger');
-                                                       
-                                                       // Threat cinematic
-                                                       const overlay2 = document.createElement('div');
-                                                       overlay2.style.cssText = 'position:fixed; inset:0; z-index:99999; display:flex; flex-direction:column; align-items:center; justify-content:center; background:rgba(200,0,0,0.45); pointer-events:none; transition: background 0.3s ease-out;';
-                                                       const bigText2 = document.createElement('div');
-                                                       bigText2.style.cssText = "font-family:'Cinzel Decorative', serif; font-size:4.5rem; font-weight:900; color:#ff3030; text-shadow:0 0 35px #ff0000, 0 4px 15px #000; transform:scale(0.5); opacity:0; transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);";
-                                                       bigText2.textContent = `+${questing.length} Threat!`;
-                                                       overlay2.appendChild(bigText2);
-                                                       document.body.appendChild(overlay2);
-                                                       
-                                                       if (engine.window && engine.window.screenShake) engine.window.screenShake(18, 500);
-                                                       const hudThreat2 = document.getElementById('hud-threat');
-                                                       if (hudThreat2 && engine.window && engine.window.spawnBurstAtElement) engine.window.spawnBurstAtElement(hudThreat2, '#c0392b', 15);
-                                                       
-                                                       setTimeout(() => { bigText2.style.transform = 'scale(1)'; bigText2.style.opacity = '1'; }, 50);
-                                                       setTimeout(() => {
-                                                           overlay2.style.background = 'rgba(200,0,0,0)';
-                                                           bigText2.style.transform = 'scale(1.2) translateY(-100px)';
-                                                           bigText2.style.opacity = '0';
-                                                           setTimeout(() => overlay2.remove(), 400);
-                                                           const diffEl2 = document.getElementById('hud-threat-diff');
-                                                           if (diffEl2) {
-                                                               diffEl2.textContent = `+${questing.length}`;
-                                                               diffEl2.classList.remove('threat-diff-active');
-                                                               void diffEl2.offsetWidth;
-                                                               diffEl2.classList.add('threat-diff-active');
-                                                               setTimeout(() => { diffEl2.classList.remove('threat-diff-active'); diffEl2.textContent = ''; }, 3500);
-                                                           }
-                                                           engine.render();
-                                                           if (game.threats[pIdx] >= 50 && engine.eliminatePlayer) engine.eliminatePlayer(pIdx);
-                                                           
-                                                           pIdx++; 
-                                                           processNext();
-                                                       }, 1500);
-                                                   }
-                                               }, true);
-                                           }
-                                        }}
-                                    ], true);
-                                }
+                                engine.showConfirmModal('Eyes in the Dark', promptHTML,
+                                    () => {
+                                        engine.toast('Eyes in the Dark', `Player ${pIdx+1} threat raised by ${questing.length}.`, 'danger');
+                                        window.launchEyesInTheDarkGlobs(questing.length, pIdx, () => {
+                                            pIdx++; processNext();
+                                        });
+                                    },
+                                    () => {
+                                        engine.showHeroPicker('Eyes in the Dark', 'Choose a questing character to discard:', questing, (chosen) => {
+                                            if(chosen) {
+                                                const executeDiscard = () => {
+                                                    try {
+                                                        if (chosen.isHero) {
+                                                            chosen.damage = chosen.hp || 99;
+                                                            if (engine.checkHeroDeath) engine.checkHeroDeath(chosen);
+                                                            else if (window.checkHeroDeath) window.checkHeroDeath(chosen);
+                                                        } else {
+                                                            game.allies = game.allies.filter(a => a._uid !== chosen._uid);
+                                                            const discardPile = (game.playerDiscards && game.playerDiscards[pIdx]) ? game.playerDiscards[pIdx] : game.playerDiscard;
+                                                            if (engine.discardCard) engine.discardCard(chosen, discardPile, false);
+                                                            else if (window.discardCard) window.discardCard(chosen, discardPile, false);
+                                                            
+                                                            if (window.onAllyLeftPlay) window.onAllyLeftPlay(chosen.name, chosen._ownerIdx);
+                                                        }
+                                                        game.selectedHeroIds = (game.selectedHeroIds || []).filter(uid => uid !== chosen._uid);
+                                                        engine.toast('Eyes in the Dark', `Discarded ${chosen.name}.`, 'danger');
+                                                        if (window.updateQuestWillpowerDisplay) window.updateQuestWillpowerDisplay();
+                                                        engine.render();
+                                                    } catch(err) {
+                                                        console.error("Eyes in the Dark Discard Execution Error:", err);
+                                                    }
+
+                                                    setTimeout(() => {
+                                                        pIdx++;
+                                                        processNext();
+                                                    }, 550);
+                                                };
+
+                                                const targetEl = document.querySelector(`[data-uid="${chosen._uid}"]`);
+                                                if (targetEl && typeof window.triggerEyesInTheDarkSpiderBite === 'function') {
+                                                    window.triggerEyesInTheDarkSpiderBite(targetEl, executeDiscard);
+                                                } else {
+                                                    executeDiscard();
+                                                }
+                                            } else {
+                                                engine.toast('Eyes in the Dark', `Player ${pIdx+1} threat raised by ${questing.length}.`, 'danger');
+                                                window.launchEyesInTheDarkGlobs(questing.length, pIdx, () => {
+                                                    pIdx++; processNext();
+                                                });
+                                            }
+                                        }, true);
+                                    }, 'Discard Character', `Raise Threat by ${questing.length}`
+                                );
                             } else {
-                                pIdx++; 
-                                processNext();
+                                pIdx++; processNext();
                             }
                         };
                         processNext();
-                    }, 200); // 200ms delay after cinematic finishes
+                    }, 400);
                 }, 1500);
             },
             onShadow: function(shadow, enemy, defChars, game, engine, next) {
@@ -5382,28 +17023,37 @@ window.LotrExpansions['dark_of_nibin'] = {
                     const targetPIdx = enemy._engagedWithPlayerIdx !== undefined ? enemy._engagedWithPlayerIdx : game.activeTabPlayerIdx;
                     const allies = game.allies.filter(a => (a._ownerIdx === undefined ? 0 : a._ownerIdx) === targetPIdx);
                     if (allies.length > 0) {
-                        if (game.activeTabPlayerIdx !== targetPIdx) engine.window._switchTab(targetPIdx);
+                        if (game.activeTabPlayerIdx !== targetPIdx && engine.window._switchTab) {
+                            engine.window._switchTab(targetPIdx);
+                        }
                         
                         const promptHTML = `<span style="font-size:1.6rem; font-weight:600; color:var(--gold-bright); display:block; margin-bottom:12px; line-height:1.35; text-align:center;">Undefended attack! Discard an ally you control:</span>`;
                         
                         engine.showHeroPicker('Shadow Effect: <br>Eyes in the Dark', promptHTML, allies, (chosen) => {
                             if(chosen) {
-                                const playAreaEl = document.querySelector(`#player-content [data-uid="${chosen._uid}"]`);
-                                const startRect = (playAreaEl && playAreaEl.getBoundingClientRect().width > 0) ? playAreaEl.getBoundingClientRect() : window._lastPickerRect;
-                                
-                                game.allies = game.allies.filter(a => a._uid !== chosen._uid);
-                                if (engine.discardCard) {
-                                    engine.discardCard(chosen, game.playerDiscards[targetPIdx] || game.playerDiscard, false, startRect);
-                                } else {
-                                    game.playerDiscard.push(chosen);
+                                const executeDiscard = () => {
+                                    game.allies = game.allies.filter(a => a._uid !== chosen._uid);
+                                    if (engine.discardCard) {
+                                        engine.discardCard(chosen, game.playerDiscards[targetPIdx] || game.playerDiscard, false);
+                                    } else {
+                                        (game.playerDiscards[targetPIdx] || game.playerDiscard).push(chosen);
+                                    }
+                                    if (engine.window.onAllyLeftPlay) {
+                                        engine.window.onAllyLeftPlay(chosen.name, chosen._ownerIdx);
+                                    }
+                                    engine.toast('Eyes in the Dark', `Discarded ${chosen.name}.`, 'danger');
                                     engine.render();
+                                    next();
+                                };
+                                const targetEl = document.querySelector(`[data-uid="${chosen._uid}"]`);
+                                if (targetEl && typeof window.triggerEyesInTheDarkSpiderBite === 'function') {
+                                    window.triggerEyesInTheDarkSpiderBite(targetEl, executeDiscard);
+                                } else {
+                                    executeDiscard();
                                 }
-                                if (engine.window.onAllyLeftPlay) {
-                                    engine.window.onAllyLeftPlay(chosen.name, chosen._ownerIdx);
-                                }
-                                engine.toast('Eyes in the Dark', `Discarded ${chosen.name}.`, 'danger');
+                            } else {
+                                next();
                             }
-                            next();
                         }, true);
                         return;
                     }
@@ -5422,37 +17072,56 @@ window.LotrExpansions['dark_of_nibin'] = {
             text: 'When Revealed: Deal 2 damage to a character controlled by the first player.\nShadow: Deal 1 damage to a character you control.',
             shadow: 'Shadow: Deal 1 damage to a character you control.',
             onReveal: function(card, game, engine, cb) {
+                if (engine.window._activeEncounterGhost) {
+                    engine.window._activeEncounterGhost.id = 'encounter-limbo-ghost';
+                    if (typeof engine.window._repositionGhostLeftOfModal === 'function') {
+                        engine.window._repositionGhostLeftOfModal();
+                    }
+                }
                 const fpIdx = game.firstPlayerIdx || 0;
-                const eligible = [...game.heroes, ...game.allies].filter(c => !c._prisoner && !c._dead && (c._ownerIdx === fpIdx || (c._ownerIdx === undefined && fpIdx === 0)));
+                const fpChars = [...game.heroes, ...game.allies].filter(c => !c._prisoner && !c._dead && (c._ownerIdx === fpIdx || (c._ownerIdx === undefined && fpIdx === 0)));
                 
-                if (eligible.length > 0) {
+                if (fpChars.length > 0) {
                     if (game.activeTabPlayerIdx !== fpIdx && engine.window._switchTab) {
                         engine.window._switchTab(fpIdx);
                     }
                     const title = game.numPlayers > 1 ? `Player ${fpIdx + 1} - Obsidian Arrows` : 'Obsidian Arrows';
                     const promptHTML = `<span style="font-size:1.6rem; font-weight:600; color:var(--gold-bright); display:block; margin-bottom:12px; line-height:1.35; text-align:center;">Forced: Choose a character you control to take 2 damage:</span>`;
                     
-                    engine.showHeroPicker(title, promptHTML, eligible, (chosen) => {
-                        const target = chosen || eligible[0];
-                        target.damage += 2;
-                        engine.toast("Obsidian Arrows", `Dealt 2 damage to ${target.name}.`, "danger");
-                        
-                        const el = document.querySelector(`[data-uid="${target._uid}"]`);
-                        if (el && engine.window.spawnBurstAtElement) engine.window.spawnBurstAtElement(el, '#c0392b', 25);
-                        if (engine.window.screenShake) engine.window.screenShake(12, 400);
-                        
-                        engine.render();
-                        if (engine.checkHeroDeath) engine.checkHeroDeath(target);
-                        
-                        if (engine.window.waitForAllyDeaths) {
-                            engine.window.waitForAllyDeaths(cb);
+                    engine.showHeroPicker(title, promptHTML, fpChars, (chosen) => {
+                        if (chosen) {
+                            const sourceEl = document.getElementById('encounter-limbo-ghost') ||
+                                             document.getElementById('encounter-reveal-ghost') ||
+                                             document.querySelector('[data-id="nibin_obsidian_arrows"]') ||
+                                             document.querySelector('[data-id="oath_obsidian_arrows"]') ||
+                                             document.querySelector('[data-id="obsidian_arrows"]');
+                            window.launch3DObsidianArrows({
+                                sourceEl: sourceEl,
+                                targetUid: chosen._uid,
+                                count: 6,
+                                soundPath: './sound_effects/dark_of_mirkwood/obsidian_arrows_shoot.mp3',
+                                onComplete: () => {
+                                    chosen.damage += 2;
+                                    engine.toast('Obsidian Arrows', `Dealt 2 damage to ${chosen.name}.`, 'danger');
+                                    engine.spawnBurstAtElement(document.querySelector(`[data-uid="${chosen._uid}"]`), '#c0392b', 24);
+
+                                    window._pauseAllyDeathProcessing = true;
+                                    if (cb) cb();
+
+                                    setTimeout(() => {
+                                        window._pauseAllyDeathProcessing = false;
+                                        engine.checkHeroDeath(chosen);
+                                        engine.render();
+                                    }, 850);
+                                }
+                            });
                         } else {
-                            cb();
+                            if (cb) cb();
                         }
                     }, true);
                 } else {
                     engine.toast("Obsidian Arrows", "First player controls no characters.", "info");
-                    cb();
+                    if (cb) cb();
                 }
             },
             onShadow: function(shadow, enemy, defChars, game, engine, next) {
@@ -5467,19 +17136,27 @@ window.LotrExpansions['dark_of_nibin'] = {
                     const promptHTML = `<span style="font-size:1.6rem; font-weight:600; color:var(--gold-bright); display:block; margin-bottom:12px; line-height:1.35; text-align:center;">Obsidian Arrows: <br>Choose a character you control to take 1 damage:</span>`;
                     
                     engine.showHeroPicker(title, promptHTML, eligible, (chosen) => {
-                        const target = chosen || eligible[0];
-                        target.damage += 1;
-                        engine.toast("Shadow Effect", `Dealt 1 damage to ${target.name}.`, "danger");
-                        
-                        const el = document.querySelector(`[data-uid="${target._uid}"]`);
-                        if (el && engine.window.spawnBurstAtElement) engine.window.spawnBurstAtElement(el, '#c0392b', 15);
-                        if (engine.window.screenShake) engine.window.screenShake(8, 300);
-                        
-                        engine.render();
-                        if (engine.checkHeroDeath) engine.checkHeroDeath(target);
-                        
-                        if (engine.window.waitForAllyDeaths) {
-                            engine.window.waitForAllyDeaths(next);
+                        if (chosen) {
+                            const enemyEl = document.querySelector(`[data-uid="${enemy._uid}"]`);
+                            const shadowEl = document.getElementById('encounter-limbo-ghost') ||
+                                             (enemyEl ? enemyEl.querySelector(`[data-uid="${shadow._uid}"]`) : null) ||
+                                             (enemyEl ? enemyEl.querySelector('.token.shadow-revealed') : null) ||
+                                             enemyEl;
+
+                            window.launch3DObsidianArrows({
+                                sourceEl: shadowEl,
+                                targetUid: chosen._uid,
+                                count: 1,
+                                soundPath: './sound_effects/dark_of_mirkwood/obsidian_arrows_shadow_card.mp3',
+                                onComplete: () => {
+                                    chosen.damage += 1;
+                                    engine.toast('Obsidian Arrows', `Dealt 1 damage to ${chosen.name}.`, 'danger');
+                                    engine.spawnBurstAtElement(document.querySelector(`[data-uid="${chosen._uid}"]`), '#c0392b', 18);
+                                    engine.checkHeroDeath(chosen);
+                                    engine.render();
+                                    next();
+                                }
+                            });
                         } else {
                             next();
                         }
