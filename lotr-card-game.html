@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>The Lord of the Rings — The Card Game</title>
+<meta name="description" content="Digital card game adaptation of The Lord of the Rings: The Card Game with rich card effects, scenario campaigns, and visual quest resolution.">
+<meta property="og:title" content="The Lord of the Rings — The Card Game">
+<meta property="og:description" content="Digital card game adaptation of The Lord of the Rings: The Card Game with rich card effects, scenario campaigns, and visual quest resolution.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700;900&family=Cinzel+Decorative:wght@700;900&family=MedievalSharp&family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
@@ -1412,7 +1415,7 @@
                 <div style="font-family:'Cormorant Garamond',serif; font-size:1.5rem; color:var(--parchment); line-height:1.4;">
                   <strong>3.1 Commit:</strong> Exhaust characters to commit willpower.<br>
                   <strong>3.2 Staging:</strong> Reveal 1 encounter card per active player.<br>
-                  <strong>3.3 Resolution:</strong> Compare committed Willpower (✦) against total staging Threat. Excess Willpower places Progress on Active Location or Quest. Deficit increases each player's Threat dial. (Action Windows throughout).
+                  <strong>3.3 Resolution:</strong> Compare committed Willpower <img src="tokens/willpower.png" style="width:1.1em; height:1.1em; vertical-align:-0.15em; filter:drop-shadow(0 1px 2px rgba(0,0,0,0.8));" alt="WP"> against total staging Threat. Excess Willpower places Progress on Active Location or Quest. Deficit increases each player's Threat dial. (Action Windows throughout).
                 </div>
               </div>
 
@@ -1436,8 +1439,8 @@
                 <div style="font-family:'Cinzel',serif; font-weight:700; font-size:1.45rem; color:var(--gold-bright);">6. Combat Phase</div>
                 <div style="font-family:'Cormorant Garamond',serif; font-size:1.5rem; color:var(--parchment); line-height:1.4;">
                   <strong>6.1 Shadow:</strong> Deal 1 face-down shadow card to each engaged enemy.<br>
-                  <strong>6.2 Enemy Attacks:</strong> Declare defender, resolve shadow effect, subtract Defense (🛡) from Attack (⚔) to assign damage. (Undefended damage bypasses Defense and goes directly to a hero).<br>
-                  <strong>6.3 Player Attacks:</strong> Exhaust ready characters to attack engaged enemies. Attack (⚔) minus enemy Defense (🛡) deals damage. (Action Windows throughout).
+                  <strong>6.2 Enemy Attacks:</strong> Declare defender, resolve shadow effect, subtract Defense <img src="tokens/shield.png" style="width:1.1em; height:1.1em; vertical-align:-0.15em; filter:drop-shadow(0 1px 2px rgba(0,0,0,0.8));" alt="DEF"> from Attack <img src="tokens/attack.png" style="width:1.1em; height:1.1em; vertical-align:-0.15em; filter:drop-shadow(0 1px 2px rgba(0,0,0,0.8));" alt="ATK"> to assign damage. (Undefended damage bypasses Defense and goes directly to a hero).<br>
+                  <strong>6.3 Player Attacks:</strong> Exhaust ready characters to attack engaged enemies. Attack <img src="tokens/attack.png" style="width:1.1em; height:1.1em; vertical-align:-0.15em; filter:drop-shadow(0 1px 2px rgba(0,0,0,0.8));" alt="ATK"> minus enemy Defense <img src="tokens/shield.png" style="width:1.1em; height:1.1em; vertical-align:-0.15em; filter:drop-shadow(0 1px 2px rgba(0,0,0,0.8));" alt="DEF"> deals damage. (Action Windows throughout).
                 </div>
               </div>
 
@@ -3712,7 +3715,7 @@ window._repositionGhostLeftOfModal = function() {
   const ghost = document.getElementById('encounter-limbo-ghost');
   if (!ghost) return;
   const modalEl = document.querySelector('#modal-overlay .modal');
-  if (!modalEl) return;
+  if (!modalEl || modalEl.innerHTML.includes('Valiant Sacrifice')) return;
   const rect = modalEl.getBoundingClientRect();
   if (rect.width === 0) {
     requestAnimationFrame(window._repositionGhostLeftOfModal);
@@ -6571,6 +6574,13 @@ $('begin-stage-btn').onclick = ()=>{
       
       void ghost.offsetWidth;
       
+      try {
+        const snd = new Audio('./sound_effects/enemy_move.mp3');
+        const vol = document.getElementById('volume-slider');
+        snd.volume = vol ? parseFloat(vol.value) : 0.25;
+        snd.play().catch(()=>{});
+      } catch(e) {}
+      
       ghost.style.left = `${destLeft}px`;
       ghost.style.top = `${destTop}px`;
       ghost.style.transform = `scale(${destScaleX}, ${destScaleY})`;
@@ -6762,6 +6772,7 @@ function resourcePhase(){
   $('phase-indicator').textContent='Resource Phase';
   showBanner(window.t('Round') + ' ' + game.round, 'Phase 1: Resource');
   setTimeout(()=>{
+    game.phaseTransitioning = false;
     const activeHeroes = game.heroes.filter(h => !h._prisoner);
     activeHeroes.forEach((h, i)=>{
       setTimeout(()=>{
@@ -6803,6 +6814,7 @@ function resourcePhase(){
 function resourceActionWindow() {
   game.phase = 'resource-window';
   game.pendingAction = null;
+  game.phaseTransitioning = false;
   setActionInfo('Resource Phase Action Window — You may play Events or use Action abilities before moving to the Planning Phase.');
   setActionBar([
     {label:'Proceed to Planning Phase', cb:()=>planningPhase(), primary:true}
@@ -9414,7 +9426,10 @@ function resolveEvent(card, finishEvent, refundEvent){
   }
   else if(card.id==='a_light_in_the_dark'){
     if (typeof window.executeLightInTheDarkEvent === 'function') {
-      window.executeLightInTheDarkEvent(card, finishEvent, refundEvent);
+      window.executeLightInTheDarkEvent(card, () => {
+        finishEvent();
+        setTimeout(() => restorePhaseUI(game.phase), 50);
+      }, refundEvent);
     }
   }
   else if(card.id==='gandalfs_search'){
@@ -11553,10 +11568,17 @@ function resolveQuest(){
 function continueQuestResolution(committed, skipReveals = false){
   setTimeout(()=>{
     const waitAndContinue = () => {
-			if (isAnyModalOpen() || window._isProcessingNibin) {
-				setTimeout(waitAndContinue, 250);
-				return;
-			}
+      const isCardAnimationPlaying = Array.from(document.body.children).some(el => {
+          if (el.style.position !== 'fixed' || el.style.pointerEvents !== 'none') return false;
+          const z = parseInt(el.style.zIndex) || 0;
+          if (z < 100) return false;
+          return el.classList.contains('card') || el.querySelector('.card') !== null;
+      });
+
+      if (isAnyModalOpen() || window._isProcessingNibin || ($('quest-reveal') && $('quest-reveal').classList.contains('show')) || game._questAnimating || isCardAnimationPlaying) {
+          setTimeout(waitAndContinue, 250);
+          return;
+      }
       
       if (!skipReveals && game.revealsLeft === undefined) {
         let activePlayers = game.numPlayers - game.eliminated.filter(e=>e).length;
@@ -11584,6 +11606,9 @@ function continueQuestResolution(committed, skipReveals = false){
               stagingThreat += (game.underTheShadowBonus || 0);
           
           const executeResolution = () => {
+            if (typeof window.disintegrateGoblintownScavengersThreatTokens === 'function') {
+              window.disintegrateGoblintownScavengersThreatTokens();
+            }
             // Reset staging threat bonuses and willpower bonuses at the end of the phase resolution
             game.stagingArea.forEach(c => { c.threatBonus = 0; c._noThreat = false; c._secretPathsActive = false; });
             if (game.activeLocation) { game.activeLocation._noThreat = false; game.activeLocation._secretPathsActive = false; }
@@ -11891,7 +11916,7 @@ function continueQuestResolution(committed, skipReveals = false){
     background: #000;
     box-shadow: 0 4px 10px rgba(0,0,0,0.6);
   `;
-  ghostFront.innerHTML = cardHTML(card);
+  ghostFront.innerHTML = cardHTML(card, false, false, false, false, true);
   const innerCard = ghostFront.querySelector('.card');
   if (innerCard) {
     innerCard.style.width = '100%';
@@ -11925,6 +11950,7 @@ function continueQuestResolution(committed, skipReveals = false){
     if (card.id === 'old_forest_road') window.SoundFX.playOldForestRoad();
     if (card.id === 'nazgul_of_dol_guldur') window.SoundFX.playNazgulAppear();
     if (card.id === 'east_bight_patrol') window.SoundFX.playEastBightPatrolAppear();
+    if (window.playGoblinTroopAudio && (card.id === 'oath_goblin_troop' || card.id === 'goblin_troop' || card.name === 'Goblin Troop')) window.playGoblinTroopAudio();
   }
 
   setTimeout(() => {
@@ -12030,6 +12056,10 @@ function animateRevealEncounterCard(card, cb) {
 			if (window.SoundFX && card.id === 'old_forest_road') window.SoundFX.playOldForestRoad();
 			if (window.SoundFX && card.id === 'nazgul_of_dol_guldur') window.SoundFX.playNazgulAppear();
 			if (window.SoundFX && card.id === 'east_bight_patrol') window.SoundFX.playEastBightPatrolAppear();
+			if (window.playGoblinTroopAudio && (card.id === 'oath_goblin_troop' || card.id === 'goblin_troop' || card.name === 'Goblin Troop')) window.playGoblinTroopAudio();
+			if ((card.id === 'nibin_crumbling_ruin' || card.id === 'crumbling_ruin' || card.name === 'Crumbling Ruin') && typeof window.playCrumblingRuinAudio === 'function') {
+				window.playCrumblingRuinAudio(card);
+			}
 			if (card.id === 'evil_storm') {
 				const appearAudio = new Audio('./sound_effects/evil_storm_appear.mp3');
 				appearAudio.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
@@ -12148,6 +12178,7 @@ function animateEncounterGhostToFinal(card, onComplete) {
     return;
   }
   window._activeEncounterGhost = null;
+  ghostWrap.id = '';
 
   const gw = ghostWrap.offsetWidth || 144;
 
@@ -12365,16 +12396,26 @@ function revealEncounterCard(cb){
             if (game.numPlayers === 1) game.threat++;
             toast('Doomed', `Forced: Doomed 1 from ${card.name}. Raised threat by 1.`, 'danger');
             
-            const diffEl = document.getElementById('hud-threat-diff');
-            if (diffEl) {
-              diffEl.textContent = `+1 Threat!`;
-              diffEl.classList.remove('threat-diff-active');
-              void diffEl.offsetWidth;
-              diffEl.classList.add('threat-diff-active');
-              setTimeout(() => {
+            // Visual blade projectile shooting from Cavern Guardian card to top UI threat number + threat_increase.mp3
+            if (typeof window.triggerCavernGuardianThreatSlash === 'function') {
+              window.triggerCavernGuardianThreatSlash(card);
+            } else {
+              try {
+                const snd = new Audio('./sound_effects/threat_increase.mp3');
+                snd.volume = parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+                snd.play().catch(() => {});
+              } catch(e) {}
+              const diffEl = document.getElementById('hud-threat-diff');
+              if (diffEl) {
+                diffEl.textContent = `+1 Threat!`;
                 diffEl.classList.remove('threat-diff-active');
-                diffEl.textContent = '';
-              }, 3500);
+                void diffEl.offsetWidth;
+                diffEl.classList.add('threat-diff-active');
+                setTimeout(() => {
+                  diffEl.classList.remove('threat-diff-active');
+                  diffEl.textContent = '';
+                }, 3500);
+              }
             }
             for(let p=0; p<game.numPlayers; p++) {
               if (game.threats[p] >= 50) eliminatePlayer(p);
@@ -12453,6 +12494,10 @@ function revealEncounterCard(cb){
               }
             };
             const isCrows = card.id === 'eastern_crows' || card.id === 'oath_eastern_crows' || (card.name && card.name.includes('Eastern Crows'));
+            const centerGhost = window._activeEncounterGhost || document.getElementById('encounter-limbo-ghost') || document.getElementById('encounter-reveal-ghost');
+            if (centerGhost) {
+              window._activeEncounterGhost = centerGhost;
+            }
             if (card._alreadyResolved) {
               delete card._alreadyResolved;
               setTimeout(() => {
@@ -12464,36 +12509,37 @@ function revealEncounterCard(cb){
                   }
                 });
               }, 100);
+            } else if (isCrows && typeof window.triggerEasternCrowsSurge === 'function') {
+              window.triggerEasternCrowsSurge(centerGhost || window._activeEncounterGhost, () => {
+                // Simultaneous on crows impact: Move Eastern Crows to Staging Area & Reveal next card from deck
+                const ghostToFinal = window._activeEncounterGhost || document.getElementById('encounter-limbo-ghost') || document.getElementById('encounter-reveal-ghost');
+                if (ghostToFinal) {
+                  window._activeEncounterGhost = ghostToFinal;
+                  animateEncounterGhostToFinal(card, () => {
+                    if (!card._surging) cb();
+                  });
+                } else {
+                  finalize();
+                }
+                if (card._surging) {
+                  card._surging = false;
+                  checkEmptyEncounterDeck(() => {
+                    revealEncounterCard(cb);
+                  });
+                }
+              });
             } else if (window._activeEncounterGhost) {
-              if (isCrows && typeof window.triggerEasternCrowsSurge === 'function') {
-                window.triggerEasternCrowsSurge(window._activeEncounterGhost, () => {
-                  // Simultaneous on crows impact: Move Eastern Crows to Staging Area & Reveal next card from deck
-                  if (window._activeEncounterGhost) {
-                    animateEncounterGhostToFinal(card, () => {
-                      if (!card._surging) cb();
-                    });
-                  } else {
-                    finalize();
-                  }
-                  if (card._surging) {
-                    card._surging = false;
-                    checkEmptyEncounterDeck(() => {
-                      revealEncounterCard(cb);
-                    });
-                  }
-                });
-              } else {
-                animateEncounterGhostToFinal(card, finalize);
-              }
+              animateEncounterGhostToFinal(card, finalize);
             } else {
               finalize();
             }
           };
 
           if(hasWhenRevealed){
-            const eleanor = game.heroes.find(h=>h.id==='eleanor' && !h.exhausted && !h._prisoner);
-            const testOfWill = game.hand.find(c=>c.id==='a_test_of_will');
-            const spiritHero = game.heroes.find(h=>h.sphere==='spirit' && h.resources>=1);
+            const cannotCancel = (card.text && /cannot be cancel/i.test(card.text)) || (game.activeLocation && (game.activeLocation.id === 'oath_the_eaves_of_mirkwood' || (game.activeLocation.name && game.activeLocation.name.includes('Eaves of Mirkwood'))));
+            const eleanor = !cannotCancel && game.heroes.find(h=>h.id==='eleanor' && !h.exhausted && !h._prisoner);
+            const testOfWill = !cannotCancel && game.hand.find(c=>c.id==='a_test_of_will');
+            const spiritHero = !cannotCancel && game.heroes.find(h=>h.sphere==='spirit' && h.resources>=1);
 
             const triggerEleanor = () => {
               if (eleanor && eleanor._ownerIdx !== undefined && game.activeTabPlayerIdx !== eleanor._ownerIdx) {
@@ -13119,6 +13165,7 @@ function resolveWhenRevealed(card, cb){
         }
      }
      card.threatBonus = (card.threatBonus || 0) + totalCost;
+     card._scavengersThreatBonus = card.threatBonus;
      toast('Goblintown Scavengers', `Discarded top cards. Threat increased by ${totalCost} until end of phase.`, 'danger', 3500);
      if(cb) cb();
   }
@@ -13563,7 +13610,7 @@ function resolveWhenRevealed(card, cb){
     if(loc.id === 'goblin_trail') {
        game._goblinTrailExplored = true;
        toast('Goblin Trail', 'Response: Placed 6 progress on the current quest!', 'success');
-       setTimeout(() => addProgressToQuest(6), 1000);
+       setTimeout(() => addProgressToQuest(6, true), 1000);
     }
     // --- Dynamic Expansion Engine Hook ---
     if (loc.onExplored) {
@@ -13682,6 +13729,181 @@ window._showQuestClashCinematic = function(wp, threat, cb) {
       cb();
     }, 300);
   }, 1500);
+};
+
+window.disintegrateGoblintownScavengersThreatTokens = function() {
+  if (!window.game) return;
+  const game = window.game;
+  const cardsToCheck = [
+    ...(game.stagingArea || []),
+    ...(game.engagedEnemies || [])
+  ];
+
+  const scavengersCards = cardsToCheck.filter(c => {
+    if (!c) return false;
+    const isScavenger = (
+      c.id === 'oath_goblintown_scavengers' ||
+      c.id === 'goblintown_scavengers' ||
+      c.id === 'nibin_goblintown_scavengers' ||
+      (c.name && c.name.toLowerCase().includes('goblintown scaveng'))
+    );
+    const bonus = c.threatBonus || c._scavengersThreatBonus || 0;
+    return isScavenger && bonus > 0;
+  });
+
+  if (scavengersCards.length === 0) return;
+
+  scavengersCards.forEach(card => {
+    const bonus = card.threatBonus || card._scavengersThreatBonus || 0;
+    card._scavengersThreatBonus = 0;
+
+    // Find card element in DOM
+    const cardEl = document.querySelector(`#staging-content [data-uid="${card._uid}"]`) ||
+                   document.querySelector(`[data-uid="${card._uid}"]`);
+    if (!cardEl) return;
+
+    // Find the threat token inside the card element
+    const tokenEl = cardEl.querySelector('.status-buff-tokens img[alt="threat"]')?.closest('.buff-token') ||
+                    cardEl.querySelector('.status-buff-tokens .buff-token') ||
+                    cardEl.querySelector('.buff-token');
+
+    let tokenRect = null;
+    if (tokenEl) {
+      const r = tokenEl.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        tokenRect = r;
+      }
+    }
+
+    if (!tokenRect) {
+      const cRect = cardEl.getBoundingClientRect();
+      if (cRect.width > 0 && cRect.height > 0) {
+        const tokenSize = cRect.width * 0.38;
+        tokenRect = {
+          left: cRect.left,
+          top: cRect.top + cRect.height * 0.145,
+          width: tokenSize,
+          height: tokenSize
+        };
+      }
+    }
+
+    if (!tokenRect) return;
+
+    // Hide original token so it doesn't flicker or linger when re-rendered
+    if (tokenEl) {
+      tokenEl.style.opacity = '0';
+      tokenEl.style.visibility = 'hidden';
+    }
+
+    // 1. Create floating disintegrating threat token
+    const threatImgUrl = 'tokens/threat_str.png';
+    const floatingToken = document.createElement('div');
+    floatingToken.className = 'disintegrating-threat-token';
+    floatingToken.style.cssText = `
+      position: fixed;
+      z-index: 100005;
+      left: ${tokenRect.left}px;
+      top: ${tokenRect.top}px;
+      width: ${tokenRect.width}px;
+      height: ${tokenRect.height}px;
+      border-radius: 50%;
+      background: rgba(0, 0, 0, 0.85);
+      border: 2px solid #ffb74d;
+      box-shadow: 0 0 10px #ffb74d;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+      opacity: 1;
+      transform: scale(1);
+      clip-path: circle(100% at 50% 50%);
+      filter: brightness(1) contrast(1) drop-shadow(0 0 8px #ffb74d);
+      transition: clip-path 0.5s cubic-bezier(0.15, 0.85, 0.25, 1), transform 0.5s cubic-bezier(0.15, 0.85, 0.25, 1), opacity 0.42s ease-in, filter 0.45s ease-in;
+    `;
+    if (tokenEl && tokenEl.innerHTML) {
+      floatingToken.innerHTML = tokenEl.innerHTML;
+    } else {
+      floatingToken.innerHTML = `
+        <img src="${threatImgUrl}" style="width:100%; height:100%; object-fit:contain; border-radius:50%;" alt="threat">
+        <div class="badge plus" style="position:absolute; top:50%; right:calc(var(--card-w, 130px) * -0.06); transform:translateY(-50%); background:#1a120b; border:calc(var(--card-w, 130px) * 0.008) solid #ffb74d; font-size:calc(var(--card-w, 130px) * 0.135); font-weight:bold; border-radius:3.5px; padding:calc(var(--card-w, 130px) * 0.015) calc(var(--card-w, 130px) * 0.035); white-space:nowrap; box-shadow:0 2px 4px rgba(0,0,0,0.95); color:#fff; font-family:'Cinzel', serif;">+${bonus}</div>
+      `;
+    }
+    document.body.appendChild(floatingToken);
+
+    // 2. Outward dispersing shards (exact opposite of how threat token materialized)
+    const tokenCenterWorldX = tokenRect.left + tokenRect.width / 2;
+    const tokenCenterWorldY = tokenRect.top + tokenRect.height / 2;
+    const emberCount = 14;
+
+    const shardContainer = document.createElement('div');
+    shardContainer.style.cssText = 'position:fixed; inset:0; pointer-events:none; z-index:100006; overflow:visible;';
+    document.body.appendChild(shardContainer);
+
+    const shards = [];
+    for (let i = 0; i < emberCount; i++) {
+      const rad = (i / emberCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
+      const dist = 42 + Math.random() * 36;
+      const ex = tokenCenterWorldX + Math.cos(rad) * dist;
+      const ey = tokenCenterWorldY + Math.sin(rad) * dist;
+      const shardSize = 4 + Math.random() * 3.5;
+
+      const shard = document.createElement('div');
+      shard.style.cssText = `
+        position: fixed;
+        left: ${tokenCenterWorldX - shardSize / 2}px;
+        top: ${tokenCenterWorldY - shardSize / 2}px;
+        width: ${shardSize}px;
+        height: ${shardSize}px;
+        background: linear-gradient(135deg, #ffffff, #ffb74d);
+        clip-path: polygon(0 20%, 80% 0, 100% 80%, 20% 100%);
+        border-radius: 2px;
+        filter: drop-shadow(0 0 6px #ffb74d);
+        pointer-events: none;
+        opacity: 0.95;
+        transform: rotate(180deg) scale(0.1);
+        transition: left 0.45s cubic-bezier(0.15, 0.85, 0.25, 1), top 0.45s cubic-bezier(0.15, 0.85, 0.25, 1), transform 0.45s ease-out, opacity 0.45s ease-out;
+      `;
+      shardContainer.appendChild(shard);
+      shards.push({ el: shard, ex, ey });
+    }
+
+    void floatingToken.offsetWidth;
+
+    // Trigger disintegration (reverse of materialize):
+    // Shards disperse outward, token contracts, clips inward to 0%, flashes with radiant amber glow, and vanishes
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        floatingToken.style.opacity = '0';
+        floatingToken.style.transform = 'scale(0.3)';
+        floatingToken.style.clipPath = 'circle(0% at 50% 50%)';
+        floatingToken.style.filter = 'brightness(2.2) contrast(1.8) drop-shadow(0 0 16px #ffb74d)';
+
+        shards.forEach(({ el, ex, ey }) => {
+          el.style.left = `${ex}px`;
+          el.style.top = `${ey}px`;
+          el.style.transform = `rotate(${Math.random() * 360}deg) scale(0.65)`;
+          el.style.opacity = '0';
+        });
+      });
+    });
+
+    try {
+      if (window.SoundFX && typeof window.SoundFX.playWhoosh === 'function') {
+        window.SoundFX.playWhoosh();
+      }
+      const snd = new Audio('./sound_effects/threat_increase.mp3');
+      const volSlider = document.getElementById('volume-slider');
+      snd.volume = volSlider ? Math.min(parseFloat(volSlider.value), 0.25) : 0.2;
+      snd.playbackRate = 1.35;
+      snd.play().catch(() => {});
+    } catch(e) {}
+
+    setTimeout(() => {
+      floatingToken.remove();
+      shardContainer.remove();
+    }, 550);
+  });
 };
 
 function checkQuestAdvance() {
@@ -13928,7 +14150,71 @@ window.animateCardToActiveLocation = function(card, callback) {
   }
   
   const rect = el.getBoundingClientRect();
-  el.style.opacity = '0'; // Hide original
+  el.style.opacity = '0'; // Card hides in place without altering layout margins or width
+
+  // Layered departure atmosphere: Ghost Frame, Skeletal Silhouette, Wisps, Spores & Falling Leaves
+  const departWrap = document.createElement('div');
+  departWrap.style.cssText = `position:fixed; left:${rect.left}px; top:${rect.top}px; width:${rect.width}px; height:${rect.height}px; z-index:999; pointer-events:none; overflow:visible;`;
+  departWrap.innerHTML = `
+    <style>
+      @keyframes ghostFrameVanish {
+        0% { opacity: 0.95; transform: scale(1); filter: drop-shadow(0 0 8px rgba(212,175,55,0.7)); }
+        35% { opacity: 0.7; transform: scale(0.98); }
+        100% { opacity: 0; transform: scale(0.91); filter: blur(5px); }
+      }
+      @keyframes branchStencilFade {
+        0% { opacity: 0; transform: scale(0.96); filter: blur(1px); }
+        25% { opacity: 0.45; transform: scale(1); filter: blur(0px); }
+        100% { opacity: 0; transform: scale(1.03); filter: blur(5px); }
+      }
+      @keyframes sporeDrift {
+        0% { transform: translate(0, 0) scale(0.5); opacity: 0; }
+        25% { opacity: 1; }
+        100% { transform: translate(var(--sx), var(--sy)) scale(1.1); opacity: 0; filter: blur(2px); }
+      }
+      @keyframes leafFlutter {
+        0% { transform: translate(0, 0) rotate(0deg); opacity: 0; }
+        20% { opacity: 0.85; }
+        60% { transform: translate(calc(var(--lx) * 0.6), 26px) rotate(calc(var(--lr) * 0.6)); }
+        100% { transform: translate(var(--lx), 62px) rotate(var(--lr)); opacity: 0; }
+      }
+      @keyframes stagingSmokeDrift {
+        0% { transform: translate(-50%, -50%) rotate(0deg) scale(0.35); opacity: 0.9; filter: blur(2px); }
+        50% { opacity: 0.75; filter: blur(5px); }
+        100% { transform: translate(-50%, -50%) translate(var(--tx), var(--ty)) rotate(var(--rot)) scale(1.15); opacity: 0; filter: blur(8px); }
+      }
+    </style>
+
+    <!-- 1. Lingering Ghost Frame (evaporating inward) -->
+    <div style="position:absolute; inset:0; border:2px solid #d4af37; border-radius:6px; box-shadow:0 0 10px rgba(167,139,250,0.6), inset 0 0 8px rgba(212,175,55,0.4); animation:ghostFrameVanish 0.28s ease-out forwards;"></div>
+
+    <!-- 2. Skeletal Branch Watermark Stencil -->
+    <svg viewBox="0 0 144 202" style="position:absolute; inset:0; width:100%; height:100%; animation:branchStencilFade 0.5s ease-out forwards;">
+      <path d="M 72 195 Q 68 140 70 100 Q 72 70 80 20 M 70 115 Q 52 90 32 75 M 71 85 Q 92 65 115 52 M 50 88 Q 42 70 30 65 M 88 72 Q 102 55 118 45" fill="none" stroke="#1c1917" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.8"/>
+      <path d="M 72 195 Q 68 140 70 100 Q 72 70 80 20" fill="none" stroke="#44403c" stroke-width="1.2" stroke-linecap="round" opacity="0.6"/>
+    </svg>
+
+    <!-- 3. Compact Detailed Smoke Wisps -->
+    <div style="position:absolute; left:50%; top:50%; width:0; height:0;">
+      <div style="position:absolute; width:54px; height:48px; background:radial-gradient(ellipse at 45% 45%, rgba(226,232,240,0.85) 0%, rgba(148,163,184,0.5) 40%, rgba(100,116,139,0.15) 65%, transparent 75%); border-radius:45% 55% 40% 60%; --tx:-18px; --ty:-26px; --rot:35deg; animation:stagingSmokeDrift 0.55s cubic-bezier(0.2,0.8,0.25,1) forwards;"></div>
+      <div style="position:absolute; width:64px; height:56px; background:radial-gradient(ellipse at 55% 40%, rgba(241,245,249,0.8) 0%, rgba(167,243,208,0.45) 35%, rgba(56,189,248,0.15) 60%, transparent 75%); border-radius:55% 45% 60% 40%; --tx:18px; --ty:-30px; --rot:-40deg; animation:stagingSmokeDrift 0.6s 0.03s cubic-bezier(0.2,0.8,0.25,1) forwards;"></div>
+      <div style="position:absolute; width:58px; height:60px; background:radial-gradient(ellipse at 40% 60%, rgba(254,243,199,0.7) 0%, rgba(203,213,225,0.45) 35%, rgba(148,163,184,0.15) 60%, transparent 75%); border-radius:50% 50% 45% 55%; --tx:-6px; --ty:-34px; --rot:20deg; animation:stagingSmokeDrift 0.65s 0.06s cubic-bezier(0.2,0.8,0.25,1) forwards;"></div>
+      <div style="position:absolute; width:46px; height:44px; background:radial-gradient(ellipse at 50% 50%, rgba(232,217,168,0.8) 0%, rgba(196,181,253,0.45) 35%, rgba(139,92,246,0.15) 60%, transparent 75%); border-radius:60% 40% 55% 45%; --tx:12px; --ty:-18px; --rot:-25deg; animation:stagingSmokeDrift 0.52s 0.02s cubic-bezier(0.2,0.8,0.25,1) forwards;"></div>
+    </div>
+
+    <!-- 4. Drifting Bioluminescent Forest Spores / Embers -->
+    <div style="position:absolute; left:46%; top:58%; width:3.5px; height:3.5px; border-radius:50%; background:#67e8f9; box-shadow:0 0 6px #67e8f9, 0 0 10px #38bdf8; --sx:-14px; --sy:-52px; animation:sporeDrift 0.65s cubic-bezier(0.2,0.8,0.25,1) forwards;"></div>
+    <div style="position:absolute; left:52%; top:54%; width:3px; height:3px; border-radius:50%; background:#fef08a; box-shadow:0 0 6px #fef08a, 0 0 10px #eab308; --sx:16px; --sy:-60px; animation:sporeDrift 0.7s 0.05s cubic-bezier(0.2,0.8,0.25,1) forwards;"></div>
+    <div style="position:absolute; left:42%; top:48%; width:4px; height:4px; border-radius:50%; background:#86efac; box-shadow:0 0 6px #86efac, 0 0 12px #22c55e; --sx:-8px; --sy:-68px; animation:sporeDrift 0.72s 0.08s cubic-bezier(0.2,0.8,0.25,1) forwards;"></div>
+    <div style="position:absolute; left:56%; top:50%; width:3px; height:3px; border-radius:50%; background:#a7f3d0; box-shadow:0 0 5px #a7f3d0; --sx:12px; --sy:-46px; animation:sporeDrift 0.6s 0.03s cubic-bezier(0.2,0.8,0.25,1) forwards;"></div>
+
+    <!-- 5. Disturbed Leaf Flurry (fluttering downward) -->
+    <div style="position:absolute; left:35%; top:65%; width:11px; height:7px; background:#451a03; border-radius:70% 0 70% 0; box-shadow:0 1px 3px rgba(0,0,0,0.8); --lx:-16px; --lr:140deg; animation:leafFlutter 0.65s cubic-bezier(0.3,0,0.7,1) forwards;"></div>
+    <div style="position:absolute; left:60%; top:60%; width:10px; height:6px; background:#2e1503; border-radius:0 70% 0 70%; box-shadow:0 1px 3px rgba(0,0,0,0.8); --lx:18px; --lr:-160deg; animation:leafFlutter 0.7s 0.06s cubic-bezier(0.3,0,0.7,1) forwards;"></div>
+    <div style="position:absolute; left:48%; top:70%; width:9px; height:6px; background:#3f2208; border-radius:60% 0 60% 0; box-shadow:0 1px 3px rgba(0,0,0,0.8); --lx:6px; --lr:110deg; animation:leafFlutter 0.6s 0.1s cubic-bezier(0.3,0,0.7,1) forwards;"></div>
+  `;
+  document.body.appendChild(departWrap);
+  setTimeout(() => departWrap.remove(), 750);
   
   const stub = document.createElement('div');
   stub.className = 'card';
@@ -13971,8 +14257,10 @@ window.animateCardToActiveLocation = function(card, callback) {
 };
 
 function travelToLocation(loc){
-  if(game.activeLocation || loc._isTraveling) return;
+  if(game.activeLocation || loc._isTraveling || game._travelingInProgress) return;
   loc._isTraveling = true;
+  game._travelingInProgress = true;
+  game.pendingAction = null;
   
   const skipBtn = Array.from(document.querySelectorAll('#action-bar button')).find(b => b.textContent === 'Skip Travel');
   if (skipBtn) {
@@ -14089,6 +14377,7 @@ function travelToLocation(loc){
           }
 
           if (loc.id === 'tower_gate') {
+            window._towerGateMultiplayerSoundPlayed = false;
             let pIdx = 0;
             const processTowerGate = () => {
                 while (pIdx < game.numPlayers && game.eliminated[pIdx]) pIdx++;
@@ -14674,16 +14963,12 @@ function optionallyEngage(enemy, targetPlayerIdx){
     skipBtn.style.pointerEvents = 'none';
   }
 
-  delete cardPositions[enemy._uid];
-  const el = document.querySelector(`.zone-content [data-uid="${enemy._uid}"]`) || document.querySelector(`[data-uid="${enemy._uid}"]`);
-  if(el) { el.style.position = ''; el.style.left = ''; el.style.top = ''; }
-
   window.animateCardToEngaged(enemy, () => {
+    delete cardPositions[enemy._uid];
     if(enemy.id === 'forest_spider') enemy._engagedThisRound = (Number(enemy._engagedThisRound) || 0) + 1;
     game.stagingArea = game.stagingArea.filter(c=>c._uid!==enemy._uid);
     game.engagedEnemies.push(enemy);
     toast('Engaged', `Player ${pIdx + 1} engages ${enemy.name}.`, 'info');
-    spawnBurstAtElement(document.querySelector(`[data-uid="${enemy._uid}"]`), '#c0392b', 15);
     if(enemy.id==='king_spider'){ 
         game.threats[pIdx] = (game.threats[pIdx] || 0) + 1; 
     }
@@ -14780,15 +15065,11 @@ function engagementChecks(){
     
     if(e.id === 'forest_spider') e._engagedThisRound = (Number(e._engagedThisRound) || 0) + 1;
     
-    delete cardPositions[e._uid];
-    const el = document.querySelector(`.zone-content [data-uid="${e._uid}"]`) || document.querySelector(`[data-uid="${e._uid}"]`);
-    if(el) { el.style.position = ''; el.style.left = ''; el.style.top = ''; }
-    
     window.animateCardToEngaged(e, () => {
+      delete cardPositions[e._uid];
       game.stagingArea = game.stagingArea.filter(c=>c._uid!==e._uid);
       game.engagedEnemies.push(e);
       toast('Engagement Check', `${e.name} engages Player ${item.pIdx + 1}.`, 'danger', 2800);
-      spawnBurstAtElement(document.querySelector(`[data-uid="${e._uid}"]`), '#c0392b', 15);
       
       if(e.id==='king_spider'){ game.threats[item.pIdx]++; }
       const finishEngageQueue = () => {
@@ -14839,11 +15120,12 @@ window.animateShadowCard = function(enemyUid, card, cb, idx = 0) {
 
   const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
   const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
+  const uiScale = window._resolutionScale || 1;
 
   const startLeft = deckRect.left + (deckRect.width / 2) - (cardW / 2);
   const startTop = deckRect.top + (deckRect.height / 2) - (cardH / 2);
   const startScale = deckRect.width / cardW;
-  const targetScale = 0.625;
+  const targetScale = 0.625 * uiScale;
   const targetRotate = 8 + (idx * 4);
 
   const ghostWrap = document.createElement('div');
@@ -14911,7 +15193,7 @@ window.animateShadowCard = function(enemyUid, card, cb, idx = 0) {
     const curRect = curEnemyEl ? curEnemyEl.getBoundingClientRect() : enemyRect;
 
     const targetCenterX = curRect.left + (curRect.width * (0.45 + (idx * 0.15))) + (cardW * targetScale / 2);
-    const targetCenterY = curRect.top + 10 + (cardH * targetScale / 2);
+    const targetCenterY = curRect.top + (10 * uiScale) + (cardH * targetScale / 2);
     const targetLeft = targetCenterX - cardW / 2;
     const targetTop = targetCenterY - cardH / 2;
 
@@ -15453,15 +15735,17 @@ window.animateShadowReveal = function(enemy, cb, idx = 0) {
   
   const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
   const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
+  const uiScale = window._resolutionScale || 1;
+  const targetScale = 0.625 * uiScale;
   
   const ghost = document.createElement('div');
   ghost.style.cssText = `
     position: fixed; z-index: 150;
     width: var(--card-w); height: var(--card-h);
     left: ${enemyRect.left + (enemyRect.width * (0.45 + (idx * 0.15)))}px;
-    top: ${enemyRect.top + 10}px;
+    top: ${enemyRect.top + (10 * uiScale)}px;
     transform-origin: top left;
-    transform: scale(0.625);
+    transform: scale(${targetScale});
     perspective: 1000px;
     transition: left 0.5s cubic-bezier(0.25, 0.8, 0.25, 1), top 0.5s cubic-bezier(0.25, 0.8, 0.25, 1), transform 0.5s cubic-bezier(0.25, 0.8, 0.25, 1), opacity 0.5s cubic-bezier(0.25, 0.8, 0.25, 1);
     pointer-events: none;
@@ -15506,8 +15790,14 @@ window.animateShadowReveal = function(enemy, cb, idx = 0) {
   
   void ghost.offsetWidth;
   
-  const hasShadowEffect = !!shadowCard.shadow;
+  let hasShadowEffect = !!shadowCard.shadow;
   let triggersModal = false;
+
+  if (hasShadowEffect && (shadowCard.id === 'oath_eyes_in_the_dark' || shadowCard.id === 'eyes_in_the_dark')) {
+      if (window.game && window.game.currentDefenders && window.game.currentDefenders.length > 0) {
+          hasShadowEffect = false;
+      }
+  }
 
   if (hasShadowEffect) {
     const hastyStrokeCard = game.hand.find(c => c.id === 'hasty_stroke');
@@ -15543,9 +15833,9 @@ window.animateShadowReveal = function(enemy, cb, idx = 0) {
 
   if (triggersModal) {
     // 1. Shift to the revealed position and flip over naturally
-    ghost.style.transform = `scale(0.625) rotate(${8 + (idx * 4)}deg)`;
+    ghost.style.transform = `scale(${targetScale}) rotate(${8 + (idx * 4)}deg)`;
     ghost.style.left = `${enemyRect.left + (enemyRect.width * (0.85 + (idx * 0.15)))}px`;
-    ghost.style.top = `${enemyRect.top + 10}px`;
+    ghost.style.top = `${enemyRect.top + (10 * uiScale)}px`;
     inner.style.transform = 'rotateY(180deg)';
 
     if (window.SoundFX && typeof window.SoundFX.playCardPlay === 'function') {
@@ -15567,9 +15857,9 @@ window.animateShadowReveal = function(enemy, cb, idx = 0) {
       cb();
     }, 550);
   } else {
-	ghost.style.transform = `scale(0.625) rotate(${8 + (idx * 4)}deg)`;
+	ghost.style.transform = `scale(${targetScale}) rotate(${8 + (idx * 4)}deg)`;
 	ghost.style.left = `${enemyRect.left + (enemyRect.width * (0.85 + (idx * 0.15)))}px`;
-	ghost.style.top = `${enemyRect.top + 10}px`;
+	ghost.style.top = `${enemyRect.top + (10 * uiScale)}px`;
 	inner.style.transform = 'rotateY(180deg)';
 	if (window.SoundFX && typeof window.SoundFX.playCardPlay === 'function') {
       window.SoundFX.playCardPlay();
@@ -15713,6 +16003,16 @@ function resolveEnemyAttack(enemy, defender){
       if (window.SoundFX && enemy.id === 'east_bight_patrol' && typeof window.SoundFX.playEastBightPatrolAttack === 'function') {
         window.SoundFX.playEastBightPatrolAttack();
       }
+      if (enemy && (enemy.id === 'cavern_guardian' || enemy.name === 'Cavern Guardian')) {
+        if (window.SoundFX && typeof window.SoundFX.playSwordAttack === 'function') {
+          window.SoundFX.playSwordAttack();
+        }
+      }
+      if (enemy && (enemy.id === 'orc_guard' || enemy.name === 'Orc Guard')) {
+        if (window.SoundFX && typeof window.SoundFX.playAxeAttack === 'function') {
+          window.SoundFX.playAxeAttack();
+        }
+      }
     };
 
     const processEnemyTraits = () => {
@@ -15781,12 +16081,12 @@ function resolveEnemyAttack(enemy, defender){
         }
 
         setTimeout(() => {
-          processEnemyTraits();
+						processEnemyTraits();
 
-          if (enemy && enemy.id === 'dol_guldur_orcs' && window.triggerDolGuldurOrcsSlash) {
-            window.triggerDolGuldurOrcsSlash(targetDef._uid, true);
-          }
-          if (enemy && enemy.id === 'chieftain_ufthak' && window.triggerChieftainUfthakSlash) {
+						if (enemy && (enemy.id === 'dol_guldur_orcs' || enemy.id === 'nibin_goblin_chieftain' || enemy.id === 'goblin_chieftain') && window.triggerDolGuldurOrcsSlash) {
+							window.triggerDolGuldurOrcsSlash(targetDef._uid, true);
+						}
+						if (enemy && enemy.id === 'chieftain_ufthak' && window.triggerChieftainUfthakSlash) {
             window.triggerChieftainUfthakSlash(targetDef._uid, true);
           }
           if (enemy && enemy.id === 'dol_guldur_beastmaster' && window.triggerBeastmasterBite) {
@@ -15794,6 +16094,12 @@ function resolveEnemyAttack(enemy, defender){
           }
           if (enemy && enemy.id === 'hummerhorns' && window.triggerHummerhornsAttackSting) {
             window.triggerHummerhornsAttackSting(targetDef._uid);
+          }
+          if (enemy && (enemy.id === 'cavern_guardian' || enemy.name === 'Cavern Guardian') && window.triggerCavernGuardianSwordSlash) {
+            window.triggerCavernGuardianSwordSlash(targetDef._uid, true);
+          }
+          if (enemy && (enemy.id === 'orc_guard' || enemy.name === 'Orc Guard') && window.triggerOrcGuardAxeAttack) {
+            window.triggerOrcGuardAxeAttack(targetDef._uid, true);
           }
           targetDef.damage += dmg;
           if(window.shakeCard) window.shakeCard(targetDef._uid);
@@ -15862,7 +16168,7 @@ function resolveEnemyAttack(enemy, defender){
                         setTimeout(() => {
                             processEnemyTraits();
                             
-							if (enemy && enemy.id === 'dol_guldur_orcs' && window.triggerDolGuldurOrcsSlash) {
+							if (enemy && (enemy.id === 'dol_guldur_orcs' || enemy.id === 'nibin_goblin_chieftain' || enemy.id === 'goblin_chieftain') && window.triggerDolGuldurOrcsSlash) {
 								window.triggerDolGuldurOrcsSlash(targetHero._uid, true);
 							}
 							if (enemy && enemy.id === 'chieftain_ufthak' && window.triggerChieftainUfthakSlash) {
@@ -15873,6 +16179,12 @@ function resolveEnemyAttack(enemy, defender){
 							}
 							if (enemy && enemy.id === 'hummerhorns' && window.triggerHummerhornsAttackSting) {
 								window.triggerHummerhornsAttackSting(targetHero._uid);
+							}
+							if (enemy && (enemy.id === 'cavern_guardian' || enemy.name === 'Cavern Guardian') && window.triggerCavernGuardianSwordSlash) {
+								window.triggerCavernGuardianSwordSlash(targetHero._uid, true);
+							}
+							if (enemy && (enemy.id === 'orc_guard' || enemy.name === 'Orc Guard') && window.triggerOrcGuardAxeAttack) {
+								window.triggerOrcGuardAxeAttack(targetHero._uid, true);
 							}
 							targetHero.damage += totalAttack;
 							if(window.shakeCard) window.shakeCard(targetHero._uid);
@@ -16278,10 +16590,11 @@ function resolveEnemyAttack(enemy, defender){
                                             const wrEl = document.querySelector(`[data-uid="${shadow._uid}"]`);
                                             if (wrEl && ghost.parentNode) {
                                                 const wrRect = wrEl.getBoundingClientRect();
-                                                const targetScale = 0.625;
+                                                const uiScale = window._resolutionScale || 1;
+                                                const targetScale = 0.625 * uiScale;
                                                 const targetRotate = 8 + (wrShadowIdx * 4);
                                                 const targetLeft = wrRect.left + (wrRect.width * (0.85 + (wrShadowIdx * 0.15)));
-                                                const targetTop = wrRect.top + 10;
+                                                const targetTop = wrRect.top + (10 * uiScale);
                                                 ghost.style.transition = 'left 0.4s cubic-bezier(0.25, 0.8, 0.25, 1), top 0.4s cubic-bezier(0.25, 0.8, 0.25, 1), transform 0.4s cubic-bezier(0.25, 0.8, 0.25, 1), opacity 0.4s cubic-bezier(0.25, 0.8, 0.25, 1)';
                                                 ghost.style.left = `${targetLeft}px`;
                                                 ghost.style.top = `${targetTop}px`;
@@ -17220,6 +17533,11 @@ function resolveEnemyAttack(enemy, defender){
         const eligibleSpiritHeroes = hastyStrokeCard ? getEligibleHeroes(hastyStrokeCard).filter(h => h.resources >= 1) : [];
         
         let hasShadowEffect = shadowCard && shadowCard.shadow;
+        if (hasShadowEffect && (shadowCard.id === 'oath_eyes_in_the_dark' || shadowCard.id === 'eyes_in_the_dark')) {
+            if (game.currentDefenders && game.currentDefenders.length > 0) {
+                hasShadowEffect = false;
+            }
+        }
         
         // Suppress the Hasty Stroke prompt if the shadow effect is completely toothless (e.g. discards attachments when we have none)
         if (hasShadowEffect) {
@@ -17260,11 +17578,12 @@ function resolveEnemyAttack(enemy, defender){
               const enemyEl = document.querySelector(`[data-uid="${enemy._uid}"]`);
               if (enemyEl && ghost.parentNode) {
                 const enemyRect = enemyEl.getBoundingClientRect();
+                const uiScale = window._resolutionScale || 1;
                 
-                const targetScale = 0.625;
+                const targetScale = 0.625 * uiScale;
                 const targetRotate = 8 + (idx * 4);
                 const targetLeft = enemyRect.left + (enemyRect.width * (0.85 + (idx * 0.15)));
-                const targetTop = enemyRect.top + 10;
+                const targetTop = enemyRect.top + (10 * uiScale);
                 
                 ghost.style.transition = 'left 0.4s cubic-bezier(0.25, 0.8, 0.25, 1), top 0.4s cubic-bezier(0.25, 0.8, 0.25, 1), transform 0.4s cubic-bezier(0.25, 0.8, 0.25, 1), opacity 0.4s cubic-bezier(0.25, 0.8, 0.25, 1)';
                 ghost.style.left = `${targetLeft}px`;
@@ -17968,6 +18287,16 @@ function defeatEnemy(enemy, attacker){
     if (window.SoundFX && (enemy.id === 'eastern_crows' || enemy.name === 'Eastern Crows') && typeof window.SoundFX.playEasternCrowsDies === 'function') {
       window.SoundFX.playEasternCrowsDies();
     }
+    if (window.playGoblinTroopDefeatedAudio && (enemy.id === 'oath_goblin_troop' || enemy.id === 'goblin_troop' || enemy.name === 'Goblin Troop')) {
+      window.playGoblinTroopDefeatedAudio();
+    }
+    if (enemy && (enemy.id === 'cavern_guardian' || enemy.name === 'Cavern Guardian')) {
+      enemy._isDefeatedEnemy = true;
+      enemy._deathSoundPlayed = true;
+      if (typeof window.playCavernGuardianDiesImmediately === 'function') {
+        window.playCavernGuardianDiesImmediately(enemy);
+      }
+    }
     toast('Enemy Defeated!', `${enemy.name} is destroyed!`, 'success', 3000);
     if(enemy.victory){
       game.vp += enemy.victory;
@@ -18072,6 +18401,9 @@ function defeatEnemy(enemy, attacker){
     render(); // Instantly hide the shadow tokens before the ghosts spawn
     
     activeShadows.forEach((sc, idx) => {
+      sc._isShadowCard = true;
+      sc._isShadowDiscard = true;
+      sc._deathSoundPlayed = true;
       animateShadowDiscard(enemy, () => {
         // 'true' flag bypasses generic slide physics since animateShadowDiscard handles it
         discardCard(sc, game.encounterDiscard, true); 
@@ -18105,6 +18437,10 @@ function animateShadowDiscard(enemy, callback, sc, idx = 0) {
     if (callback) callback();
     return;
   }
+  shadowCard._isShadowCard = true;
+  shadowCard._isShadowDiscard = true;
+  shadowCard._deathSoundPlayed = true;
+  window._shadowDiscardInProgress = true;
   
   const enemyEl = document.querySelector(`[data-uid="${enemy._uid}"]`);
   const discardEl = document.getElementById('encounter-discard-pile');
@@ -18118,8 +18454,9 @@ function animateShadowDiscard(enemy, callback, sc, idx = 0) {
   
   const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
   const cardH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-h')) || 202;
+  const uiScale = window._resolutionScale || 1;
   
-  let startRect = { left: enemyRect.left + 65 + (idx * 15), top: enemyRect.top + 10, width: cardW * 0.625, height: cardH * 0.625 };
+  let startRect = { left: enemyRect.left + (enemyRect.width * (0.45 + (idx * 0.15))), top: enemyRect.top + (10 * uiScale), width: cardW * 0.625 * uiScale, height: cardH * 0.625 * uiScale };
   const existingToken = enemyEl.querySelectorAll('.shadow-revealed')[idx] || enemyEl.querySelectorAll('.token.shadow')[idx];
   if (existingToken) {
       startRect = existingToken.getBoundingClientRect();
@@ -18161,6 +18498,9 @@ function animateShadowDiscard(enemy, callback, sc, idx = 0) {
   setTimeout(() => {
     ghost.remove();
     if (callback) callback();
+    setTimeout(() => {
+      window._shadowDiscardInProgress = false;
+    }, 250);
   }, 800);
 }
 
@@ -18627,6 +18967,9 @@ function refreshPhase(){
       
       // 1. Kick off shadow discards immediately
       activeShadows.forEach((sc, idx) => {
+         sc._isShadowCard = true;
+         sc._isShadowDiscard = true;
+         sc._deathSoundPlayed = true;
          animateShadowDiscard(wr, () => {
            discardCard(sc, game.encounterDiscard, true);
            render();
@@ -18895,6 +19238,9 @@ function continueRefreshPhase(){
       if (activeShadows.length > 0) {
         e._shadowDiscarding = true;
         activeShadows.forEach((sc, idx) => {
+          sc._isShadowCard = true;
+          sc._isShadowDiscard = true;
+          sc._deathSoundPlayed = true;
           shadowPromises.push(new Promise(resolve => {
             animateShadowDiscard(e, () => {
               discardCard(sc, game.encounterDiscard, true);
@@ -19080,7 +19426,7 @@ function continueRefreshPhase(){
                       }
                     };
                     processWebsForHeroes(0);
-                }, 500);
+                }, 10);
               };
 
       if (shadowPromises.length > 0) {
@@ -19090,7 +19436,7 @@ function continueRefreshPhase(){
       } else {
         proceedRefresh();
       }
-    }, 600);
+    }, 15);
   });
 }
 
@@ -19366,6 +19712,13 @@ window._animateCardToDiscard = function(card, isPlayer, callback, startRect = nu
 function checkHeroDeath(hero){
   if(hero.damage >= hero.hp && !hero._dead){
     hero._dead = true; // Mark dead immediately to prevent duplicate triggers
+    delete hero._defendingAgainstName;
+    const defEl = document.querySelector(`[data-uid="${hero._uid}"]`);
+    if (defEl) {
+      defEl.querySelectorAll('.defending-label, div').forEach(d => {
+        if (d.classList.contains('defending-label') || d.textContent.startsWith('Defending:')) d.remove();
+      });
+    }
     
     // Check Horn of Gondor
     const hornHero = game.heroes.find(h=>h.attached && h.attached.some(a=>a.id==='horn_of_gondor'));
@@ -19391,6 +19744,8 @@ function checkHeroDeath(hero){
        window.onAllyLeftPlay(hero.name, hero._ownerIdx);
     }
 
+    window._deathAnimatingCount = (window._deathAnimatingCount || 0) + 1;
+    const baseDelay = 200;
     const atts = [...(hero.attached || [])];
     
     atts.forEach((a, idx) => {
@@ -19412,10 +19767,10 @@ function checkHeroDeath(hero){
            hero.attached = hero.attached.filter(x => x._uid !== a._uid);
            render();
         }
-      }, idx * 100);
+      }, baseDelay + (idx * 100));
     });
 
-    const cardDelay = (atts.length * 100) + 50;
+    const cardDelay = (atts.length * 100) + baseDelay;
 
     setTimeout(() => {
       if(hero.isHero){
@@ -19441,6 +19796,7 @@ function checkHeroDeath(hero){
           discardCard(hero, game.heroDiscard, true);
           const remainingHeroes = game.heroes.filter(h => (h._ownerIdx === hero._ownerIdx || (h._ownerIdx === undefined && hero._ownerIdx === 0)) && !h._prisoner);
           if(remainingHeroes.length === 0) eliminatePlayer(hero._ownerIdx || 0);
+          window._deathAnimatingCount = Math.max(0, (window._deathAnimatingCount || 1) - 1);
           render();
         });
         toast('Hero Fallen!', `${hero.name} has fallen!`, 'danger', 4000);
@@ -19451,6 +19807,7 @@ function checkHeroDeath(hero){
         game.allies = game.allies.filter(a=>a._uid!==hero._uid);
         window._animateCardToDiscard(hero, true, () => {
           discardCard(hero, game.playerDiscard, true);
+          window._deathAnimatingCount = Math.max(0, (window._deathAnimatingCount || 1) - 1);
           render();
         });
         toast('Ally Defeated!', `${hero.name} has been destroyed!`, 'danger', 3000);
@@ -19572,7 +19929,6 @@ function endGame(victory){
     window._triggerLiquidMelt = function() {
       if (window._isMelting) return;
       window._isMelting = true;
-      if (window.SoundFX && window.SoundFX.playWhoosh) window.SoundFX.playWhoosh();
 
       if (window.MusicSynth && window.MusicSynth.audio) {
         const startVol = window.MusicSynth.audio.volume;
@@ -19607,12 +19963,27 @@ function endGame(victory){
       appWrap.style.transform = 'scaleY(1.25) translateY(60px) skewY(2deg)';
       appWrap.style.opacity = '0';
 
+      const endScreen = document.getElementById('end-screen');
+      if (endScreen) {
+        endScreen.style.transition = 'filter 0.85s ease-in, transform 0.9s ease-in, opacity 0.85s ease-in';
+        endScreen.style.filter = 'url(#liquidMeltFilter) blur(3px)';
+        endScreen.style.transform = 'scaleY(1.25) translateY(60px) skewY(2deg)';
+        endScreen.style.opacity = '0';
+        endScreen.style.pointerEvents = 'none';
+      }
+
       const darkOverlay = document.createElement('div');
-      darkOverlay.style.cssText = 'position:fixed;inset:0;z-index:9999999;pointer-events:all;background:radial-gradient(circle at 50% 30%, rgba(20,10,5,0.95), #000 90%);opacity:0;transition:opacity 0.75s ease-in;';
+      darkOverlay.style.cssText = 'position:fixed;inset:0;z-index:9999999;pointer-events:all;background:#000;opacity:0;transition:opacity 0.75s ease-in;';
       document.body.appendChild(darkOverlay);
       requestAnimationFrame(() => { darkOverlay.style.opacity = '1'; });
 
-      setTimeout(() => { location.reload(); }, 900);
+      setTimeout(() => {
+        if (endScreen) {
+          endScreen.classList.remove('show');
+          endScreen.style.display = 'none';
+        }
+        location.reload();
+      }, 900);
     };
 
     /* =====================================================================
@@ -19635,9 +20006,9 @@ function getThreat(c, clampZero = true){
   }
   return clampZero ? Math.max(0, thr) : thr;
 }
-function addProgressToQuest(amount){
+function addProgressToQuest(amount, bypassActiveLocation = false){
   let remaining = amount;
-  if(game.activeLocation){
+  if(game.activeLocation && !bypassActiveLocation){
     const needed = game.activeLocation.questPts - game.activeLocation.progress;
     const progressToLocation = Math.min(remaining, needed);
     game.activeLocation.progress += progressToLocation;
@@ -20235,7 +20606,40 @@ function renderStaging(){
     el.innerHTML = '<div style="opacity:0.5;font-style:italic;font-family:\'Cormorant Garamond\';font-size:1.1rem;align-self:center;margin-left:auto;margin-right:auto;">The path ahead is quiet... for now.</div>';
     return;
   }
+
+  // Lock each staging card to its slot so cards never shift or move when neighbor cards leave
+  const cardW = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--card-w')) || 144;
+  const stepX = cardW + 10;
+  const occupiedSlots = new Set();
+  
+  game.stagingArea.forEach(c => {
+    if (cardPositions[c._uid]) {
+      const slot = Math.round((cardPositions[c._uid].x - 10) / stepX);
+      occupiedSlots.add(slot);
+    }
+  });
+
+  let nextSlot = 0;
+  game.stagingArea.forEach(c => {
+    if (!cardPositions[c._uid]) {
+      while (occupiedSlots.has(nextSlot)) {
+        nextSlot++;
+      }
+      cardPositions[c._uid] = { x: 10 + nextSlot * stepX, y: 19 };
+      occupiedSlots.add(nextSlot);
+    }
+  });
+
   el.innerHTML = game.stagingArea.map(c=>cardHTML(c)).join('');
+  el.querySelectorAll('.card').forEach(cardEl => {
+    const uid = cardEl.getAttribute('data-uid');
+    if (uid && cardPositions[uid]) {
+      cardEl.style.position = 'absolute';
+      cardEl.style.left = cardPositions[uid].x + 'px';
+      cardEl.style.top = cardPositions[uid].y + 'px';
+      cardEl.style.zIndex = '3';
+    }
+  });
 }
 
 function renderEngaged(){
@@ -20495,11 +20899,11 @@ function cardHTML(c, enlarged=false, hideAttached=false, upright=false, hideShad
   if(c.id === 'beorn' && c._beornActivated && window._beornActiveSparks && !enlarged) extraClasses += ' beorn-aura-active';
 
   if(!enlarged){
-    cursorStyle='cursor:pointer;';
-    clickHandler=`onclick="window._cardClick('${c._uid}')"`;
-    if(c.type==='ally' || c.type==='attachment' || c.type==='event'){
-      const isActionWindow = ['planning', 'quest-commit', 'quest-action-1', 'quest-action-2', 'travel', 'encounter-opt', 'encounter-window-1', 'encounter-checks', 'encounter-window-2', 'combat-window-1', 'combat-enemy-attack', 'combat-defend', 'combat-window-defend', 'combat-window-shadow', 'combat-window-wolf-rider', 'combat-window-after-attack', 'combat-resolve-enemy', 'combat-player-attack', 'refresh'].includes(game.phase);
-      const isPlayablePhase = (c.type==='event') ? isActionWindow : (game.phase==='planning');
+		cursorStyle='cursor:pointer;';
+		clickHandler=`onclick="window._cardClick('${c._uid}')"`;
+		if(c.type==='ally' || c.type==='attachment' || c.type==='event'){
+			const isActionWindow = ['resource', 'resource-window', 'planning', 'quest-commit', 'quest-action-1', 'quest-action-2', 'travel', 'encounter-opt', 'encounter-window-1', 'encounter-checks', 'encounter-window-2', 'combat-window-1', 'combat-enemy-attack', 'combat-defend', 'combat-window-defend', 'combat-window-shadow', 'combat-window-wolf-rider', 'combat-window-after-attack', 'combat-resolve-enemy', 'combat-player-attack', 'refresh'].includes(game.phase);
+			const isPlayablePhase = (c.type==='event') ? isActionWindow : (game.phase==='planning');
       if(isPlayablePhase && !canPlayCard(c)){
         cursorStyle='cursor:not-allowed;';
       }
@@ -20686,7 +21090,7 @@ function cardHTML(c, enlarged=false, hideAttached=false, upright=false, hideShad
   let defendingLabel = '';
   if (c._defendingAgainstName && !enlarged) {
 	const rotation = c.exhausted ? 'rotate(-90deg)' : 'rotate(0deg)';
-	defendingLabel = `<div style="position:absolute; top:50%; left:50%; transform:translate(-50%, -50%) ${rotation}; background:rgba(0,0,0,0.95); border:2px solid #ff3333; color:#ff3333; padding:4px 10px; border-radius:6px; font-family:'Cinzel',serif; font-size:1.1rem; font-weight:900; z-index:35; white-space:nowrap; box-shadow:0 4px 12px rgba(0,0,0,0.9); pointer-events:none; text-shadow:0 1px 3px #000;">Defending: ${c._defendingAgainstName}</div>`;
+	defendingLabel = `<div class="defending-label" style="position:absolute; top:50%; left:50%; transform:translate(-50%, -50%) ${rotation}; background:rgba(0,0,0,0.95); border:2px solid #ff3333; color:#ff3333; padding:4px 10px; border-radius:6px; font-family:'Cinzel',serif; font-size:1.1rem; font-weight:900; z-index:35; white-space:nowrap; box-shadow:0 4px 12px rgba(0,0,0,0.9); pointer-events:none; text-shadow:0 1px 3px #000;">Defending: ${c._defendingAgainstName}</div>`;
   }
 
   let committedLabel = '';
@@ -20757,7 +21161,7 @@ function cardHTML(c, enlarged=false, hideAttached=false, upright=false, hideShad
     extraClasses += ' actionable-board';
   }
 
-  const isPlayablePhase = (c.type==='event') ? ['resource-window', 'planning', 'quest-commit', 'quest-action-1', 'quest-action-2', 'travel', 'encounter-opt', 'encounter-window-1', 'encounter-checks', 'encounter-window-2', 'combat-window-1', 'combat-enemy-attack', 'combat-defend', 'combat-window-defend', 'combat-window-shadow', 'combat-window-wolf-rider', 'combat-window-after-attack', 'combat-resolve-enemy', 'combat-player-attack', 'refresh'].includes(game.phase) : (game.phase==='planning');
+  const isPlayablePhase = (c.type==='event') ? ['resource', 'resource-window', 'planning', 'quest-commit', 'quest-action-1', 'quest-action-2', 'travel', 'encounter-opt', 'encounter-window-1', 'encounter-checks', 'encounter-window-2', 'combat-window-1', 'combat-enemy-attack', 'combat-defend', 'combat-window-defend', 'combat-window-shadow', 'combat-window-wolf-rider', 'combat-window-after-attack', 'combat-resolve-enemy', 'combat-player-attack', 'refresh'].includes(game.phase) : (game.phase==='planning');
   if(!enlarged && game.hand.includes(c) && isPlayablePhase && canPlayCard(c)) {
     if (c.id === 'valiant_sacrifice') {
       extraClasses += ' actionable-board';
@@ -21316,12 +21720,13 @@ if(c.id==='gleowine' && !c.exhausted && canActivateAlly(c)){
 		}
 	}
 	if(game.pendingAction==='travel' && c.type==='location'){
-    if (!game.stagingArea.includes(c)) return;
+    if (!game.stagingArea.includes(c) || game.activeLocation || c._isTraveling || game._travelingInProgress || isAnyModalOpen()) return;
+    game.pendingAction = null;
     showConfirmModal(
       'Travel to Location',
       `<span style="font-size:1.6rem; font-weight:600; line-height:1.45; color:var(--parchment);">Do you want to travel to <strong>${c.name}</strong>?</span>`,
       () => { travelToLocation(c); },
-      () => {}
+      () => { if (!game.activeLocation && !game._travelingInProgress && game.phase === 'travel') game.pendingAction = 'travel'; }
     );
     return;
   }
@@ -22092,7 +22497,7 @@ window._resolvingValiantSacrifice = false;
 
 window.waitForAllyDeaths = function(cb) {
   if (!cb) return;
-  if (window._allyDeathTimer || window._resolvingValiantSacrifice) {
+  if (window._allyDeathTimer || window._resolvingValiantSacrifice || (window._deathAnimatingCount && window._deathAnimatingCount > 0)) {
      setTimeout(() => window.waitForAllyDeaths(cb), 50);
   } else {
      cb();
@@ -25005,10 +25410,12 @@ if (debugSpawnBtn) {
         <button class="btn" onclick="document.getElementById('modal-overlay').classList.remove('show'); window._debugSpawnPlayerCard();">Player Card</button>
         <button class="btn" onclick="document.getElementById('modal-overlay').classList.remove('show'); window._debugAddProgress();">Add Progress</button>
         <button class="btn" onclick="document.getElementById('modal-overlay').classList.remove('show'); window._debugAddResources();">Add Resources</button>
+        <button class="btn" onclick="document.getElementById('modal-overlay').classList.remove('show'); window._debugChangePlayerThreat();">Change Threat</button>
         <button class="btn" onclick="document.getElementById('modal-overlay').classList.remove('show'); window._debugViewPlayerDeck();">View Player Deck</button>
         <button class="btn" onclick="document.getElementById('modal-overlay').classList.remove('show'); window._debugSpawnEncounterCard();">Encounter Card</button>
         <button class="btn" onclick="document.getElementById('modal-overlay').classList.remove('show'); window._debugViewEncounterDeck();">View Encounter Deck</button>
         <button class="btn" onclick="document.getElementById('modal-overlay').classList.remove('show'); window._debugModifyEnemyStats();">Modify Enemy Stats</button>
+        <button class="btn" style="border-color:#ff5252;color:#ff5252;" onclick="document.getElementById('modal-overlay').classList.remove('show'); window._debugKillCard();">💀 Kill Card</button>
       </div>
       <div class="modal-actions" style="margin-top:1.5rem;">
         <button class="btn" onclick="document.getElementById('modal-overlay').classList.remove('show')">Cancel</button>
@@ -25017,6 +25424,134 @@ if (debugSpawnBtn) {
     $('modal-overlay').classList.add('show');
   };
 }
+
+window._debugKillCard = function() {
+  const killable = [
+    ...game.heroes.filter(h => !h._dead),
+    ...game.allies.filter(a => !a._dead),
+    ...game.engagedEnemies,
+    ...game.stagingArea.filter(c => c.type === 'enemy' || c.type === 'enemy-immune' || c.type === 'location')
+  ];
+  if (game.activeLocation) killable.push(game.activeLocation);
+
+  if (killable.length === 0) {
+    toast('Debug', 'No cards in play to kill.', 'info');
+    return;
+  }
+
+  showCardPicker('Kill Card', '<span style="font-size:1.6rem;font-weight:600;color:var(--parchment);text-align:center;">Choose any card in play to destroy:</span>', killable, (chosen) => {
+    if (!chosen) return;
+    if (chosen.isHero) {
+      chosen.damage = chosen.hp || 99;
+      checkHeroDeath(chosen);
+      toast('Debug', `Killed hero ${chosen.name}.`, 'danger');
+    } else if (chosen.type === 'ally') {
+      chosen.damage = chosen.hp || 99;
+      checkHeroDeath(chosen);
+      toast('Debug', `Killed ally ${chosen.name}.`, 'danger');
+    } else if (chosen.type === 'enemy' || chosen.type === 'enemy-immune') {
+      defeatEnemy(chosen, null);
+      toast('Debug', `Killed enemy ${chosen.name}.`, 'danger');
+    } else if (chosen.type === 'location') {
+      chosen.progress = chosen.questPts || 99;
+      checkLocationExplored(chosen);
+      toast('Debug', `Explored location ${chosen.name}.`, 'danger');
+    }
+    render();
+  }, 'Cancel');
+};
+
+window._debugChangePlayerThreat = function(playerIdx) {
+  let pIdx = (playerIdx !== undefined) ? playerIdx : (game.activeTabPlayerIdx || 0);
+
+  const renderModal = () => {
+    const m = $('modal-content');
+    if (!m) return;
+    m.classList.remove('modal-six-col');
+    const curThreat = (game.threats && game.threats[pIdx] !== undefined) ? game.threats[pIdx] : (game.threat || 0);
+
+    let playerSelectorHTML = '';
+    if (game.numPlayers > 1) {
+      playerSelectorHTML = `
+        <div style="display:flex; justify-content:center; gap:8px; margin-bottom:1.2rem; flex-wrap:wrap;">
+          ${Array.from({length: game.numPlayers}).map((_, i) => `
+            <button class="btn" style="padding:0.4rem 1rem; font-size:1.1rem; ${i === pIdx ? 'border-color:var(--gold-bright); color:var(--gold-bright); background:rgba(212,175,55,0.15);' : 'opacity:0.7;'}" onclick="window._debugChangePlayerThreat(${i})">
+              Player ${i + 1} (${game.threats[i]})
+            </button>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    m.innerHTML = `
+      <h2 style="font-size:2.2rem; color:var(--gold-bright); margin-bottom:0.5rem;">Change Player Threat</h2>
+      <p style="font-size:1.4rem; color:var(--parchment-dark); margin-bottom:1rem; text-align:center;">
+        Adjust threat for Player ${pIdx + 1}:
+      </p>
+      ${playerSelectorHTML}
+      <div style="display:flex; flex-direction:column; align-items:center; gap:16px; margin:1.2rem 0;">
+        <div style="display:flex; align-items:center; justify-content:center; gap:16px; background:rgba(0,0,0,0.5); padding:12px 24px; border-radius:8px; border:1.5px solid var(--gold-deep);">
+          <span style="font-family:'Cinzel',serif; font-size:1.4rem; color:var(--parchment-dark);">Current Threat:</span>
+          <span style="font-family:'Cinzel',serif; font-size:2.8rem; font-weight:bold; color:var(--blood-bright); min-width:60px; text-align:center;">${curThreat}</span>
+        </div>
+
+        <div style="display:flex; gap:8px; justify-content:center; flex-wrap:wrap;">
+          <button class="btn" style="min-width:48px; padding:0.4rem 0.8rem; font-size:1.1rem;" onclick="window._debugAdjustPlayerThreat(${pIdx}, -10)">−10</button>
+          <button class="btn" style="min-width:48px; padding:0.4rem 0.8rem; font-size:1.1rem;" onclick="window._debugAdjustPlayerThreat(${pIdx}, -5)">−5</button>
+          <button class="btn" style="min-width:48px; padding:0.4rem 0.8rem; font-size:1.1rem;" onclick="window._debugAdjustPlayerThreat(${pIdx}, -1)">−1</button>
+          <button class="btn" style="min-width:48px; padding:0.4rem 0.8rem; font-size:1.1rem;" onclick="window._debugAdjustPlayerThreat(${pIdx}, 1)">+1</button>
+          <button class="btn" style="min-width:48px; padding:0.4rem 0.8rem; font-size:1.1rem;" onclick="window._debugAdjustPlayerThreat(${pIdx}, 5)">+5</button>
+          <button class="btn" style="min-width:48px; padding:0.4rem 0.8rem; font-size:1.1rem;" onclick="window._debugAdjustPlayerThreat(${pIdx}, 10)">+10</button>
+        </div>
+
+        <div style="display:flex; align-items:center; gap:10px; margin-top:6px;">
+          <input type="number" id="debug-exact-threat-input" value="${curThreat}" min="0" max="99" style="width:80px; padding:0.5rem; text-align:center; font-size:1.4rem; background:var(--ink); color:#fff; border:1px solid var(--gold-deep); border-radius:4px; font-family:'Cinzel',serif;">
+          <button class="btn" style="padding:0.5rem 1.2rem; font-size:1.1rem; border-color:var(--gold-bright); color:var(--gold-bright);" onclick="const val = parseInt(document.getElementById('debug-exact-threat-input').value, 10); if (!isNaN(val)) window._debugSetPlayerThreat(${pIdx}, val);">Set Exact</button>
+        </div>
+      </div>
+
+      <div class="modal-actions" style="margin-top:1.5rem; display:flex; gap:10px; justify-content:center; flex-wrap:wrap;">
+        <button class="btn" onclick="document.getElementById('modal-overlay').classList.remove('show'); document.getElementById('debug-spawn-btn').click();">Back to Debug</button>
+        <button class="btn" style="border-color:var(--gold-bright); color:var(--gold-bright);" onclick="document.getElementById('modal-overlay').classList.remove('show')">Done</button>
+      </div>
+    `;
+    $('modal-overlay').classList.add('show');
+  };
+
+  window._debugCurrentThreatEditorRenderer = renderModal;
+  renderModal();
+};
+
+window._debugAdjustPlayerThreat = function(pIdx, delta) {
+  const cur = (game.threats && game.threats[pIdx] !== undefined) ? game.threats[pIdx] : (game.threat || 0);
+  window._debugSetPlayerThreat(pIdx, cur + delta);
+};
+
+window._debugSetPlayerThreat = function(pIdx, val) {
+  const newThreat = Math.max(0, val);
+  if (!game.threats) game.threats = [0];
+  game.threats[pIdx] = newThreat;
+  if (pIdx === 0 || game.numPlayers === 1) {
+    game.threat = newThreat;
+  }
+  toast('Debug', `Player ${pIdx + 1} Threat set to ${newThreat}.`, 'info');
+  if (newThreat >= 50 && typeof eliminatePlayer === 'function' && !game.eliminated[pIdx]) {
+    eliminatePlayer(pIdx);
+  }
+  render();
+  if (window._debugCurrentThreatEditorRenderer) {
+    window._debugCurrentThreatEditorRenderer();
+  }
+};
+
+window._debugKillEnemy = function(uid) {
+  const enemy = [...game.stagingArea, ...game.engagedEnemies].find(e => e._uid === uid);
+  if (!enemy) return;
+  toast('Debug', `Killed ${enemy.name}.`, 'danger');
+  defeatEnemy(enemy, null);
+  $('modal-overlay').classList.remove('show');
+  render();
+};
 
 window._debugModifyEnemyStats = function() {
   const enemies = [...game.stagingArea.filter(c => c.type === 'enemy' || c.type === 'enemy-immune'), ...game.engagedEnemies];
@@ -25076,8 +25611,9 @@ window._debugOpenEnemyStatEditor = function(enemy) {
           </div>
         </div>
       </div>
-      <div class="modal-actions" style="margin-top:1.2rem;">
+      <div class="modal-actions" style="margin-top:1.2rem; display:flex; gap:10px; justify-content:center; flex-wrap:wrap;">
         <button class="btn" onclick="window._debugModifyEnemyStats()">Back</button>
+        <button class="btn" style="border-color:#ff5252; color:#ff5252; background:rgba(255,82,82,0.12);" onclick="window._debugKillEnemy('${enemy._uid}')">💀 Kill Card</button>
         <button class="btn" style="border-color:var(--gold-bright);color:var(--gold-bright);" onclick="document.getElementById('modal-overlay').classList.remove('show')">Done</button>
       </div>
     `;
@@ -25217,18 +25753,25 @@ window._debugSpawnEncounterCard = function() {
           {label: 'Active Location (if location)', cb: () => {
             if (spawned.type === 'location') {
               if (game.activeLocation) {
-                 toast('Debug', 'There is already an active location. Please explore or remove it first.', 'danger');
-                 setTimeout(promptAgain, 10);
+                window.showConfirmModal('Active Location Exists', `There is already an active location (<strong>${game.activeLocation.name}</strong>). Replace it with <strong>${spawned.name}</strong> and discard the current one?`, () => {
+                  if (game.activeLocation) {
+                    game.encounterDiscard.push(game.activeLocation);
+                  }
+                  game.activeLocation = spawned;
+                  toast('Debug', `Spawned ${spawned.name} as active location.`, 'info');
+                  render();
+                  setTimeout(promptAgain, 10);
+                }, () => {
+                  setTimeout(promptAgain, 10);
+                });
               } else {
-                 game.stagingArea.push(spawned);
-                 render();
-                 setTimeout(() => {
-                   travelToLocation(spawned);
-                   setTimeout(promptAgain, 10);
-                 }, 50);
+                game.activeLocation = spawned;
+                toast('Debug', `Spawned ${spawned.name} as active location.`, 'info');
+                render();
+                setTimeout(promptAgain, 10);
               }
             } else {
-              toast('Debug', 'Card must be a location to travel to.', 'danger');
+              toast('Debug', 'Card must be a location to set as active location.', 'danger');
               setTimeout(promptAgain, 10);
             }
           }},
@@ -25549,6 +26092,16 @@ window.addEventListener('keydown', (e)=>{
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     const logBtn = $('log-toggle-btn');
     if (logBtn) logBtn.click();
+  }
+  if (e.key.toLowerCase() === 'd') {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    const modal = $('modal-overlay');
+    if (modal && modal.classList.contains('show') && modal.innerHTML.includes('Debug Spawner')) {
+      modal.classList.remove('show');
+    } else {
+      const debugBtn = $('debug-spawn-btn');
+      if (debugBtn) debugBtn.click();
+    }
   }
   if(e.key === 'Tab') {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;

@@ -5709,10 +5709,9 @@ window.triggerHealSparkles = function(targetUid, priorDmg) {
                 if (onTaut) onTaut();
             }
 
-            // Landing Impact burst when card arrives in Engaged Area
+            // Landing in Engaged Area
             if (frame >= shootFrames + pullFrames && !landingTriggered) {
                 landingTriggered = true;
-                spawnBurst(targetX, targetY, 30, '#ff1744');
                 if (window.LotrEngine && window.LotrEngine.screenShake) {
                     window.LotrEngine.screenShake(10, 300);
                 }

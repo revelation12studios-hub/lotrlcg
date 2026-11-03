@@ -3331,9 +3331,15 @@
 
   // 2e. EASTERN CROWS SURGE: Murder of Crows emerge from card and land on Encounter Deck to Reveal Next Card
   let _lastEasternCrowsSurgeTime = 0;
+  let _currentEasternCrowsOnImpact = null;
   window.triggerEasternCrowsSurge = function(cardOrEl, onImpact) {
+    if (typeof onImpact === 'function') {
+      _currentEasternCrowsOnImpact = onImpact;
+    }
     const now = Date.now();
-    if (now - _lastEasternCrowsSurgeTime < 2800) return;
+    if (now - _lastEasternCrowsSurgeTime < 2800) {
+      return;
+    }
     _lastEasternCrowsSurgeTime = now;
 
     // Preload surge audio for instant zero-latency playback on impact
@@ -3353,8 +3359,10 @@
         impactOccurred = true;
         _surgeBallInFlight = false;
         _surgeBallHit = true;
-        if (typeof onImpact === 'function') {
-          try { onImpact(); } catch(e) {}
+        const cb = _currentEasternCrowsOnImpact || onImpact;
+        _currentEasternCrowsOnImpact = null;
+        if (typeof cb === 'function') {
+          try { cb(); } catch(e) {}
         }
       }
       if (_pendingSurgeReveal) {
@@ -3385,15 +3393,18 @@
       requestAnimationFrame(step);
     }
 
-    // 1. Locate launch origin (Eastern Crows card)
+    // 1. Locate launch origin (Eastern Crows card in center of screen)
     let originCard = null;
+    const centerGhost = document.getElementById('encounter-limbo-ghost') ||
+                        document.getElementById('encounter-reveal-ghost') ||
+                        window._activeEncounterGhost;
+
     if (cardOrEl && cardOrEl.nodeType) {
       originCard = cardOrEl;
+    } else if (centerGhost) {
+      originCard = centerGhost;
     } else {
-      originCard = document.getElementById('encounter-limbo-ghost') ||
-                   document.getElementById('encounter-reveal-ghost') ||
-                   window._activeEncounterGhost ||
-                   document.querySelector('#staging-content [data-id="eastern_crows"]') ||
+      originCard = document.querySelector('#staging-content [data-id="eastern_crows"]') ||
                    document.querySelector('#staging-content [data-id="oath_eastern_crows"]') ||
                    document.querySelector('[data-id="eastern_crows"]') ||
                    document.querySelector('[data-id="oath_eastern_crows"]') ||
@@ -3425,7 +3436,7 @@
     const deckRx = dRect.width * 0.58;
 
     // Flutter shake on Eastern Crows card as crows burst out
-    const ghost = document.getElementById('encounter-limbo-ghost') || window._activeEncounterGhost || document.getElementById('encounter-reveal-ghost');
+    const ghost = centerGhost || document.getElementById('encounter-limbo-ghost') || window._activeEncounterGhost || document.getElementById('encounter-reveal-ghost');
     const stagingCrows = document.querySelector('#staging-content [data-id="eastern_crows"]') || document.querySelector('#staging-content [data-id="oath_eastern_crows"]') || document.querySelector('[data-id="eastern_crows"]');
     const targetCard = ghost || originCard || stagingCrows;
     if (targetCard) {
@@ -3914,8 +3925,10 @@
             _surgeBallInFlight = false;
 
             // Trigger onImpact callback
-            if (typeof onImpact === 'function') {
-              try { onImpact(); } catch(e) { console.error(e); }
+            const impactCb = _currentEasternCrowsOnImpact || onImpact;
+            _currentEasternCrowsOnImpact = null;
+            if (typeof impactCb === 'function') {
+              try { impactCb(); } catch(e) { console.error(e); }
             }
 
             // REVEAL NEXT ENCOUNTER CARD RIGHT AS CROWS LAND!
@@ -4927,6 +4940,403 @@
 
   window.triggerDespairOnReveal = function(card, gameInstance, engine, cb) {
     window.triggerDespair(cb);
+  };
+
+window.triggerEvilStormOnReveal = function(card, gameInstance, engine, cb) {
+    const g = gameInstance || window.game || window.LotrEngine?.game;
+    const numP = g ? (g.numPlayers || 1) : 1;
+    const toastFn = (engine && engine.toast) || window.toast;
+    const renderFn = (engine && engine.render) || window.render;
+
+    // 1. Only proceed if at least one active player has 35+ threat
+    const qualifyingPlayers = [];
+    for (let p = 0; p < numP; p++) {
+      if (g && g.eliminated && g.eliminated[p]) continue;
+      const threatVal = (g && g.threats && g.threats[p] !== undefined) ? g.threats[p] : (g ? g.threat : 0);
+      if (threatVal >= 35) {
+        qualifyingPlayers.push(p);
+      }
+    }
+
+    if (qualifyingPlayers.length === 0) {
+      if (toastFn) {
+        toastFn('Evil Storm', 'No players have threat of 35 or higher. No damage dealt.', 'info', 3000);
+      }
+      if (cb) cb();
+      return;
+    }
+
+    // 2. Build sequential character target queue grouped by player
+    const sequence = [];
+    qualifyingPlayers.forEach(p => {
+      const pChars = [...(g?.heroes || []), ...(g?.allies || [])].filter(c => c && !c._prisoner && !c._dead && (c._ownerIdx === p || (c._ownerIdx === undefined && p === 0)));
+      pChars.forEach(c => {
+        sequence.push({ char: c, playerIdx: p });
+      });
+    });
+
+    if (sequence.length === 0) {
+      if (toastFn) {
+        toastFn('Evil Storm', 'No eligible characters in play to damage.', 'info', 3000);
+      }
+      if (cb) cb();
+      return;
+    }
+
+    const originCard = window._activeEncounterGhost ||
+                       document.getElementById('encounter-limbo-ghost') ||
+                       document.getElementById('encounter-reveal-ghost') ||
+                       document.querySelector('[data-id="evil_storm"]');
+
+    // 3. Play evil_storm.mp3 and smoothly fade out evil_storm_appear.mp3
+    try {
+      if (window._stormAppearAudio) {
+        const appearAudio = window._stormAppearAudio;
+        window._stormAppearAudio = null;
+        const aStartVol = appearAudio.volume;
+        const aFadeStart = performance.now();
+        const aFadeDur = 600;
+        const aFader = setInterval(() => {
+          const elp = performance.now() - aFadeStart;
+          const p = Math.min(1.0, elp / aFadeDur);
+          appearAudio.volume = Math.max(0, aStartVol * (1 - p));
+          if (p >= 1.0) {
+            clearInterval(aFader);
+            appearAudio.pause();
+          }
+        }, 25);
+      }
+      const snd = new Audio('./sound_effects/evil_storm.mp3');
+      snd.volume = typeof getVol === 'function' ? getVol(1) : parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+      snd.play().catch(() => {});
+      window._stormAudio = snd;
+    } catch(e) {}
+
+    // 4. Smoothly scale Evil Storm downward to standard scale and shake heavily
+    const hitInterval = 520;
+    const shakeDur = Math.max(900, 260 + sequence.length * hitInterval + 450);
+
+    if (originCard) {
+      // Smoothly transition scale down from 2.2 to 1.0 so it doesn't obstruct storm clouds
+      originCard.style.transition = 'transform 0.55s cubic-bezier(0.25, 0.8, 0.25, 1), filter 0.15s ease-out';
+      originCard.style.transform = 'scale(1.0)';
+
+      const startShake = performance.now();
+      const maxAmp = 20;
+      function doCardShake(now) {
+        const elapsed = now - startShake;
+        if (elapsed < shakeDur) {
+          const decay = Math.pow(Math.max(0, 1 - elapsed / shakeDur), 1.15);
+          const dx = Math.sin(elapsed * 0.035) * (maxAmp * decay);
+          originCard.style.translate = `${dx.toFixed(2)}px 0px`;
+          requestAnimationFrame(doCardShake);
+        } else {
+          try { originCard.style.removeProperty('translate'); } catch(e) { originCard.style.translate = ''; }
+        }
+      }
+      requestAnimationFrame(doCardShake);
+
+      originCard.style.filter = 'drop-shadow(0 0 28px #ef4444) drop-shadow(0 0 50px #000000) drop-shadow(0 0 15px #7f1d1d) brightness(1.25)';
+      setTimeout(() => {
+        if (originCard) {
+          originCard.style.transition = 'filter 0.6s ease-out';
+          originCard.style.filter = '';
+        }
+      }, shakeDur);
+    }
+
+    if (typeof window.screenShake === 'function') {
+      window.screenShake(8, 450);
+    }
+
+    // Helper: Direct physical card shake on hit
+    function shakeTargetCard(el) {
+      if (!el) return;
+      const isExhausted = el.classList.contains('exhausted');
+      const startT = performance.now();
+      const dur = 320;
+      const amp = 14;
+      function s(now) {
+        const elp = now - startT;
+        if (elp < dur) {
+          const decay = Math.pow(Math.max(0, 1 - elp / dur), 1.2);
+          const dx = Math.sin(elp * 0.18) * amp * decay;
+          if (isExhausted) {
+            el.style.transform = `rotate(90deg) translate3d(0, ${(-dx).toFixed(1)}px, 0)`;
+          } else {
+            el.style.transform = `translate3d(${dx.toFixed(1)}px, 0, 0)`;
+          }
+          requestAnimationFrame(s);
+        } else {
+          el.style.transform = isExhausted ? 'rotate(90deg)' : '';
+        }
+      }
+      requestAnimationFrame(s);
+    }
+
+    // Helper: Detailed grey/black storm clouds, pouring rain & slowly fading multi-branch lightning strike
+    function strikeCardWithLightning(cardEl, onHit) {
+      if (!cardEl) { if (onHit) onHit(); return; }
+      const rect = cardEl.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) { if (onHit) onHit(); return; }
+
+      const tx = rect.left + rect.width / 2;
+      const ty = rect.top + rect.height * 0.48;
+
+      const cloudCX = tx + (Math.random() - 0.5) * 20;
+      const cloudCY = Math.max(35, rect.top - 85);
+
+      const { canvas, ctx } = createCanvas(100000);
+
+      function createBranch(x1, y1, x2, y2, displace, depth) {
+        if (depth <= 0) return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
+        const midX = (x1 + x2) / 2 + (Math.random() - 0.5) * displace;
+        const midY = (y1 + y2) / 2 + (Math.random() - 0.5) * (displace * 0.45);
+        const left = createBranch(x1, y1, midX, midY, displace * 0.55, depth - 1);
+        const right = createBranch(midX, midY, x2, y2, displace * 0.55, depth - 1);
+        return left.concat(right.slice(1));
+      }
+
+      const mainTrunk = createBranch(cloudCX, cloudCY + 15, tx, ty, 38, 4);
+
+      const sideBranches = [];
+      for (let b = 0; b < 4; b++) {
+        const segIdx = Math.floor(mainTrunk.length * (0.25 + b * 0.18));
+        const root = mainTrunk[segIdx] || mainTrunk[0];
+        const dir = (b % 2 === 0 ? 1 : -1);
+        const endBx = root.x + dir * (28 + Math.random() * 32);
+        const endBy = root.y + (30 + Math.random() * 45);
+        sideBranches.push(createBranch(root.x, root.y, endBx, endBy, 20, 3));
+      }
+
+      const cloudPuffs = [
+        { ox: -65, oy: -15, r: 42, color: '20, 22, 28' },
+        { ox: -35, oy: -26, r: 52, color: '38, 42, 50' },
+        { ox: 0,   oy: -32, r: 58, color: '12, 14, 18' },
+        { ox: 38,  oy: -24, r: 50, color: '34, 38, 45' },
+        { ox: 68,  oy: -12, r: 40, color: '18, 20, 24' },
+        { ox: -20, oy: -6,  r: 46, color: '8, 9, 12' },
+        { ox: 25,  oy: -4,  r: 48, color: '14, 15, 18' },
+        { ox: -48, oy: 12,  r: 34, color: '48, 52, 62' },
+        { ox: 48,  oy: 14,  r: 32, color: '42, 46, 56' }
+      ];
+
+      const rain = Array.from({ length: 36 }, () => ({
+        x: cloudCX + (Math.random() - 0.5) * 190,
+        y: cloudCY - 10 + Math.random() * (rect.height + 140),
+        speed: 18 + Math.random() * 8,
+        len: 16 + Math.random() * 14,
+        wind: -2.5 + (Math.random() - 0.5) * 1.5,
+        alpha: 0.3 + Math.random() * 0.45
+      }));
+
+      let frame = 0;
+      const totalFrames = 85;
+      let hitDispatched = false;
+
+      function renderStrike() {
+        ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+        frame++;
+
+        let flash = 0;
+        let pAlpha = 1.0;
+        if (frame <= 6) {
+          const strobe = [1.0, 0.25, 0.95, 0.20, 0.85, 0.35][frame - 1];
+          flash = strobe;
+          pAlpha = 1.0;
+        } else {
+          const fadeProg = (frame - 6) / (totalFrames - 6);
+          pAlpha = Math.pow(Math.max(0, 1 - fadeProg), 1.35);
+          flash = 0;
+        }
+
+        if (!hitDispatched && frame >= 2) {
+          hitDispatched = true;
+          if (onHit) onHit();
+        }
+
+        if (pAlpha > 0.005) {
+          // 1. Draw Pouring Rain Streaks
+          ctx.save();
+          ctx.strokeStyle = `rgba(186, 230, 253, ${0.45 * pAlpha})`;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          rain.forEach(rn => {
+            rn.y += rn.speed;
+            rn.x += rn.wind;
+            if (rn.y > rect.bottom + 60) {
+              rn.y = cloudCY - 20 + Math.random() * 30;
+              rn.x = cloudCX + (Math.random() - 0.5) * 190;
+            }
+            ctx.moveTo(rn.x, rn.y);
+            ctx.lineTo(rn.x + rn.wind * 1.6, rn.y + rn.len);
+          });
+          ctx.stroke();
+          ctx.restore();
+
+          // 2. Draw Volumetric Grey & Black Storm Clouds
+          ctx.save();
+          cloudPuffs.forEach(p => {
+            const px = cloudCX + p.ox;
+            const py = cloudCY + p.oy;
+            const grad = ctx.createRadialGradient(px, py, 0, px, py, p.r);
+            if (flash > 0) {
+              grad.addColorStop(0, `rgba(255, 230, 230, ${pAlpha * (0.65 + flash * 0.35)})`);
+              grad.addColorStop(0.35, `rgba(220, 38, 38, ${pAlpha * (0.50 + flash * 0.35)})`);
+              grad.addColorStop(0.75, `rgba(${p.color}, ${0.75 * pAlpha})`);
+            } else {
+              grad.addColorStop(0, `rgba(${p.color}, ${0.95 * pAlpha})`);
+              grad.addColorStop(0.55, `rgba(${p.color}, ${0.65 * pAlpha})`);
+            }
+            grad.addColorStop(1, `rgba(${p.color}, 0)`);
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(px, py, p.r, 0, Math.PI * 2);
+            ctx.fill();
+          });
+          ctx.restore();
+
+          // 3. Draw Detailed Multi-Branch Lightning Strike
+          ctx.save();
+          ctx.globalCompositeOperation = 'screen';
+
+          function drawBranchPath(points, width, strokeColor, shadowColor, shadowBlur) {
+            if (!points || points.length < 2) return;
+            ctx.beginPath();
+            ctx.moveTo(points[0].x, points[0].y);
+            for (let i = 1; i < points.length; i++) {
+              ctx.lineTo(points[i].x, points[i].y);
+            }
+            ctx.strokeStyle = strokeColor;
+            ctx.lineWidth = width;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            if (shadowColor && shadowBlur) {
+              ctx.shadowColor = shadowColor;
+              ctx.shadowBlur = shadowBlur;
+            }
+            ctx.stroke();
+          }
+
+          // Layer A: Wide outer fiery red atmospheric glow
+          drawBranchPath(mainTrunk, 11 * pAlpha, `rgba(239, 68, 68, ${0.45 * pAlpha})`, '#ef4444', 18);
+          sideBranches.forEach(b => drawBranchPath(b, 6 * pAlpha, `rgba(239, 68, 68, ${0.35 * pAlpha})`, '#ef4444', 12));
+
+          // Layer B: Searing crimson electrical body
+          drawBranchPath(mainTrunk, 4.5 * pAlpha, `rgba(220, 38, 38, ${0.92 * pAlpha})`, '#dc2626', 8);
+          sideBranches.forEach(b => drawBranchPath(b, 2.8 * pAlpha, `rgba(220, 38, 38, ${0.85 * pAlpha})`, '#dc2626', 6));
+
+          // Layer C: Razor white-hot core
+          drawBranchPath(mainTrunk, 1.8 * pAlpha, `rgba(255, 255, 255, ${0.98 * pAlpha})`, '#ffffff', 4);
+          sideBranches.forEach(b => drawBranchPath(b, 1.0 * pAlpha, `rgba(255, 255, 255, ${0.92 * pAlpha})`, '#ffffff', 3));
+
+          ctx.restore();
+        }
+
+        if (frame < totalFrames) {
+          requestAnimationFrame(renderStrike);
+        } else {
+          canvas.remove();
+        }
+      }
+      requestAnimationFrame(renderStrike);
+    }
+
+    // 5. Sequentially cycle through characters one-by-one with automatic tab switching
+    let seqIdx = 0;
+    function processNextTarget() {
+      if (seqIdx >= sequence.length) {
+        if (window._stormAudio) {
+          const audioToFade = window._stormAudio;
+          const startVol = audioToFade.volume;
+          const fadeStartTime = performance.now();
+          const fadeDur = 1100;
+          const fadeInterval = setInterval(() => {
+            const elp = performance.now() - fadeStartTime;
+            const p = Math.min(1.0, elp / fadeDur);
+            audioToFade.volume = Math.max(0, startVol * (1 - p));
+            if (p >= 1.0) {
+              clearInterval(fadeInterval);
+              audioToFade.pause();
+              if (window._stormAudio === audioToFade) {
+                window._stormAudio = null;
+              }
+            }
+          }, 30);
+        }
+
+        if (toastFn) {
+          toastFn('Evil Storm', `Dealt 1 damage to ${sequence.length} character(s) (${qualifyingPlayers.map(p => `Player ${p + 1}`).join(', ')} threat 35+).`, 'danger', 3500);
+        }
+        setTimeout(() => {
+          const finish = window.waitForAllyDeaths || window.LotrEngine?.window?.waitForAllyDeaths;
+          if (finish) finish(cb);
+          else if (cb) cb();
+        }, 550);
+        return;
+      }
+
+      const item = sequence[seqIdx];
+      const c = item.char;
+      const targetPIdx = item.playerIdx;
+
+      if (g && g.numPlayers > 1 && g.activeTabPlayerIdx !== targetPIdx) {
+        if (typeof window._switchTab === 'function') {
+          window._switchTab(targetPIdx);
+        } else {
+          g.activeTabPlayerIdx = targetPIdx;
+          if (typeof renderFn === 'function') renderFn();
+        }
+      }
+
+      setTimeout(() => {
+        const cardEl = document.querySelector(`[data-uid="${c._uid}"]`);
+
+        strikeCardWithLightning(cardEl, () => {
+          c.damage = (c.damage || 0) + 1;
+          if (cardEl) {
+            shakeTargetCard(cardEl);
+
+            let tokenLayer = cardEl.querySelector('.token-layer');
+            if (!tokenLayer) {
+              tokenLayer = document.createElement('div');
+              tokenLayer.className = 'token-layer';
+              tokenLayer.style.cssText = 'position:absolute; inset:0; pointer-events:none; z-index:20;';
+              cardEl.appendChild(tokenLayer);
+            }
+            let dmgToken = tokenLayer.querySelector('.token.damage');
+            if (!dmgToken) {
+              dmgToken = document.createElement('div');
+              dmgToken.className = 'token damage';
+              tokenLayer.appendChild(dmgToken);
+            }
+            dmgToken.textContent = c.damage;
+            dmgToken.style.animation = 'none';
+            void dmgToken.offsetWidth;
+            dmgToken.style.animation = 'tokenPop 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)';
+
+            if (typeof window.spawnBurstAtElement === 'function') {
+              window.spawnBurstAtElement(cardEl, '#c0392b', 16);
+            }
+            if (typeof window.floatTextAtElement === 'function') {
+              window.floatTextAtElement(c._uid, '-1', '#ff5050');
+            }
+          }
+
+          const checkDeath = window.checkHeroDeath || window.LotrEngine?.checkHeroDeath;
+          if (typeof checkDeath === 'function') {
+            checkDeath(c);
+          }
+
+          if (typeof renderFn === 'function') renderFn();
+        });
+
+        seqIdx++;
+        setTimeout(processNextTarget, hitInterval);
+      }, 70);
+    }
+
+    setTimeout(processNextTarget, 260);
   };
 
   // 4b. MASSING AT NIGHT: Fiery Red/Orange/Black Column, Bendy Soft Lightning & Fast Dissolve
@@ -19181,6 +19591,613 @@
     requestAnimationFrame(loop);
   };
 
+  // Audio helpers for Cavern Guardian & Orc Guard attacks
+  let _lastCavernGuardianAttackAudioTime = 0;
+  let _lastSwordAttackAudioTime = 0;
+  function hookSwordAttackAudio() {
+    if (window.SoundFX && typeof window.SoundFX.playSwordAttack === 'function') {
+      if (!window.SoundFX.playSwordAttack._debounced) {
+        const origPlaySword = window.SoundFX.playSwordAttack;
+        window.SoundFX.playSwordAttack = function(...args) {
+          const now = Date.now();
+          if (now - _lastSwordAttackAudioTime < 500) {
+            return;
+          }
+          _lastSwordAttackAudioTime = now;
+          return origPlaySword.apply(this, args);
+        };
+        window.SoundFX.playSwordAttack._debounced = true;
+      }
+    }
+  }
+  hookSwordAttackAudio();
+  setInterval(hookSwordAttackAudio, 150);
+
+  window.playCavernGuardianAttackAudio = function() {
+    const now = Date.now();
+    if (now - _lastCavernGuardianAttackAudioTime < 600 || now - _lastSwordAttackAudioTime < 500) return;
+    _lastCavernGuardianAttackAudioTime = now;
+    _lastSwordAttackAudioTime = now;
+    try {
+      if (window.SoundFX && typeof window.SoundFX.playSwordAttack === 'function') {
+        window.SoundFX.playSwordAttack();
+      }
+    } catch(e) {}
+  };
+
+  let _lastOrcGuardAttackAudioTime = 0;
+  let _lastAxeAttackAudioTime = 0;
+  function hookAxeAttackAudio() {
+    if (window.SoundFX && typeof window.SoundFX.playAxeAttack === 'function') {
+      if (!window.SoundFX.playAxeAttack._debounced) {
+        const origPlayAxe = window.SoundFX.playAxeAttack;
+        window.SoundFX.playAxeAttack = function(...args) {
+          const now = Date.now();
+          if (now - _lastAxeAttackAudioTime < 500) {
+            return;
+          }
+          _lastAxeAttackAudioTime = now;
+          return origPlayAxe.apply(this, args);
+        };
+        window.SoundFX.playAxeAttack._debounced = true;
+      }
+    }
+  }
+  hookAxeAttackAudio();
+  setInterval(hookAxeAttackAudio, 150);
+
+  window.playOrcGuardAttackAudio = function() {
+    const now = Date.now();
+    if (now - _lastOrcGuardAttackAudioTime < 600 || now - _lastAxeAttackAudioTime < 500) return;
+    _lastOrcGuardAttackAudioTime = now;
+    _lastAxeAttackAudioTime = now;
+    try {
+      if (window.SoundFX && typeof window.SoundFX.playAxeAttack === 'function') {
+        window.SoundFX.playAxeAttack();
+      }
+    } catch(e) {}
+  };
+
+  // 12a-CG. CAVERN GUARDIAN ATTACK: Gleaming Razor Sword Slash with Star Glint Flare & Slicing Sparks
+  const _lastCavernGuardianSlash = {};
+  window._lastCavernGuardianSlash = _lastCavernGuardianSlash;
+  window.triggerCavernGuardianSwordSlash = function(targetUid, isCombatAttack = false) {
+    if (!targetUid) return;
+    const now = Date.now();
+    if (now - (_lastCavernGuardianSlash[targetUid] || 0) < 350) return;
+    _lastCavernGuardianSlash[targetUid] = now;
+
+    let cardEl = document.querySelector(`[data-uid="${targetUid}"]`) ||
+                 document.querySelector(`#player-content [data-uid="${targetUid}"]`) ||
+                 document.querySelector(`.zone-content [data-uid="${targetUid}"]`) ||
+                 document.querySelector(`#combat-defender-slot [data-uid="${targetUid}"]`);
+
+    if (!cardEl) return;
+    const rect = cardEl.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+
+    window._cavernGuardianAttackInProgress = true;
+    setTimeout(() => {
+      window._cavernGuardianAttackInProgress = false;
+    }, 1200);
+
+    // Play attack audio only if not already played for this combat attack
+    if (!isCombatAttack && (Date.now() - _lastSwordAttackAudioTime > 500)) {
+      try {
+        window.playCavernGuardianAttackAudio();
+      } catch(e) {}
+    }
+
+    // Subtle impact tremor & ethereal blade flare on receiving character card
+    const isExhausted = cardEl.classList.contains('exhausted');
+    const rotBase = isExhausted ? 90 : 0;
+    cardEl.style.transition = 'filter 0.08s ease-out, transform 0.08s ease-out';
+    cardEl.style.filter = 'drop-shadow(0 0 24px #38bdf8) brightness(1.28)';
+    cardEl.style.transform = `rotate(${rotBase - 2}deg) scale(0.96)`;
+    setTimeout(() => {
+      cardEl.style.transition = 'filter 0.45s ease-out, transform 0.35s ease-out';
+      cardEl.style.filter = '';
+      cardEl.style.transform = isExhausted ? 'rotate(90deg)' : '';
+    }, 180);
+
+    if (typeof window.shakeCard === 'function') {
+      window.shakeCard(targetUid);
+    }
+
+    const pad = Math.max(35, rect.width * 0.40);
+    const w = rect.width + pad * 2;
+    const h = rect.height + pad * 2;
+
+    const canvas = document.createElement('canvas');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    canvas.style.cssText = `
+      position: fixed;
+      left: ${rect.left - pad}px;
+      top: ${rect.top - pad}px;
+      width: ${w}px;
+      height: ${h}px;
+      pointer-events: none;
+      z-index: 100000;
+    `;
+    document.body.appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    const cx = pad + rect.width / 2;
+    const cy = pad + rect.height / 2;
+    const cw = rect.width;
+    const ch = rect.height;
+
+    // Curved razor sword slash points cutting cleanly diagonally across the card (top-right down to bottom-left)
+    const p0 = { x: cw * 0.55, y: -ch * 0.46 };
+    const p1 = { x: -cw * 0.08, y: -ch * 0.16 }; // Arched blade crest
+    const p2 = { x: -cw * 0.55, y: ch * 0.48 };
+
+    const numSteps = 40;
+    const pts = [];
+    for (let i = 0; i <= numSteps; i++) {
+      const u = i / numSteps;
+      const mt = 1 - u;
+      const x = mt * mt * p0.x + 2 * mt * u * p1.x + u * u * p2.x;
+      const y = mt * mt * p0.y + 2 * mt * u * p1.y + u * u * p2.y;
+      pts.push({ x, y, u });
+    }
+
+    // Razor-sharp slicing sparks bursting off the cutting blade path
+    const sparks = Array.from({ length: 26 }, () => {
+      const ang = Math.PI * 0.65 + (Math.random() - 0.5) * 1.8;
+      const spd = 3.0 + Math.random() * 6.5;
+      return {
+        x: (Math.random() - 0.5) * (cw * 0.4),
+        y: (Math.random() - 0.5) * (ch * 0.4),
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd,
+        size: 1.5 + Math.random() * 2.5,
+        alpha: 1.0,
+        decay: 0.038 + Math.random() * 0.024,
+        color: Math.random() > 0.4 ? '#ffffff' : (Math.random() > 0.5 ? '#7dd3fc' : '#38bdf8')
+      };
+    });
+
+    let frame = 0;
+    const swipeFrames = 6;
+    const totalFrames = 34;
+
+    function loop() {
+      ctx.clearRect(0, 0, w, h);
+      frame++;
+
+      const slashProg = Math.min(1.0, frame / swipeFrames);
+      const holdFade = frame <= swipeFrames ? 1.0 : Math.max(0, 1 - (frame - swipeFrames) / (totalFrames - swipeFrames));
+      const alpha = Math.sin(holdFade * Math.PI * 0.5);
+
+      if (alpha > 0.01) {
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.globalCompositeOperation = 'screen';
+        ctx.globalAlpha = alpha;
+
+        const activeCount = Math.min(pts.length, Math.floor(pts.length * slashProg));
+
+        if (activeCount >= 2) {
+          // 1. Radiant outer ethereal steel-blue aura
+          ctx.shadowColor = '#38bdf8';
+          ctx.shadowBlur = 18;
+          for (let i = 0; i < activeCount - 1; i++) {
+            const pA = pts[i];
+            const pB = pts[i + 1];
+            const taper = Math.sin(pA.u * Math.PI); // Needle taper at both ends, thickest at blade crest
+            const width = (14.0 * taper + 0.8) * alpha;
+
+            ctx.strokeStyle = `rgba(56, 189, 248, ${0.60 * alpha * taper})`;
+            ctx.lineWidth = width;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(pA.x, pA.y);
+            ctx.lineTo(pB.x, pB.y);
+            ctx.stroke();
+          }
+
+          // 2. High-intensity incandescent steel-white blade body
+          ctx.shadowColor = '#0284c7';
+          ctx.shadowBlur = 10;
+          for (let i = 0; i < activeCount - 1; i++) {
+            const pA = pts[i];
+            const pB = pts[i + 1];
+            const taper = Math.sin(pA.u * Math.PI);
+            const width = (7.5 * taper + 0.6) * alpha;
+
+            ctx.strokeStyle = `rgba(224, 242, 254, ${0.96 * alpha})`;
+            ctx.lineWidth = width;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(pA.x, pA.y);
+            ctx.lineTo(pB.x, pB.y);
+            ctx.stroke();
+          }
+
+          // 3. Razor pure-white cutting edge / core spine
+          ctx.shadowColor = '#ffffff';
+          ctx.shadowBlur = 7;
+          for (let i = 0; i < activeCount - 1; i++) {
+            const pA = pts[i];
+            const pB = pts[i + 1];
+            const taper = Math.sin(pA.u * Math.PI);
+            const width = (2.8 * taper + 0.4) * alpha;
+
+            ctx.strokeStyle = `rgba(255, 255, 255, ${0.98 * alpha})`;
+            ctx.lineWidth = width;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(pA.x, pA.y);
+            ctx.lineTo(pB.x, pB.y);
+            ctx.stroke();
+          }
+
+          // 4. Brilliant 4-point / 8-point sword glint flare at the cutting crest
+          if (frame >= 3 && frame <= 20) {
+            const glintProg = (frame - 3) / 17;
+            const glintAlpha = Math.sin(glintProg * Math.PI) * alpha;
+            const glintX = p1.x;
+            const glintY = p1.y;
+            const rayLen = (cw * 0.42) * (1 - glintProg * 0.3);
+
+            ctx.save();
+            ctx.globalAlpha = glintAlpha;
+            ctx.shadowColor = '#ffffff';
+            ctx.shadowBlur = 12;
+
+            // Central circular bloom
+            const cGrad = ctx.createRadialGradient(glintX, glintY, 0, glintX, glintY, rayLen * 0.35);
+            cGrad.addColorStop(0, 'rgba(255, 255, 255, 0.95)');
+            cGrad.addColorStop(0.3, 'rgba(186, 230, 253, 0.75)');
+            cGrad.addColorStop(1, 'rgba(56, 189, 248, 0)');
+            ctx.fillStyle = cGrad;
+            ctx.beginPath();
+            ctx.arc(glintX, glintY, rayLen * 0.35, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Horizontal & vertical sharp glint rays
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2.2 * (1 - glintProg);
+            ctx.beginPath();
+            ctx.moveTo(glintX - rayLen, glintY);
+            ctx.lineTo(glintX + rayLen, glintY);
+            ctx.moveTo(glintX, glintY - rayLen);
+            ctx.lineTo(glintX, glintY + rayLen);
+            ctx.stroke();
+
+            // Diagonal secondary rays
+            const diagLen = rayLen * 0.55;
+            ctx.strokeStyle = 'rgba(224, 242, 254, 0.85)';
+            ctx.lineWidth = 1.4 * (1 - glintProg);
+            ctx.beginPath();
+            ctx.moveTo(glintX - diagLen, glintY - diagLen);
+            ctx.lineTo(glintX + diagLen, glintY + diagLen);
+            ctx.moveTo(glintX - diagLen, glintY + diagLen);
+            ctx.lineTo(glintX + diagLen, glintY - diagLen);
+            ctx.stroke();
+
+            ctx.restore();
+          }
+        }
+
+        // 5. Razor sparks scattering off the blade slice
+        if (frame >= 3) {
+          sparks.forEach(sp => {
+            sp.x += sp.vx;
+            sp.y += sp.vy;
+            sp.vy += 0.18;
+            sp.alpha -= sp.decay;
+            if (sp.alpha > 0) {
+              ctx.fillStyle = sp.color;
+              ctx.shadowColor = '#38bdf8';
+              ctx.shadowBlur = 6;
+              ctx.beginPath();
+              ctx.arc(sp.x, sp.y, sp.size * sp.alpha, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          });
+        }
+
+        ctx.restore();
+      }
+
+      if (frame < totalFrames && alpha > 0.01) {
+        requestAnimationFrame(loop);
+      } else {
+        canvas.remove();
+      }
+    }
+    requestAnimationFrame(loop);
+  };
+  window.triggerCavernGuardianAttack = window.triggerCavernGuardianSwordSlash;
+
+  // 12a-OG. ORC GUARD ATTACK: Heavy Downward Axe Cleave Shockwave, Fracture Cracks & Shrapnel (NO physical axe rendered)
+  const _lastOrcGuardAttack = {};
+  window._lastOrcGuardAttack = _lastOrcGuardAttack;
+  window.triggerOrcGuardAxeAttack = function(targetUid, isCombatAttack = false) {
+    if (!targetUid) return;
+    const now = Date.now();
+    if (now - (_lastOrcGuardAttack[targetUid] || 0) < 350) return;
+    _lastOrcGuardAttack[targetUid] = now;
+
+    let cardEl = document.querySelector(`[data-uid="${targetUid}"]`) ||
+                 document.querySelector(`#player-content [data-uid="${targetUid}"]`) ||
+                 document.querySelector(`.zone-content [data-uid="${targetUid}"]`) ||
+                 document.querySelector(`#combat-defender-slot [data-uid="${targetUid}"]`);
+
+    if (!cardEl) return;
+    const rect = cardEl.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+
+    window._orcGuardAttackInProgress = true;
+    setTimeout(() => {
+      window._orcGuardAttackInProgress = false;
+    }, 1200);
+
+    // Play attack audio only if not already played for this combat attack
+    if (!isCombatAttack && (Date.now() - _lastAxeAttackAudioTime > 500)) {
+      try {
+        window.playOrcGuardAttackAudio();
+      } catch(e) {}
+    }
+
+    // Heavy blunt kinetic compression & molten flare on receiving character card
+    const isExhausted = cardEl.classList.contains('exhausted');
+    const rotBase = isExhausted ? 90 : 0;
+    cardEl.style.transition = 'filter 0.08s ease-out, transform 0.08s ease-out';
+    cardEl.style.filter = 'drop-shadow(0 0 26px #ea580c) brightness(1.35)';
+    cardEl.style.transform = isExhausted ? 'rotate(90deg) scale(0.93, 0.95)' : 'translateY(5px) scale(0.96, 0.91)';
+    setTimeout(() => {
+      cardEl.style.transition = 'filter 0.45s ease-out, transform 0.35s ease-out';
+      cardEl.style.filter = '';
+      cardEl.style.transform = isExhausted ? 'rotate(90deg)' : '';
+    }, 200);
+
+    if (typeof window.shakeCard === 'function') {
+      window.shakeCard(targetUid);
+    }
+    if (typeof screenShake === 'function') {
+      screenShake(6, 260);
+    }
+
+    // Moved down canvas padding & offsets to place cleave lower on the target card
+    const padX = Math.max(40, rect.width * 0.40);
+    const padTop = Math.max(35, rect.height * 0.35);
+    const padBottom = Math.max(75, rect.height * 0.65);
+    const w = rect.width + padX * 2;
+    const h = rect.height + padTop + padBottom;
+
+    const canvas = document.createElement('canvas');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    canvas.style.cssText = `
+      position: fixed;
+      left: ${rect.left - padX}px;
+      top: ${rect.top - padTop}px;
+      width: ${w}px;
+      height: ${h}px;
+      pointer-events: none;
+      z-index: 100000;
+    `;
+    document.body.appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    const cx = padX + rect.width / 2;
+    const yShiftDown = Math.round(rect.height * 0.20 + 12);
+    const cy = padTop + rect.height / 2 + yShiftDown;
+    const cw = rect.width;
+    const ch = rect.height;
+
+    // Heavy downward chopping arc points (descending steeply from high above straight into target chest)
+    const p0 = { x: -cw * 0.14, y: -ch * 0.65 };
+    const p1 = { x: -cw * 0.22, y: -ch * 0.15 }; // Broad cleaving crest
+    const p2 = { x: cw * 0.12, y: ch * 0.22 };  // Point of chop embedding
+
+    const numSteps = 38;
+    const pts = [];
+    for (let i = 0; i <= numSteps; i++) {
+      const u = i / numSteps;
+      const mt = 1 - u;
+      const x = mt * mt * p0.x + 2 * mt * u * p1.x + u * u * p2.x;
+      const y = mt * mt * p0.y + 2 * mt * u * p1.y + u * u * p2.y;
+      pts.push({ x, y, u });
+    }
+
+    // Pre-calculate 7 jagged armor/ground fracture cracks radiating from point of impact (p2)
+    const crackAngles = [-2.4, -1.8, -1.1, -0.3, 0.4, 1.2, 1.9];
+    const fractures = crackAngles.map(baseAng => {
+      const len = cw * (0.28 + Math.random() * 0.26);
+      const segs = [];
+      let curX = p2.x;
+      let curY = p2.y;
+      const numSegs = 4;
+      for (let s = 1; s <= numSegs; s++) {
+        const segDist = len / numSegs;
+        const ang = baseAng + (Math.random() - 0.5) * 0.6;
+        curX += Math.cos(ang) * segDist;
+        curY += Math.sin(ang) * segDist;
+        segs.push({ x: curX, y: curY });
+      }
+      return segs;
+    });
+
+    // Heavy molten iron sparks & shrapnel bursting on chop impact
+    const shrapnel = Array.from({ length: 32 }, () => {
+      const ang = Math.PI * 0.5 + (Math.random() - 0.5) * 2.2;
+      const spd = 3.5 + Math.random() * 7.5;
+      return {
+        x: p2.x + (Math.random() - 0.5) * 16,
+        y: p2.y + (Math.random() - 0.5) * 16,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd,
+        size: 1.8 + Math.random() * 3.2,
+        alpha: 1.0,
+        decay: 0.035 + Math.random() * 0.025,
+        color: Math.random() > 0.4 ? '#f97316' : (Math.random() > 0.5 ? '#ef4444' : '#fbbf24')
+      };
+    });
+
+    let frame = 0;
+    const chopFrames = 6;
+    const totalFrames = 36;
+
+    function loop() {
+      ctx.clearRect(0, 0, w, h);
+      frame++;
+
+      const chopProg = Math.min(1.0, frame / chopFrames);
+      const holdFade = frame <= chopFrames ? 1.0 : Math.max(0, 1 - (frame - chopFrames) / (totalFrames - chopFrames));
+      const alpha = Math.sin(holdFade * Math.PI * 0.5);
+
+      if (alpha > 0.01) {
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.globalCompositeOperation = 'screen';
+        ctx.globalAlpha = alpha;
+
+        const activeCount = Math.min(pts.length, Math.floor(pts.length * chopProg));
+
+        if (activeCount >= 2) {
+          // 1. Broad savage outer molten crimson/orange cleave wave
+          ctx.shadowColor = '#ea580c';
+          ctx.shadowBlur = 20;
+          for (let i = 0; i < activeCount - 1; i++) {
+            const pA = pts[i];
+            const pB = pts[i + 1];
+            // Heavy axe wedge shape: thicker in middle and bottom impact
+            const wedge = Math.pow(Math.sin(pA.u * Math.PI * 0.85 + 0.15), 0.7);
+            const width = (18.0 * wedge + 1.2) * alpha;
+
+            ctx.strokeStyle = `rgba(239, 68, 68, ${0.65 * alpha * wedge})`;
+            ctx.lineWidth = width;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(pA.x, pA.y);
+            ctx.lineTo(pB.x, pB.y);
+            ctx.stroke();
+          }
+
+          // 2. High-intensity fiery amber cutting shockwave
+          ctx.shadowColor = '#f59e0b';
+          ctx.shadowBlur = 12;
+          for (let i = 0; i < activeCount - 1; i++) {
+            const pA = pts[i];
+            const pB = pts[i + 1];
+            const wedge = Math.pow(Math.sin(pA.u * Math.PI * 0.85 + 0.15), 0.7);
+            const width = (9.5 * wedge + 0.8) * alpha;
+
+            ctx.strokeStyle = `rgba(251, 191, 36, ${0.95 * alpha})`;
+            ctx.lineWidth = width;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(pA.x, pA.y);
+            ctx.lineTo(pB.x, pB.y);
+            ctx.stroke();
+          }
+
+          // 3. Incandescent white-hot core cleave spine
+          ctx.shadowColor = '#ffffff';
+          ctx.shadowBlur = 8;
+          for (let i = 0; i < activeCount - 1; i++) {
+            const pA = pts[i];
+            const pB = pts[i + 1];
+            const wedge = Math.pow(Math.sin(pA.u * Math.PI * 0.85 + 0.15), 0.7);
+            const width = (3.4 * wedge + 0.5) * alpha;
+
+            ctx.strokeStyle = `rgba(255, 255, 240, ${0.98 * alpha})`;
+            ctx.lineWidth = width;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(pA.x, pA.y);
+            ctx.lineTo(pB.x, pB.y);
+            ctx.stroke();
+          }
+        }
+
+        // 4. Point of Chop Impact: Shockwave burst & jagged fracture fissures
+        if (frame >= 4) {
+          const impactFrame = frame - 4;
+          const impactProg = Math.min(1.0, impactFrame / 18);
+          const impactAlpha = Math.sin((1 - impactProg) * Math.PI * 0.5) * alpha;
+
+          // Radial crushing shockwave detonation ring
+          const ringRadX = (cw * 0.28) + impactProg * (cw * 0.45);
+          const ringRadY = (ch * 0.16) + impactProg * (ch * 0.32);
+          ctx.save();
+          ctx.globalAlpha = impactAlpha * 0.75;
+          ctx.strokeStyle = '#f97316';
+          ctx.lineWidth = 3.2 * (1 - impactProg);
+          ctx.shadowColor = '#ea580c';
+          ctx.shadowBlur = 14;
+          ctx.beginPath();
+          ctx.ellipse(p2.x, p2.y, ringRadX, ringRadY, 0, 0, Math.PI * 2);
+          ctx.stroke();
+
+          // Intense core impact flash
+          const fGrad = ctx.createRadialGradient(p2.x, p2.y, 0, p2.x, p2.y, cw * 0.45);
+          fGrad.addColorStop(0, 'rgba(255, 255, 255, 0.95)');
+          fGrad.addColorStop(0.25, 'rgba(254, 215, 170, 0.85)');
+          fGrad.addColorStop(0.55, 'rgba(234, 88, 12, 0.45)');
+          fGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+          ctx.fillStyle = fGrad;
+          ctx.beginPath();
+          ctx.arc(p2.x, p2.y, cw * 0.45 * (1 - impactProg * 0.3), 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+
+          // Jagged armor/ground fracture cracks branching outward from the chop
+          ctx.save();
+          ctx.globalAlpha = impactAlpha * 0.90;
+          ctx.shadowColor = '#ea580c';
+          ctx.shadowBlur = 8;
+          ctx.lineWidth = 2.0 * (1 - impactProg * 0.5);
+          ctx.strokeStyle = '#fb923c';
+          fractures.forEach(segs => {
+            ctx.beginPath();
+            ctx.moveTo(p2.x, p2.y);
+            segs.forEach(pt => ctx.lineTo(pt.x, pt.y));
+            ctx.stroke();
+          });
+          ctx.restore();
+        }
+
+        // 5. Heavy flying iron sparks & shrapnel blasting outward
+        if (frame >= 4) {
+          shrapnel.forEach(sp => {
+            sp.x += sp.vx;
+            sp.y += sp.vy;
+            sp.vy += 0.22;
+            sp.alpha -= sp.decay;
+            if (sp.alpha > 0) {
+              ctx.fillStyle = sp.color;
+              ctx.shadowColor = '#ea580c';
+              ctx.shadowBlur = 7;
+              ctx.beginPath();
+              ctx.arc(sp.x, sp.y, sp.size * sp.alpha, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          });
+        }
+
+        ctx.restore();
+      }
+
+      if (frame < totalFrames && alpha > 0.01) {
+        requestAnimationFrame(loop);
+      } else {
+        canvas.remove();
+      }
+    }
+    requestAnimationFrame(loop);
+  };
+  window.triggerOrcGuardAttack = window.triggerOrcGuardAxeAttack;
+
   // 12a-0. EAST BIGHT PATROL UNDEFENDED SHADOW: Audio, Red Flash, Direct Screen Shake & Incremental Threat Ticks
   let _lastEastBightUndefendedTime = 0;
   window.triggerEastBightPatrolUndefendedThreat = function(targetPIdxOverride, onComplete) {
@@ -23036,7 +24053,10 @@
                       window.triggerWolfRiderSurge();
                     }
                     else if ((title.includes('Eastern Crows') || msg.includes('Eastern Crows') || msg.includes('eastern_crows') || msg.includes('东方乌鸦')) && (title.includes('Surge') || msg.includes('Surge') || msg.includes('surge') || msg.includes('增兵'))) {
-                      window.triggerEasternCrowsSurge();
+                      const hasActiveCrowsReveal = window._activeEncounterCard && (window._activeEncounterCard.id === 'eastern_crows' || window._activeEncounterCard.name?.includes('Eastern Crows'));
+                      if (!hasActiveCrowsReveal && !window._activeEncounterGhost) {
+                        window.triggerEasternCrowsSurge();
+                      }
                     }
                     else if ((title.includes('Misty Mountain Goblins') || msg.includes('Misty Mountain Goblins')) && (msg.includes('Removed') || msg.includes('progress'))) {
                       if (typeof window.triggerMistyMountainGoblinsSlash === 'function') {
@@ -25546,6 +26566,7 @@
   window.playTowerGateLocationAudio = playTowerGateLocationAudio;
 
   function playOrcGuardAudio() {
+    if (window._orcGuardAttackInProgress || window.game?.currentEnemyAttacking?.id === 'orc_guard') return;
     try {
       const vol = typeof getVol === 'function' ? getVol(1) : parseFloat(document.getElementById('volume-slider')?.value || 0.25);
       const snd = new Audio('./sound_effects/orc_guard.mp3');
@@ -25661,8 +26682,26 @@
       }
     }
 
-    if (typeof playTowerGateLocationAudio === 'function') {
-      playTowerGateLocationAudio();
+    // Play tower_gate_travel.mp3 when Tower Gate shoots out its projectile
+    try {
+      const vol = typeof getVol === 'function' ? getVol(1) : parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+      const travelSnd = new Audio('./sound_effects/tower_gate_travel.mp3');
+      travelSnd.volume = vol;
+      travelSnd.currentTime = 0;
+      travelSnd.play().catch(() => {});
+    } catch(e) {}
+
+    // In multiplayer, tower_gate.mp3 plays once when shooting out its projectile onto player's deck
+    const isMultiplayer = window.game && window.game.numPlayers > 1;
+    if (isMultiplayer && !window._towerGateMultiplayerSoundPlayed) {
+      window._towerGateMultiplayerSoundPlayed = true;
+      try {
+        const vol = typeof getVol === 'function' ? getVol(1) : parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+        const tgSnd = new Audio('./sound_effects/tower_gate.mp3');
+        tgSnd.volume = vol;
+        tgSnd.currentTime = 0;
+        tgSnd.play().catch(() => {});
+      } catch(e) {}
     }
 
     const gateEl = document.querySelector('#active-location-content .card') ||
@@ -25684,21 +26723,21 @@
     // Origin: lower center of gate (archway threshold)
     const gx = gRect.left + gRect.width / 2;
     const gy = gRect.top + gRect.height * 0.65;
-    // Target: center of player deck
+    // Target: top center of player deck
     const dx = dRect.left + dRect.width / 2;
-    const dy = dRect.top + dRect.height / 2;
+    const dy = dRect.top + dRect.height * 0.45;
 
     const midX = (gx + dx) / 2 + 35;
     const midY = Math.min(gy, dy) - 90;
 
     const { canvas, ctx } = createCanvas(99999);
     let frame = 0;
-    // Sped up slightly: 75 frames (~1.25s at 60fps) for snappy yet menacing movement
-    const totalFrames = 75;
+    // Extended duration: 96 frames (~1.6s at 60fps) so entire projectile moves into the top of player's deck from head to tail
+    const totalFrames = 96;
 
     // Multiple shadowy streamer tendrils
     const wisps = Array.from({ length: 28 }, (_, i) => ({
-      delay: (i / 28) * 0.32,
+      delay: (i / 28) * 0.18,
       latOffset: (Math.sin(i * 1.3) * 45),
       thick: 2.5 + (i % 4) * 1.5,
       alphaMult: 0.75 + (i % 3) * 0.15,
@@ -25707,11 +26746,11 @@
 
     // Claw silhouettes streaking across the battlefield
     const claws = [
-      { startT: 0.02, lat: -25, size: 36, rotOff: -0.08 },
+      { startT: 0.04, lat: -25, size: 36, rotOff: -0.08 },
       { startT: 0.10, lat: 20, size: 42, rotOff: 0.10 },
-      { startT: 0.20, lat: -10, size: 48, rotOff: 0.02 },
-      { startT: 0.30, lat: 26, size: 40, rotOff: 0.12 },
-      { startT: 0.40, lat: -28, size: 44, rotOff: -0.15 }
+      { startT: 0.16, lat: -10, size: 48, rotOff: 0.02 },
+      { startT: 0.24, lat: 26, size: 40, rotOff: 0.12 },
+      { startT: 0.32, lat: -28, size: 44, rotOff: -0.15 }
     ];
 
     function loop() {
@@ -25720,7 +26759,7 @@
       const masterProg = frame / totalFrames;
 
       // 1. Billowing dark archway portal aura framing Tower Gate (transparent center so card art never disappears)
-      const gateBurstAlpha = Math.max(0, 1 - Math.pow(masterProg, 1.4)) * 0.75;
+      const gateBurstAlpha = Math.max(0, 1 - Math.pow(masterProg / 0.6, 1.4)) * 0.75;
       if (gateBurstAlpha > 0.01) {
         ctx.save();
         const gateRad = (gRect.width * 0.85) * (0.9 + Math.sin(frame * 0.18) * 0.12);
@@ -25736,14 +26775,16 @@
         ctx.restore();
       }
 
-      // 2. Streaking shadowy wisps / dark smoke tendrils across battlefield (flowing all the way into player deck)
+      // 2. Streaking shadowy wisps / dark smoke tendrils flowing completely into the top of player deck from head to tail
       wisps.forEach((w, wIdx) => {
-        const uMax = Math.min(1.0, Math.max(0, (masterProg - w.delay) / 0.50));
+        const headProg = (masterProg - w.delay) / 0.46;
+        const uMax = Math.min(1.0, Math.max(0, headProg));
         if (uMax <= 0) return;
 
-        // Leading head stays anchored into deck (1.0) as tail draws in
-        const uMin = Math.max(0, (masterProg - (w.delay + 0.44)) / 0.50);
-        if (uMin >= 1.0) return;
+        // Tail draws cleanly into top of player deck behind the head
+        const tailProg = (masterProg - (w.delay + 0.26)) / 0.46;
+        const uMin = Math.min(1.0, Math.max(0, tailProg));
+        if (uMin >= 1.0) return; // Entire tendril has moved into player deck
 
         const steps = 28;
 
@@ -25778,9 +26819,9 @@
         ctx.restore();
       });
 
-      // 3. Menacing clawed silhouettes streaking outward toward the deck (solid visibility all the way to destination)
+      // 3. Menacing clawed silhouettes streaking outward toward the deck and plunging directly into deck cards
       claws.forEach(c => {
-        const cProg = (masterProg - c.startT) / 0.54;
+        const cProg = (masterProg - c.startT) / 0.50;
         if (cProg <= 0 || cProg >= 1.0) return;
 
         const u = Math.min(1.0, Math.max(0, cProg));
@@ -25795,21 +26836,21 @@
         const ny = nInv * nInv * gy + 2 * nInv * nextU * (midY + c.lat) + nextU * nextU * dy;
         const angle = Math.atan2(ny - cy, nx - cx) + c.rotOff;
 
-        // Stays fully solid across the board and only plunges into the deck cards at u >= 0.95
+        // Stays fully solid across the board and plunges into the deck cards at u >= 0.92
         let alpha = 0.95;
         if (u < 0.12) {
           alpha = (u / 0.12) * 0.95;
-        } else if (u > 0.95) {
-          alpha = ((1.0 - u) / 0.05) * 0.95;
+        } else if (u > 0.92) {
+          alpha = ((1.0 - u) / 0.08) * 0.95;
         }
         drawShadowClaw(ctx, cx, cy, angle, c.size, alpha);
       });
 
       // 4. Shadow impact plunge directly into player deck as wisps and claws arrive
-      if (masterProg > 0.48) {
-        const deckHitProg = (masterProg - 0.48) / 0.52;
+      if (masterProg > 0.44 && masterProg <= 0.98) {
+        const deckHitProg = (masterProg - 0.44) / 0.54;
         const hitRad = (dRect.width * 0.75) * (0.35 + deckHitProg * 0.75);
-        const hitAlpha = Math.sin(deckHitProg * Math.PI * 0.88);
+        const hitAlpha = Math.sin(deckHitProg * Math.PI);
 
         ctx.save();
         const dGrad = ctx.createRadialGradient(dx, dy, 0, dx, dy, hitRad);
@@ -26265,6 +27306,7 @@
           }
         }
       } else if (card && (card.id === 'tower_gate' || card.name === 'Tower Gate')) {
+        window._towerGateMultiplayerSoundPlayed = false;
         // Play tower_gate_location.mp3 during travel
         setTimeout(() => {
           if (typeof window.playTowerGateLocationAudio === 'function') {
@@ -26297,6 +27339,7 @@
             activeCardEl.style.display = 'block';
           }
           window._towerGateInfiltrationActive = true;
+          window._towerGateMultiplayerSoundPlayed = false;
           if (callback) callback();
         };
       }
@@ -26880,11 +27923,73 @@
   window.triggerTowerGateAppear = window.triggerTowerGateReveal;
   window.playTowerGateAudio = window.triggerTowerGateReveal;
 
+  let _lastThreatIncreaseSoundTime = 0;
+  function playThreatIncreaseAudio() {
+    const now = Date.now();
+    if (now - _lastThreatIncreaseSoundTime < 800) return;
+    _lastThreatIncreaseSoundTime = now;
+    try {
+      const vol = typeof getVol === 'function' ? getVol(1) : parseFloat(document.getElementById('volume-slider')?.value || 0.25);
+      const snd = new Audio('./sound_effects/threat_increase.mp3');
+      snd.volume = vol;
+      snd.currentTime = 0;
+      snd.play().catch(() => {});
+    } catch(e) {}
+  }
+
+  let _lastCavernGuardianThreatFlashTime = 0;
+  window.triggerCavernGuardianThreatFlash = function() {
+    const now = Date.now();
+    if (now - _lastCavernGuardianThreatFlashTime < 1500) return;
+    _lastCavernGuardianThreatFlashTime = now;
+
+    const oldOverlay = document.getElementById('cavern-guardian-threat-overlay');
+    if (oldOverlay) oldOverlay.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'cavern-guardian-threat-overlay';
+    overlay.style.cssText = 'position:fixed; inset:0; z-index:99999; display:flex; flex-direction:column; align-items:center; justify-content:center; background:rgba(200,0,0,0.45); pointer-events:none; transition: background 0.3s ease-out;';
+
+    const bigText = document.createElement('div');
+    bigText.style.cssText = "font-family:'Cinzel Decorative', serif; font-size:4.5rem; font-weight:900; color:#ff3030; text-shadow:0 0 35px #ff0000, 0 4px 15px #000; transform:scale(0.5); opacity:0; transition: all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);";
+    bigText.textContent = `+1 Threat!`;
+    overlay.appendChild(bigText);
+    document.body.appendChild(overlay);
+
+    if (typeof screenShake === 'function') {
+      screenShake(16, 450);
+    }
+
+    setTimeout(() => {
+      bigText.style.transform = 'scale(1)';
+      bigText.style.opacity = '1';
+    }, 50);
+
+    setTimeout(() => {
+      overlay.style.background = 'rgba(200,0,0,0)';
+      bigText.style.transform = 'scale(1.2) translateY(-100px)';
+      bigText.style.opacity = '0';
+      setTimeout(() => {
+        overlay.remove();
+      }, 400);
+    }, 1300);
+
+    // Play threat_increase.mp3 immediately as the screen turns red
+    playThreatIncreaseAudio();
+  };
+
   let _lastCavernGuardianRevealTime = 0;
   window.triggerCavernGuardianReveal = function() {
+    if (window._cavernGuardianAttackInProgress || window.game?.currentEnemyAttacking?.id === 'cavern_guardian') return;
     const now = Date.now();
     if (now - _lastCavernGuardianRevealTime < 1200) return;
     _lastCavernGuardianRevealTime = now;
+
+    // When Cavern Guardian is first revealed from the encounter deck, the screen turns red with +1 Threat! text in the middle
+    if (typeof window.triggerCavernGuardianThreatFlash === 'function') {
+      window.triggerCavernGuardianThreatFlash();
+    }
+
     try {
       const snd = new Audio('./sound_effects/cavern_guardian.mp3');
       snd.volume = typeof getVol === 'function' ? getVol(1) : parseFloat(document.getElementById('volume-slider')?.value || 0.25);
@@ -26893,6 +27998,348 @@
   };
   window.triggerCavernGuardianAppear = window.triggerCavernGuardianReveal;
   window.playCavernGuardianAudio = window.triggerCavernGuardianReveal;
+
+  // Cavern Guardian Revealed: Doomed 1 Threat Increase VFX & Audio
+  // Shoots a cool gleaming razor sword slash projectile from Cavern Guardian's card up to the player's top UI threat number,
+  // playing threat_increase.mp3 upon impact with a cross-slash cut, flare burst, and counter bounce.
+  window.triggerCavernGuardianThreatSlash = function(cardInstance, onComplete) {
+    let sourceEl = null;
+    if (cardInstance && cardInstance._uid) {
+      sourceEl = document.querySelector(`[data-uid="${cardInstance._uid}"]`);
+    }
+    if (!sourceEl) {
+      sourceEl = document.querySelector('[data-id="cavern_guardian"]') ||
+                 document.querySelector('#staging-area-content .card') ||
+                 document.getElementById('encounter-reveal-ghost') ||
+                 document.querySelector('.zone-content .card');
+    }
+
+    const threatEl = document.getElementById('hud-threat') ||
+                     document.querySelector('.threat-badge') ||
+                     document.getElementById('hud-threat-diff');
+
+    let sx = window.innerWidth * 0.5;
+    let sy = window.innerHeight * 0.38;
+    if (sourceEl) {
+      const sRect = sourceEl.getBoundingClientRect();
+      if (sRect.width > 0 && sRect.height > 0) {
+        sx = sRect.left + sRect.width / 2;
+        sy = sRect.top + sRect.height * 0.35;
+      }
+    }
+
+    let tx = window.innerWidth * 0.28;
+    let ty = 32;
+    if (threatEl) {
+      const tRect = threatEl.getBoundingClientRect();
+      if (tRect.width > 0 && tRect.height > 0) {
+        tx = tRect.left + tRect.width / 2;
+        ty = tRect.top + tRect.height / 2;
+      }
+    }
+
+    // Play initial blade slice whoosh sound at launch
+    try {
+      if (window.SoundFX && typeof window.SoundFX.playWhoosh === 'function') {
+        window.SoundFX.playWhoosh();
+      }
+    } catch(e) {}
+
+    const { canvas, ctx } = createCanvas(100002);
+    let frame = 0;
+    const flightFrames = 40; // Fast, snappy, cinematic arc
+    const impactFrames = 22;
+    const totalFrames = flightFrames + impactFrames;
+
+    // Curved parabolic trajectory towards top threat counter
+    const arcOffset = (sx < tx ? -1 : 1) * Math.min(120, Math.abs(sx - tx) * 0.35 + 40);
+    const cx = (sx + tx) / 2 + arcOffset;
+    const cy = Math.min(sy, ty) - 95;
+
+    // Trailing echoes behind the projectile
+    const trail = [];
+
+    // Flight slicing sparks
+    const sparks = [];
+
+    // Impact state
+    let impactInitialized = false;
+    const impactSparks = [];
+
+    function loop() {
+      ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+      frame++;
+
+      if (frame <= flightFrames) {
+        const t = frame / flightFrames;
+        const tInv = 1 - t;
+
+        // Quadratic bezier position
+        const curX = tInv * tInv * sx + 2 * tInv * t * cx + t * t * tx;
+        const curY = tInv * tInv * sy + 2 * tInv * t * cy + t * t * ty;
+
+        // Dynamic tangent
+        const dx = 2 * tInv * (cx - sx) + 2 * t * (tx - cx);
+        const dy = 2 * tInv * (cy - sy) + 2 * t * (ty - cy);
+        const angle = Math.atan2(dy, dx);
+        const spin = frame * 0.32;
+
+        trail.unshift({ x: curX, y: curY, angle, spin, t });
+        if (trail.length > 14) trail.pop();
+
+        // Spawn slicing sparks shedding backwards
+        if (frame % 2 === 0) {
+          const sparkAng = angle + Math.PI + (Math.random() - 0.5) * 1.4;
+          const spd = 2.5 + Math.random() * 4.5;
+          sparks.push({
+            x: curX + (Math.random() - 0.5) * 8,
+            y: curY + (Math.random() - 0.5) * 8,
+            vx: Math.cos(sparkAng) * spd,
+            vy: Math.sin(sparkAng) * spd,
+            size: 1.5 + Math.random() * 2.2,
+            alpha: 1.0,
+            decay: 0.05 + Math.random() * 0.03,
+            color: Math.random() > 0.4 ? '#38bdf8' : (Math.random() > 0.5 ? '#ffffff' : '#ef4444')
+          });
+        }
+
+        // Draw trail echoes
+        ctx.save();
+        ctx.globalCompositeOperation = 'screen';
+        for (let i = trail.length - 1; i >= 0; i--) {
+          const tr = trail[i];
+          const trAlpha = (1 - (i / trail.length)) * 0.55;
+          ctx.save();
+          ctx.translate(tr.x, tr.y);
+          ctx.rotate(tr.angle + tr.spin * 0.4);
+          ctx.globalAlpha = trAlpha;
+          ctx.shadowColor = '#38bdf8';
+          ctx.shadowBlur = 12;
+
+          const trLen = 34 * (1 - i / trail.length * 0.5);
+          const trW = 12 * (1 - i / trail.length * 0.5);
+
+          ctx.beginPath();
+          ctx.ellipse(0, 0, trLen * 0.5, trW * 0.35, 0, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(56, 189, 248, ${trAlpha * 0.7})`;
+          ctx.fill();
+
+          ctx.restore();
+        }
+
+        // Draw the Spinning Razor Sword Slash Projectile
+        ctx.save();
+        ctx.translate(curX, curY);
+        ctx.rotate(angle + spin);
+
+        const len = 52;
+        const w = 18;
+
+        // 1. Outer Ethereal / Doomed Crimson & Cyan Aura
+        ctx.shadowColor = '#ef4444';
+        ctx.shadowBlur = 18;
+        ctx.beginPath();
+        ctx.moveTo(len * 0.55, 0);
+        ctx.quadraticCurveTo(0, -w * 0.9, -len * 0.52, -w * 0.25);
+        ctx.quadraticCurveTo(-len * 0.1, 0, -len * 0.52, w * 0.25);
+        ctx.quadraticCurveTo(0, w * 0.9, len * 0.55, 0);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.55)';
+        ctx.fill();
+
+        // 2. High-speed incandescent steel-blue blade body
+        ctx.shadowColor = '#38bdf8';
+        ctx.shadowBlur = 14;
+        ctx.beginPath();
+        ctx.moveTo(len * 0.52, 0);
+        ctx.quadraticCurveTo(0, -w * 0.7, -len * 0.48, -w * 0.18);
+        ctx.quadraticCurveTo(-len * 0.08, 0, -len * 0.48, w * 0.18);
+        ctx.quadraticCurveTo(0, w * 0.7, len * 0.52, 0);
+        ctx.closePath();
+
+        const bGrad = ctx.createLinearGradient(-len * 0.5, 0, len * 0.5, 0);
+        bGrad.addColorStop(0, '#0284c7');
+        bGrad.addColorStop(0.5, '#38bdf8');
+        bGrad.addColorStop(1, '#e0f2fe');
+        ctx.fillStyle = bGrad;
+        ctx.fill();
+
+        // 3. Razor Pure-White Cutting Spine / Edge
+        ctx.shadowColor = '#ffffff';
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        ctx.moveTo(len * 0.50, 0);
+        ctx.quadraticCurveTo(0, -w * 0.35, -len * 0.42, 0);
+        ctx.quadraticCurveTo(0, w * 0.35, len * 0.50, 0);
+        ctx.closePath();
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+
+        // 4. Central star glint at blade crest
+        ctx.beginPath();
+        ctx.arc(len * 0.15, 0, 4.5, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.shadowBlur = 10;
+        ctx.fill();
+
+        ctx.restore();
+        ctx.restore(); // restore screen
+      } else {
+        // Impact Phase at Top UI Threat Counter!
+        if (!impactInitialized) {
+          impactInitialized = true;
+
+          // 1. Play threat_increase.mp3 upon impact if not already played
+          playThreatIncreaseAudio();
+
+          // 2. Animate #hud-threat counter bounce & glow
+          if (threatEl) {
+            threatEl.style.transition = 'transform 0.1s ease-out, filter 0.1s ease-out';
+            threatEl.style.transform = 'scale(1.42)';
+            threatEl.style.filter = 'drop-shadow(0 0 16px #ef4444) drop-shadow(0 0 8px #38bdf8)';
+            setTimeout(() => {
+              threatEl.style.transition = 'transform 0.4s ease-out, filter 0.4s ease-out';
+              threatEl.style.transform = '';
+              threatEl.style.filter = '';
+            }, 260);
+          }
+
+          // 3. Activate #hud-threat-diff popup if present
+          const diffEl = document.getElementById('hud-threat-diff');
+          if (diffEl) {
+            diffEl.textContent = `+1 Threat!`;
+            diffEl.classList.remove('threat-diff-active');
+            void diffEl.offsetWidth;
+            diffEl.classList.add('threat-diff-active');
+            setTimeout(() => {
+              diffEl.classList.remove('threat-diff-active');
+              diffEl.textContent = '';
+            }, 3500);
+          }
+
+          // 4. Screen micro-shake
+          if (typeof screenShake === 'function') {
+            screenShake(5, 220);
+          }
+
+          // 5. Spawn burst of impact sparks radiating from threat counter
+          for (let s = 0; s < 36; s++) {
+            const ang = (Math.PI * 2 / 36) * s + (Math.random() - 0.5) * 0.5;
+            const spd = 3.5 + Math.random() * 8.0;
+            impactSparks.push({
+              x: tx,
+              y: ty,
+              vx: Math.cos(ang) * spd,
+              vy: Math.sin(ang) * spd,
+              size: 2.0 + Math.random() * 3.5,
+              alpha: 1.0,
+              decay: 0.045 + Math.random() * 0.03,
+              color: Math.random() > 0.4 ? '#38bdf8' : (Math.random() > 0.5 ? '#ffffff' : '#ef4444')
+            });
+          }
+        }
+
+        const impactFrame = frame - flightFrames;
+        const impProgress = impactFrame / impactFrames;
+        const impAlpha = Math.max(0, 1 - impProgress);
+
+        ctx.save();
+        ctx.globalCompositeOperation = 'screen';
+
+        // Expanding shockwave circle from threat counter
+        const shockRadius = impProgress * 65 + 10;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(tx, ty, shockRadius, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(56, 189, 248, ${impAlpha * 0.85})`;
+        ctx.lineWidth = 3.5 * impAlpha;
+        ctx.shadowColor = '#38bdf8';
+        ctx.shadowBlur = 14;
+        ctx.stroke();
+        ctx.restore();
+
+        // Cross-Slash X-cut flashing across #hud-threat
+        if (impactFrame <= 12) {
+          const slashProgress = Math.min(1.0, impactFrame / 6);
+          const slashAlpha = Math.sin(impAlpha * Math.PI * 0.5);
+          const slashLen = 54 * slashProgress;
+
+          ctx.save();
+          ctx.translate(tx, ty);
+          ctx.globalAlpha = slashAlpha;
+          ctx.shadowColor = '#ffffff';
+          ctx.shadowBlur = 15;
+
+          // Slash 1: Diagonal top-left to bottom-right
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 3.2 * (1 - impactFrame / 12);
+          ctx.beginPath();
+          ctx.moveTo(-slashLen * 0.6, -slashLen * 0.45);
+          ctx.lineTo(slashLen * 0.6, slashLen * 0.45);
+          ctx.stroke();
+
+          // Slash 2: Diagonal bottom-left to top-right
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 2.6 * (1 - impactFrame / 12);
+          ctx.beginPath();
+          ctx.moveTo(-slashLen * 0.55, slashLen * 0.45);
+          ctx.lineTo(slashLen * 0.55, -slashLen * 0.45);
+          ctx.stroke();
+
+          ctx.restore();
+        }
+
+        // Draw impact sparks
+        impactSparks.forEach(sp => {
+          sp.x += sp.vx;
+          sp.y += sp.vy;
+          sp.vy += 0.15; // slight gravity
+          sp.alpha -= sp.decay;
+          if (sp.alpha > 0) {
+            ctx.fillStyle = sp.color;
+            ctx.shadowColor = sp.color;
+            ctx.shadowBlur = 8;
+            ctx.globalAlpha = sp.alpha;
+            ctx.beginPath();
+            ctx.arc(sp.x, sp.y, sp.size * sp.alpha, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        });
+
+        ctx.restore();
+      }
+
+      // Draw flight sparks
+      if (sparks.length > 0) {
+        ctx.save();
+        ctx.globalCompositeOperation = 'screen';
+        sparks.forEach(sp => {
+          sp.x += sp.vx;
+          sp.y += sp.vy;
+          sp.alpha -= sp.decay;
+          if (sp.alpha > 0) {
+            ctx.fillStyle = sp.color;
+            ctx.shadowColor = sp.color;
+            ctx.shadowBlur = 6;
+            ctx.globalAlpha = sp.alpha;
+            ctx.beginPath();
+            ctx.arc(sp.x, sp.y, sp.size * sp.alpha, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        });
+        ctx.restore();
+      }
+
+      if (frame < totalFrames) {
+        requestAnimationFrame(loop);
+      } else {
+        canvas.remove();
+        if (typeof onComplete === 'function') onComplete();
+      }
+    }
+
+    requestAnimationFrame(loop);
+  };
 
   // --- Persistent Rich Green Poisonous Gas Plume ---
   let _gladdenGasRaf = null;
@@ -29835,6 +31282,19 @@
                 }, 450);
               }
             }
+						if (node.querySelector('[data-id="evil_storm"]') || html.includes('evil_storm') || html.includes('Evil Storm')) {
+              if (isEncounterReveal) {
+                setTimeout(() => {
+                  const uid = (node.querySelector('[data-id="evil_storm"]') || node.querySelector('[data-uid]'))?.getAttribute('data-uid');
+                  if (uid && window._cardRegistry?.[uid]) {
+                    window._cardRegistry[uid].onReveal = window.triggerEvilStormOnReveal;
+                  }
+                  if (window._activeEncounterCard) {
+                    window._activeEncounterCard.onReveal = window.triggerEvilStormOnReveal;
+                  }
+                }, 450);
+              }
+            }
 						if (node.querySelector('[data-id="pursued_by_shadow"]') || html.includes('pursued_by_shadow') || html.includes('Pursued by Shadow')) {
               if (isEncounterReveal) {
                 setTimeout(() => {
@@ -30964,6 +32424,32 @@
             }, 120);
           }
         }
+        if (attacker && (attacker.id === 'cavern_guardian' || attacker.name === 'Cavern Guardian')) {
+          const isUndefended = !window.game?.currentDefenders || window.game.currentDefenders.length === 0;
+          if (!isUndefended) {
+            const now = Date.now();
+            if (now - (window._lastCavernGuardianSlash?.[targetUid] || 0) > 500) {
+              setTimeout(() => {
+                if (typeof window.triggerCavernGuardianSwordSlash === 'function') {
+                  window.triggerCavernGuardianSwordSlash(targetUid);
+                }
+              }, 120);
+            }
+          }
+        }
+        if (attacker && (attacker.id === 'orc_guard' || attacker.name === 'Orc Guard')) {
+          const isUndefended = !window.game?.currentDefenders || window.game.currentDefenders.length === 0;
+          if (!isUndefended) {
+            const now = Date.now();
+            if (now - (window._lastOrcGuardAttack?.[targetUid] || 0) > 500) {
+              setTimeout(() => {
+                if (typeof window.triggerOrcGuardAxeAttack === 'function') {
+                  window.triggerOrcGuardAxeAttack(targetUid);
+                }
+              }, 120);
+            }
+          }
+        }
       } catch(e) {}
       return origLunge.apply(this, arguments);
     };
@@ -31288,7 +32774,26 @@
   initMarshAdderDeathWatcher();
 
   let _lastCavernGuardianDieAudioTime = 0;
-  function playCavernGuardianDiesImmediately() {
+  function playCavernGuardianDiesImmediately(cardInstance) {
+    if (window._shadowDiscardInProgress) return;
+    if (cardInstance && (cardInstance._isShadowCard || cardInstance._isShadowDiscard || cardInstance._deathSoundPlayed)) return;
+    const g = window.game || window.LotrEngine?.game;
+    if (g) {
+      if ((g.engagedEnemies || []).some(e => e && e._shadowDiscarding) ||
+          (g.stagingArea || []).some(e => e && e._shadowDiscarding)) {
+        return;
+      }
+    }
+    if (cardInstance) {
+      if (cardInstance._isShadowCard || cardInstance._isShadowDiscard) return;
+      if (cardInstance.id !== 'cavern_guardian' && cardInstance.name !== 'Cavern Guardian') return;
+      cardInstance._deathSoundPlayed = true;
+    } else {
+      const enemyDying = g?.currentEnemyAttacking?.id === 'cavern_guardian' ||
+                         g?.defeatedEnemy?.id === 'cavern_guardian' ||
+                         (g?.victoryDisplay && g.victoryDisplay[g.victoryDisplay.length - 1]?.id === 'cavern_guardian');
+      if (!enemyDying) return;
+    }
     const now = Date.now();
     if (now - _lastCavernGuardianDieAudioTime < 1200) return;
     _lastCavernGuardianDieAudioTime = now;
@@ -31306,12 +32811,12 @@
   window.playCavernGuardianDiesImmediately = playCavernGuardianDiesImmediately;
   window.playCavernGuardianDeathAudio = playCavernGuardianDiesImmediately;
 
-  // Multi-layered defeat detection for Cavern Guardian
+  // Multi-layered defeat detection for Cavern Guardian (only when defeated as an enemy, never as a shadow card)
   function initCavernGuardianDeathWatcher() {
-    // 1. Array push hook on victoryDisplay & encounterDiscard
+    // 1. Array push hook on victoryDisplay
     function hookPiles() {
       const g = window.game || window.LotrEngine?.game;
-      if (!g || !g.victoryDisplay || !g.encounterDiscard) {
+      if (!g || !g.victoryDisplay) {
         setTimeout(hookPiles, 100);
         return;
       }
@@ -31320,33 +32825,24 @@
         g.victoryDisplay.push = function(...items) {
           for (const item of items) {
             if (item && (item.id === 'cavern_guardian' || item.name === 'Cavern Guardian')) {
-              playCavernGuardianDiesImmediately();
+              if (!item._isShadowCard && !item._isShadowDiscard && !item._deathSoundPlayed && !window._shadowDiscardInProgress) {
+                playCavernGuardianDiesImmediately(item);
+              }
             }
           }
           return origVDPush.apply(this, arguments);
         };
         g.victoryDisplay._cavernGuardianHooked = true;
       }
-      if (!g.encounterDiscard._cavernGuardianHooked) {
-        const origEDPush = g.encounterDiscard.push;
-        g.encounterDiscard.push = function(...items) {
-          for (const item of items) {
-            if (item && (item.id === 'cavern_guardian' || item.name === 'Cavern Guardian')) {
-              playCavernGuardianDiesImmediately();
-            }
-          }
-          return origEDPush.apply(this, arguments);
-        };
-        g.encounterDiscard._cavernGuardianHooked = true;
-      }
     }
     hookPiles();
 
-    // 2. DOM MutationObserver watching for "Cavern Guardian is destroyed" / "Enemy Defeated! Cavern Guardian"
+    // 2. DOM MutationObserver watching only for explicit "Cavern Guardian is destroyed" toasts
     const checkDeathText = (node) => {
       if (!node || node.nodeType !== 1 || node.tagName === 'SCRIPT' || node.tagName === 'STYLE') return;
       const txt = (node.textContent || '').trim();
-      if (txt.includes('Cavern Guardian') && (txt.includes('destroyed') || txt.includes('Defeated') || txt.includes('Enemy Defeated') || txt.includes('victory') || txt.includes('Victory'))) {
+      if (txt.includes('Cavern Guardian is destroyed') || txt.includes('Cavern Guardian is Defeated') || txt.includes('Cavern Guardian is defeated')) {
+        if (window._shadowDiscardInProgress) return;
         playCavernGuardianDiesImmediately();
       }
     };
@@ -31361,26 +32857,16 @@
 
     const tc = document.getElementById('toast-container');
     if (tc) deathObs.observe(tc, { childList: true, subtree: true });
-    const gl = document.getElementById('game-log-content');
-    if (gl) deathObs.observe(gl, { childList: true, subtree: true });
-    deathObs.observe(document.body, { childList: true, subtree: true });
 
-    // 3. Fast interval check on victoryDisplay & encounterDiscard
+    // 3. Fast interval check on victoryDisplay only (encounterDiscard is NOT checked because shadow cards go there)
     setInterval(() => {
       const g = window.game || window.LotrEngine?.game;
       if (!g) return;
-      if (g.victoryDisplay && g.victoryDisplay.some(c => c && c.id === 'cavern_guardian' && !c._deathSoundPlayed)) {
-        const cg = g.victoryDisplay.find(c => c && c.id === 'cavern_guardian' && !c._deathSoundPlayed);
+      if (g.victoryDisplay && g.victoryDisplay.some(c => c && c.id === 'cavern_guardian' && !c._deathSoundPlayed && !c._isShadowCard && !c._isShadowDiscard)) {
+        const cg = g.victoryDisplay.find(c => c && c.id === 'cavern_guardian' && !c._deathSoundPlayed && !c._isShadowCard && !c._isShadowDiscard);
         if (cg) {
           cg._deathSoundPlayed = true;
-          playCavernGuardianDiesImmediately();
-        }
-      }
-      if (g.encounterDiscard && g.encounterDiscard.some(c => c && c.id === 'cavern_guardian' && !c._deathSoundPlayed)) {
-        const cg = g.encounterDiscard.find(c => c && c.id === 'cavern_guardian' && !c._deathSoundPlayed);
-        if (cg) {
-          cg._deathSoundPlayed = true;
-          playCavernGuardianDiesImmediately();
+          playCavernGuardianDiesImmediately(cg);
         }
       }
     }, 150);
@@ -31421,8 +32907,8 @@
                 playEasternCrowsDiesImmediately();
               } else if (this.id === 'dungeon_jailor' || this.id === 'dungeon_jailer') {
                 playDungeonJailorDiesImmediately();
-              } else if (this.id === 'cavern_guardian') {
-                playCavernGuardianDiesImmediately();
+              } else if (this.id === 'cavern_guardian' && !this._isShadowCard && !this._isShadowDiscard) {
+                playCavernGuardianDiesImmediately(this);
               }
             }
           },
@@ -31445,6 +32931,9 @@
           if (c && (c.id === 'east_bight_patrol' || c.id === 'dol_guldur_orcs' || c.id === 'black_forest_bats' || c.id === 'wolf_rider' || c.id === 'marsh_adder' || c.id === 'goblin_sniper' || c.id === 'wargs' || c.id === 'misty_mountain_goblins' || c.id === 'eastern_crows' || c.id === 'dungeon_jailor' || c.id === 'dungeon_jailer' || c.id === 'cavern_guardian')) {
             attachEnemyDeathWatcher(c);
           }
+				if (c && (c.id === 'evil_storm' || c.name === 'Evil Storm')) {
+            c.onReveal = window.triggerEvilStormOnReveal;
+          }	
         });
       }
 
@@ -31470,6 +32959,9 @@
             inst.onReveal = window.triggerUnderTheShadowOnReveal;
           }
           return inst;
+					if (inst && (inst.id === 'evil_storm' || inst.name === 'Evil Storm')) {
+            inst.onReveal = window.triggerEvilStormOnReveal;
+          }
         };
         window.makeCardInst._deathWatchHooked = true;
       }
@@ -33645,6 +35137,10 @@
       if (isUnderTheShadow) {
         card.onReveal = window.triggerUnderTheShadowOnReveal;
       }
+			const isEvilStorm = card && (card.id === 'evil_storm' || card.name === 'Evil Storm');
+      if (isEvilStorm) {
+        card.onReveal = window.triggerEvilStormOnReveal;
+      }
       return origFn.apply(this, arguments);
     };
     wrapped._webHooked = true;
@@ -33756,6 +35252,7 @@
     }
     if (window.SoundFX && !window.SoundFX.playCavernGuardian) {
       window.SoundFX.playCavernGuardian = function() {
+        if (window._cavernGuardianAttackInProgress || window.game?.currentEnemyAttacking?.id === 'cavern_guardian') return;
         if (typeof window.triggerCavernGuardianReveal === 'function') {
           window.triggerCavernGuardianReveal();
         }
@@ -33763,6 +35260,7 @@
     }
     if (window.SoundFX) {
       window.SoundFX.playOrcGuard = function() {
+        if (window._orcGuardAttackInProgress || window.game?.currentEnemyAttacking?.id === 'orc_guard') return;
         if (typeof window.playOrcGuardAudio === 'function') {
           window.playOrcGuardAudio();
         }
@@ -33869,8 +35367,11 @@
         }
       }
       if ((t.includes('Eastern Crows') || m.includes('Eastern Crows') || m.includes('eastern_crows') || m.includes('东方乌鸦')) && (t.includes('Surge') || m.includes('Surge') || m.includes('surge') || m.includes('增兵'))) {
-        if (typeof window.triggerEasternCrowsSurge === 'function') {
-          window.triggerEasternCrowsSurge();
+        const hasActiveCrowsReveal = window._activeEncounterCard && (window._activeEncounterCard.id === 'eastern_crows' || window._activeEncounterCard.name?.includes('Eastern Crows'));
+        if (!hasActiveCrowsReveal && !window._activeEncounterGhost) {
+          if (typeof window.triggerEasternCrowsSurge === 'function') {
+            window.triggerEasternCrowsSurge();
+          }
         }
       }
       if ((t.includes('Marsh Adder') || m.includes('Marsh Adder') || m.includes('沼泽毒蛇')) && (t.includes('attacks') || m.includes('attacks') || t.includes('threat') || m.includes('threat'))) {
